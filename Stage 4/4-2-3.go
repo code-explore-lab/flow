@@ -660,7 +660,6 @@ func streamAAC(track *mediaTrack) {
 		fmt.Println("open aac:", err)
 		return
 	}
-
 	// 先读一帧，同时从首帧 ADTS 头拿到采样率，用来算发包节奏
 	au, err := demux.NextAU()
 	if err != nil {

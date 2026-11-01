@@ -513,3 +513,5 @@ RTP 包用 $ 0 <len> <rtp> 发
 
 RTCP 包用 $ 1 <len> <rtcp> 发
 ```
+
+## **同一个 TCP 连接上，先后 / 并行建立多个独立 RTSP Session**，也就是一条 TCP 承载多路播放会话。

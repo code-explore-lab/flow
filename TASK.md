@@ -236,10 +236,10 @@ ffplay -v debug rtsp://127.0.0.1:8554/live
 ### 4.2 任务清单
 
 - [x] **4.2.1** SETUP 时解析 `Transport` 里有没有 `interleaved=`，有就走 TCP 模式，不再开 UDP 端口。
-- [ ] **4.2.2** 给每条 TCP 连接起一个**读 goroutine**：循环读字节，第一个字节是 `$` 就按 interleaved 帧解析喂给 RTCP 接收；否则按 RTSP 文本行解析（状态机区分）。
-- [ ] **4.2.3** 推 RTP 时：视频包前面拼 `\x24\x00\xLL\xLL`，音频拼 `\x24\x02\xLL\xLL`，直接 `conn.Write`。
-- [ ] **4.2.4** ffplay 强制走 TCP：`ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/live`。
-- [ ] **4.2.5** VLC 也能在菜单里把传输改成 TCP。
+- [x] **4.2.2** 给每条 TCP 连接起一个**读 goroutine**：循环读字节，第一个字节是 `$` 就按 interleaved 帧解析喂给 RTCP 接收；否则按 RTSP 文本行解析（状态机区分）。
+- [x] **4.2.3** 推 RTP 时：视频包前面拼 `\x24\x00\xLL\xLL`，音频拼 `\x24\x02\xLL\xLL`，直接 `conn.Write`。
+- [x] **4.2.4** ffplay 强制走 TCP：`ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/live`。
+- [x] **4.2.5** VLC 也能在菜单里把传输改成 TCP。
 
 ### 4.3 验收标准
 
@@ -272,11 +272,11 @@ ffplay -v debug rtsp://127.0.0.1:8554/live
 
 ### 5.1 任务清单
 
-- [ ] **5.1.1 会话管理**：`session.Manager` 用 `map[string]*Session`，每 30s 扫一次，超过 timeout 没收到 RTCP 就 TEARDOWN。
-- [ ] **5.1.2 单源多消费者**：一个 `test.h264` 文件只解码一次，多个客户端同时拉流时用 fan-out（每路客户端一个 channel，源 goroutine 广播）。
-- [ ] **5.1.3 RTCP 发送者报告（SR）**：每 5 秒发一次 RTCP SR（PT=200），带 NTP/RTP timestamp 映射，否则有些播放器会停。
-- [ ] **5.1.4 环形缓冲区**：源 goroutine 解码后写到 ring buffer，消费者各自按 seq 读，慢消费者丢老帧而不是拖慢整体。
-- [ ] **5.1.5 优雅退出**：捕获 `SIGINT`，关闭所有 listener 和 session，UDP/TCP 都 close。
+- [x] **5.1.1 会话管理**：`session.Manager` 用 `map[string]*Session`，每 30s 扫一次，超过 timeout 没收到 RTCP 就 TEARDOWN。
+- [x] **5.1.2 单源多消费者**：一个 `test.h264` 文件只解码一次，多个客户端同时拉流时用 fan-out（每路客户端一个 channel，源 goroutine 广播）。
+- [x] **5.1.3 RTCP 发送者报告（SR）**：每 5 秒发一次 RTCP SR（PT=200），带 NTP/RTP timestamp 映射，否则有些播放器会停。
+- [x] **5.1.4 环形缓冲区**：源 goroutine 解码后写到 ring buffer，消费者各自按 seq 读，慢消费者丢老帧而不是拖慢整体。
+- [x] **5.1.5 优雅退出**：捕获 `SIGINT`，关闭所有 listener 和 session，UDP/TCP 都 close。
 - [ ] **5.1.6 接入真实摄像头**：用 ffmpeg 把 USB 摄像头（`/dev/video0` 或 Windows DirectShow）转成 `pipe:1` 输出裸 H264，server 改成从 stdin 读，模拟实时流。
 - [ ] **5.1.7 RTSP ANNOUNCE（推流端，加分项）**：让 ffmpeg 把流**推**到你的 server，server 接收后再转发给拉流客户端。
 - [ ] **5.1.8 压测**：写个脚本同时拉 20 路流，看 CPU/内存/Goroutine 数（用 `pprof`）。

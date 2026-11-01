@@ -78,7 +78,7 @@ ffmpeg -i testdata/test.mp4 -c:a copy -bsf:a aac_adtstoasc testdata/test.aac
 - [x] **1.2.6** 实现 `SETUP`：解析 `client_port`，分配 UDP 端口（先随便给两个），生成 SessionID 回给客户端。
 - [x] **1.2.7** 实现 `PLAY`：回 `200 OK`，**这一阶段先不推任何包**。
 - [x] **1.2.8** 实现 `TEARDOWN`：关闭会话。
-- [ ] **1.2.9** 状态机校验：如果客户端顺序错乱（例如还没 DESCRIBE 就 PLAY），返回 `454 Session Not Found` 或 `455 Method Not Valid`。
+- [x] **1.2.9** 状态机校验：如果客户端顺序错乱（例如还没 DESCRIBE 就 PLAY），返回 `454 Session Not Found` 或 `455 Method Not Valid`。
 
 ### 1.3 验收标准
 
@@ -128,13 +128,13 @@ ffprobe -v trace rtsp://127.0.0.1:8554/live
 
 ### 2.2 任务清单
 
-- [ ] **2.2.1** 写 `internal/media/h264_demux.go`：从 `test.h264`（Annex-B，`00 00 00 01` 起始码）里切出每个 NALU。
-- [ ] **2.2.2** 写 `internal/rtp/h264_packer.go`：输入一个 NALU，输出一个或多个 RTP packet（小包直接 single NALU，大包走 FU-A）。
-- [ ] **2.2.3** 在 DESCRIBE 阶段动态读 `test.h264` 的 SPS/PPS，拼出真实的 SDP（`sprop-parameter-sets` 用 base64）。
-- [ ] **2.2.4** SETUP 阶段从 `Transport` 头解析 `client_port`，服务端开两个 UDP 端口：一个发 RTP、一个收 RTCP（RFC 3550 要求偶+奇）。
-- [ ] **2.2.5** PLAY 之后起一个 goroutine：按 25fps（40ms 一帧）节奏，从文件读 NALU → 封 RTP → `udpConn.WriteToUDP`。
-- [ ] **2.2.6** RTP 头部：PT=96（动态）、SSRC 随机、seq 从 0 自增、timestamp 每帧加 `90000/25 = 3600`。
-- [ ] **2.2.7** IDR 帧（SPS/PPS/IDR）前要立刻发，不能等下一帧节奏。
+- [x] **2.2.1** 写 `internal/media/h264_demux.go`：从 `test.h264`（Annex-B，`00 00 00 01` 起始码）里切出每个 NALU。
+- [x] **2.2.2** 写 `internal/rtp/h264_packer.go`：输入一个 NALU，输出一个或多个 RTP packet（小包直接 single NALU，大包走 FU-A）。
+- [x] **2.2.3** 在 DESCRIBE 阶段动态读 `test.h264` 的 SPS/PPS，拼出真实的 SDP（`sprop-parameter-sets` 用 base64）。
+- [x] **2.2.4** SETUP 阶段从 `Transport` 头解析 `client_port`，服务端开两个 UDP 端口：一个发 RTP、一个收 RTCP（RFC 3550 要求偶+奇）。
+- [x] **2.2.5** PLAY 之后起一个 goroutine：按 25fps（40ms 一帧）节奏，从文件读 NALU → 封 RTP → `udpConn.WriteToUDP`。
+- [x] **2.2.6** RTP 头部：PT=96（动态）、SSRC 随机、seq 从 0 自增、timestamp 每帧加 `90000/25 = 3600`。
+- [x] **2.2.7** IDR 帧（SPS/PPS/IDR）前要立刻发，不能等下一帧节奏。
 
 ### 2.3 验收标准
 
@@ -184,12 +184,12 @@ ffplay -v debug rtsp://127.0.0.1:8554/live
 
 ### 3.2 任务清单
 
-- [ ] **3.2.1** 写 `internal/media/aac_demux.go`：按 ADTS 头里的 `frame_length` 切出每个 AU。
-- [ ] **3.2.2** 解析 ADTS 头，拿到 `sampling_frequency` 和 `channel_config`，动态拼 SDP 里的 `config`（AudioSpecificConfig，2 字节：`profile<<11 | freqIdx<<7 | chCfg<<3`）。
-- [ ] **3.2.3** 写 `internal/rtp/aac_packer.go`：按 RFC 3640 拼 RTP 包。
-- [ ] **3.2.4** DESCRIBE 返回的 SDP 改成两条 `m=video` + `m=audio`（其实是一个 SDP 里两个 `m=` 行）。
-- [ ] **3.2.5** SETUP 现在要被客户端调用两次：第一次 `m=video` 分配视频端口对，第二次 `m=audio` 分配音频端口对，**共用同一个 SessionID**。
-- [ ] **3.2.6** PLAY 后两个 goroutine 并行推：视频一路 UDP，音频一路 UDP，timestamp 各自从 0 累加。
+- [x] **3.2.1** 写 `internal/media/aac_demux.go`：按 ADTS 头里的 `frame_length` 切出每个 AU。
+- [x] **3.2.2** 解析 ADTS 头，拿到 `sampling_frequency` 和 `channel_config`，动态拼 SDP 里的 `config`（AudioSpecificConfig，2 字节：`profile<<11 | freqIdx<<7 | chCfg<<3`）。
+- [x] **3.2.3** 写 `internal/rtp/aac_packer.go`：按 RFC 3640 拼 RTP 包。
+- [x] **3.2.4** DESCRIBE 返回的 SDP 改成两条 `m=video` + `m=audio`（其实是一个 SDP 里两个 `m=` 行）。
+- [x] **3.2.5** SETUP 现在要被客户端调用两次：第一次 `m=video` 分配视频端口对，第二次 `m=audio` 分配音频端口对，**共用同一个 SessionID**。
+- [x] **3.2.6** PLAY 后两个 goroutine 并行推：视频一路 UDP，音频一路 UDP，timestamp 各自从 0 累加。
 
 ### 3.3 验收标准
 
@@ -235,7 +235,7 @@ ffplay -v debug rtsp://127.0.0.1:8554/live
 
 ### 4.2 任务清单
 
-- [ ] **4.2.1** SETUP 时解析 `Transport` 里有没有 `interleaved=`，有就走 TCP 模式，不再开 UDP 端口。
+- [x] **4.2.1** SETUP 时解析 `Transport` 里有没有 `interleaved=`，有就走 TCP 模式，不再开 UDP 端口。
 - [ ] **4.2.2** 给每条 TCP 连接起一个**读 goroutine**：循环读字节，第一个字节是 `$` 就按 interleaved 帧解析喂给 RTCP 接收；否则按 RTSP 文本行解析（状态机区分）。
 - [ ] **4.2.3** 推 RTP 时：视频包前面拼 `\x24\x00\xLL\xLL`，音频拼 `\x24\x02\xLL\xLL`，直接 `conn.Write`。
 - [ ] **4.2.4** ffplay 强制走 TCP：`ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/live`。

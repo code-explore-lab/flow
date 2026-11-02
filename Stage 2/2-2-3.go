@@ -1,3 +1,5 @@
+//go:build ignore
+
 package Stage2
 
 import (

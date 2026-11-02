@@ -1,3 +1,5 @@
+//go:build ignore
+
 /*
 **1.2.1** 用 `net.Listen("tcp", ":8554")` 起服务，每 accept 一个连接起一个 goroutine。
  */

@@ -1,4 +1,4 @@
-package main
+package rtsp
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 // TestStartPlayIsIdempotent 验证同一个会话不会因为重复 PLAY 起两组推流；
 // PAUSE（stopPlay）之后再 PLAY 必须拿到新的生命周期。
 func TestStartPlayIsIdempotent(t *testing.T) {
-	rs := newRtspSession()
+	rs := newSession()
 	parent, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 
@@ -51,7 +51,7 @@ func TestPauseStopsPlayButKeepsSession(t *testing.T) {
 	sess := m.NewSession("127.0.0.1")
 	sess.SetState(session.StatePlaying)
 
-	rs := newRtspSession()
+	rs := newSession()
 	track := &mediaTrack{kind: "video", serverRtpPort: 50000}
 	rs.setTrack("video", track)
 
@@ -94,7 +94,7 @@ func TestPauseStopsPlayButKeepsSession(t *testing.T) {
 // TestStopPlayCancelsStreamLoop 用和 streamH264/streamAAC 相同的 select 模式，
 // 验证 stopPlay 后消费循环能退出。
 func TestStopPlayCancelsStreamLoop(t *testing.T) {
-	rs := newRtspSession()
+	rs := newSession()
 	done, started := rs.startPlay(context.Background())
 	if !started {
 		t.Fatal("startPlay failed")
@@ -128,7 +128,7 @@ func TestSessionCloseCancelsPlay(t *testing.T) {
 	m := session.NewManager(time.Minute)
 	sess := m.NewSession("127.0.0.1")
 
-	rs := newRtspSession()
+	rs := newSession()
 	done, started := rs.startPlay(sess.Context())
 	if !started {
 		t.Fatal("startPlay failed")
@@ -147,7 +147,7 @@ func TestSessionCloseCancelsPlay(t *testing.T) {
 	rs.stopPlay()
 }
 
-// TestTrackSSRCAndSeqPersist 验证 P0-4 的核心：同一条轨的 SSRC 和 seq
+// TestTrackSSRCAndSeqPersist 验证同一条轨的 SSRC 和 seq
 // 跨 PLAY/PAUSE 连续，不因重新起推流 goroutine 而重置。
 func TestTrackSSRCAndSeqPersist(t *testing.T) {
 	track := &mediaTrack{kind: "video"}
@@ -164,7 +164,7 @@ func TestTrackSSRCAndSeqPersist(t *testing.T) {
 		t.Fatalf("currentSSRC = %08x, want %08x", track.currentSSRC(), ssrc1)
 	}
 
-	// seq 严格递增；截断成 uint16 后按 RFC 3550 语义仍单调（不考虑回绕）。
+	// seq 严格递增。
 	var last uint32
 	for i := 0; i < 100; i++ {
 		n := track.nextSeq()
@@ -175,7 +175,7 @@ func TestTrackSSRCAndSeqPersist(t *testing.T) {
 	}
 
 	// 模拟 PAUSE→PLAY 之间重建一条轨（数据在同一 mediaTrack 上），seq/ssrc 不重置。
-	track2 := track // 真实场景中 setTrack 保留同一个 track 对象
+	track2 := track
 	if track2.ensureSSRC() != ssrc1 {
 		t.Fatal("SSRC changed after simulated pause/resume")
 	}

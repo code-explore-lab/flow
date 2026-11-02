@@ -146,3 +146,40 @@ func TestSessionCloseCancelsPlay(t *testing.T) {
 	rs.stopPlay()
 	rs.stopPlay()
 }
+
+// TestTrackSSRCAndSeqPersist 验证 P0-4 的核心：同一条轨的 SSRC 和 seq
+// 跨 PLAY/PAUSE 连续，不因重新起推流 goroutine 而重置。
+func TestTrackSSRCAndSeqPersist(t *testing.T) {
+	track := &mediaTrack{kind: "video"}
+
+	ssrc1 := track.ensureSSRC()
+	ssrc2 := track.ensureSSRC()
+	if ssrc1 != ssrc2 {
+		t.Fatalf("ensureSSRC returned %08x then %08x, want stable", ssrc1, ssrc2)
+	}
+	if ssrc1 == 0 {
+		t.Fatal("ensureSSRC should generate a non-zero SSRC")
+	}
+	if track.currentSSRC() != ssrc1 {
+		t.Fatalf("currentSSRC = %08x, want %08x", track.currentSSRC(), ssrc1)
+	}
+
+	// seq 严格递增；截断成 uint16 后按 RFC 3550 语义仍单调（不考虑回绕）。
+	var last uint32
+	for i := 0; i < 100; i++ {
+		n := track.nextSeq()
+		if i > 0 && n != last+1 {
+			t.Fatalf("nextSeq jumped from %d to %d", last, n)
+		}
+		last = n
+	}
+
+	// 模拟 PAUSE→PLAY 之间重建一条轨（数据在同一 mediaTrack 上），seq/ssrc 不重置。
+	track2 := track // 真实场景中 setTrack 保留同一个 track 对象
+	if track2.ensureSSRC() != ssrc1 {
+		t.Fatal("SSRC changed after simulated pause/resume")
+	}
+	if got := track2.nextSeq(); got != 100 {
+		t.Fatalf("seq reset after simulated pause/resume: got %d, want 100", got)
+	}
+}

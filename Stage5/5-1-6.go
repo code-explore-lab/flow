@@ -49,20 +49,39 @@ type mediaTrack struct {
 
 // trackStats 记录这条轨已经发了多少 RTP，供 RTCP SR 填入 packet/octet count
 // 和 NTP↔RTP 映射。推流 goroutine 写、SR goroutine 读，用锁串行化。
+//
+// P0-4：ssrc 和 seq 存在 mediaTrack 上、跨 PAUSE/PLAY 保持：
+// - SSRC 在同一个 RTSP 会话里必须不变（RFC 3550），否则播放器会当成新的同步源；
+// - seq 要连续递增，恢复播放后不回退、不重置，Wireshark 里才看不到断层。
 type trackStats struct {
 	mu       sync.Mutex
 	ssrc     uint32
+	seq      uint32 // 下一个要用的 RTP seq（写进 RTP 头时截断成 uint16）
 	packets  uint32
 	octets   uint32
 	lastRTP  uint32
 	lastSent time.Time
 }
 
-// setSSRC 在推流 goroutine 启动时登记本路的 SSRC，SR 里必须用同一个值。
-func (t *mediaTrack) setSSRC(ssrc uint32) {
+// ensureSSRC 返回本路的 SSRC：第一次调用时随机生成并固定下来，
+// PAUSE 之后再 PLAY 复用同一个值。0 表示还没分配过。
+func (t *mediaTrack) ensureSSRC() uint32 {
 	t.stats.mu.Lock()
-	t.stats.ssrc = ssrc
-	t.stats.mu.Unlock()
+	defer t.stats.mu.Unlock()
+	if t.stats.ssrc == 0 {
+		t.stats.ssrc = rand.Uint32()
+	}
+	return t.stats.ssrc
+}
+
+// nextSeq 返回下一个要用的 RTP seq 并自增。内部用 uint32 存，避免长会话
+// 很快溢出；写进 RTP 头时再截断成 uint16（RFC 3550 的 seq 本来就是 16 位回绕）。
+func (t *mediaTrack) nextSeq() uint32 {
+	t.stats.mu.Lock()
+	defer t.stats.mu.Unlock()
+	n := t.stats.seq
+	t.stats.seq++
+	return n
 }
 
 // currentSSRC 返回本路已登记的 SSRC（RTCP SR 和日志用）。
@@ -200,6 +219,9 @@ func (t *mediaTrack) writeRTCP(pkt []byte) error {
 //	$ + channel(1) + length(2, 大端) + packet
 //
 // channel 用 SETUP 协商出来的 interleavedRTP / interleavedRTCP。
+// 1B      1B        2B              N B
+//0x24($)  channel  length(big-endian)  payload(RTP/RTCP包)
+
 func (t *mediaTrack) writeInterleavedChannel(channel int, pkt []byte) error {
 	if len(pkt) > 0xFFFF {
 		return fmt.Errorf("packet too large for interleaved: %d bytes", len(pkt))
@@ -957,12 +979,11 @@ func streamH264(track *mediaTrack, done <-chan struct{}) {
 
 	packer := rtp.NewH264Packer(1400)
 	var (
-		seq     uint16
-		ssrc    = rand.Uint32() //同步源
 		dropped uint64
 	)
-	// 5.1.3：RTCP SR 里的 SSRC 必须和 RTP 包一致
-	track.setSSRC(ssrc)
+	// P0-4：SSRC 和 seq 从 track 取，跨 PAUSE/PLAY 连续。
+	// 5.1.3：RTCP SR 里的 SSRC 必须和 RTP 包一致。
+	ssrc := track.ensureSSRC()
 	for {
 		f, ok := reader.Next(done)
 		if !ok {
@@ -982,8 +1003,7 @@ func streamH264(track *mediaTrack, done <-chan struct{}) {
 			continue
 		}
 		for _, p := range pkts {
-			p.Header.Seq = seq
-			seq++
+			p.Header.Seq = uint16(track.nextSeq())
 			p.Header.Timestamp = f.Timestamp
 			p.Header.SSRC = ssrc
 			data, err := p.Header.Marshal(p.Payload)
@@ -1009,11 +1029,10 @@ func streamAAC(track *mediaTrack, done <-chan struct{}) {
 
 	packer := rtp.NewAACPacker()
 	var (
-		seq     uint16
-		ssrc    = rand.Uint32() // 和视频各自独立的 SSRC
 		dropped uint64
 	)
-	track.setSSRC(ssrc)
+	// P0-4：和视频一样，音频的 SSRC/seq 也跨 PAUSE/PLAY 连续。
+	ssrc := track.ensureSSRC()
 	rateSet := false
 	for {
 		f, ok := reader.Next(done)
@@ -1040,8 +1059,7 @@ func streamAAC(track *mediaTrack, done <-chan struct{}) {
 			continue
 		}
 		for _, p := range pkts {
-			p.Header.Seq = seq
-			seq++
+			p.Header.Seq = uint16(track.nextSeq())
 			p.Header.Timestamp = f.Timestamp
 			p.Header.SSRC = ssrc
 			data, err := p.Header.Marshal(p.Payload)

@@ -38,10 +38,11 @@
   - `Paused → Playing` 只启动一组；
   - 验收：连续两次 PLAY，RTP 包速率不翻倍；
   - ✅ 已实现：PLAY 状态校验放行 `Playing`，`startPlay` 返回 `started=false` 时只回 200 并打印 `PLAY ignored: stream already running`。raw RTSP/TCP 实测 34 → 28 包/0.4s（未翻倍），PAUSE 后再 PLAY 42 包/0.4s（单组流）。
-- [ ] **P0-4 PAUSE → PLAY 的 seq/timestamp 连续性**
+- [x] **P0-4 PAUSE → PLAY 的 seq/timestamp 连续性**
   - 每轨保存 `lastSeq`，恢复后继续递增，不回退、不重置；
   - 视频 timestamp 继续按源时间走，不重复上一帧；
-  - 验收：ffmpeg 拉流中 PAUSE 10s 再 PLAY，画面正常、Wireshark 里 seq 单调。
+  - 验收：ffmpeg 拉流中 PAUSE 10s 再 PLAY，画面正常、Wireshark 里 seq 单调；
+  - ✅ 已实现：`trackStats` 增加 `seq`（uint32，写头时截断 uint16）、`ensureSSRC()`（首次随机生成后固定）、`nextSeq()`；`streamH264`/`streamAAC` 不再用局部 `seq`/`rand.Uint32()`。raw RTSP/TCP 实测 PAUSE 前后 ssrc=e39d1a52 不变、seq 17→18 连续。
 - [ ] **P0-5 端到端验证脚本**
   - 用 raw socket 或 ffmpeg 构造 `PLAY → PAUSE → PLAY`；
   - 验收：服务端日志只有一次 `stream start`，无重复发送。

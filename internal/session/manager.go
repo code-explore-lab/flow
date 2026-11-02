@@ -63,11 +63,13 @@ type Session struct {
 	state     State
 	lastRTCP  time.Time // 最后一次收到 RTCP 的时间
 	lastRTSP  time.Time // 最后一次收到该会话 RTSP 请求的时间
-	done      chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
 	closeOnce sync.Once
 }
 
 func newSession(id, remoteIP string, now time.Time) *Session {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Session{
 		ID:        id,
 		RemoteIP:  remoteIP,
@@ -76,7 +78,8 @@ func newSession(id, remoteIP string, now time.Time) *Session {
 		// 创建即算一次活动：刚 SETUP 还没 PLAY 的会话不会立刻被扫掉。
 		lastRTCP: now,
 		lastRTSP: now,
-		done:     make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
@@ -145,17 +148,24 @@ func (s *Session) Expired(now time.Time, timeout time.Duration) bool {
 
 // Done 在会话被关闭后关闭，推流 goroutine select 它来及时退出。
 func (s *Session) Done() <-chan struct{} {
-	return s.done
+	return s.ctx.Done()
 }
 
-// Close 关闭会话：状态置为 Teardown、关掉 Done 通道、调用一次 OnClose。
+// Context 返回会话的生命周期 context，Close 时取消。
+// 调用方可以据此派生更短的生命周期（例如一次 PLAY 的推流 context），
+// 会话关闭时子 context 会级联取消，不必再单独监听 Done。
+func (s *Session) Context() context.Context {
+	return s.ctx
+}
+
+// Close 关闭会话：状态置为 Teardown、取消生命周期 context、调用一次 OnClose。
 // 重复调用是安全的（TEARDOWN 与超时清理可能同时发生）。
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.state = StateTeardown
 		s.mu.Unlock()
-		close(s.done)
+		s.cancel()
 		if s.OnClose != nil {
 			s.OnClose()
 		}

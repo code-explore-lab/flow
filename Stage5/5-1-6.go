@@ -1,4 +1,4 @@
-package Stage5
+package main
 
 import (
 	"bufio"
@@ -290,9 +290,11 @@ type rtspSession struct {
 	mu     sync.Mutex
 	tracks map[string]*mediaTrack // key: "video" / "audio"
 
-	// 5.1.3：同一个会话只起一组 RTCP SR goroutine，
-	// PAUSE 之后再 PLAY 不会重复起（两路各一个）。
-	srOnce sync.Once
+	// P0-1：每次 PLAY 的独立生命周期。PAUSE 时取消它，TEARDOWN 时由会话
+	// context 级联取消。playMu 保护下面两个字段。
+	playMu     sync.Mutex
+	playCancel context.CancelFunc
+	playDone   <-chan struct{}
 }
 
 func newRtspSession() *rtspSession {
@@ -312,6 +314,38 @@ func (s *rtspSession) track(kind string) *mediaTrack {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tracks[kind]
+}
+
+// startPlay 为一次 PLAY 建立独立的推流生命周期。
+// parent 是会话 context：会话关闭时它会被取消，playCtx 随之级联取消。
+// 如果已经有一个在播放的生命周期，返回它的 done 且 started=false，
+// 调用方据此避免重复 PLAY 时再起一组推流 goroutine。
+func (s *rtspSession) startPlay(parent context.Context) (done <-chan struct{}, started bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	s.playMu.Lock()
+	defer s.playMu.Unlock()
+	if s.playCancel != nil {
+		return s.playDone, false
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.playCancel = cancel
+	s.playDone = ctx.Done()
+	return s.playDone, true
+}
+
+// stopPlay 取消当前推流生命周期。PAUSE 调用；重复调用是安全的。
+// 只停推流和 SR，不动 Session、源订阅和 UDP 端口，PLAY 可以重新开始。
+func (s *rtspSession) stopPlay() {
+	s.playMu.Lock()
+	cancel := s.playCancel
+	s.playCancel = nil
+	s.playDone = nil
+	s.playMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // closeAll 关掉会话下所有轨的 UDP socket（TEARDOWN / 超时回收时由 OnClose 调用）。
@@ -798,8 +832,11 @@ func handleConn(conn *rtspConn) {
 				break
 			}
 			sess.TouchRTSP()
-			// 状态校验：只有 Init / Paused 允许PLAY
-			if st := sess.State(); st != session.StateInit && st != session.StatePaused {
+			// P0-3：Init / Paused / Playing 都允许 PLAY。
+			// Playing 状态下重复 PLAY 按 RFC 2326 是“更新播放参数”（例如改 Range），
+			// 这里直接回 200，复用已有推流生命周期，不重复起 goroutine。
+			st := sess.State()
+			if st != session.StateInit && st != session.StatePaused && st != session.StatePlaying {
 				err = writeResponse(conn, "455 Method Not Valid In This State", hd, nil)
 				break
 			}
@@ -812,27 +849,32 @@ func handleConn(conn *rtspConn) {
 			hd["Session"] = sessionHeaderValue(sess)
 			err = writeResponse(conn, "200 OK", hd, nil)
 			if err == nil {
+				// P0-1：每次 PLAY 一条独立的推流生命周期，父 context 是会话 context，
+				// TEARDOWN/超时回收时会级联取消。PAUSE 通过 stopPlay 单独取消。
+				playDone, started := rtspSess.startPlay(sess.Context())
+				if !started {
+					// 已经有一组推流在跑（重复 PLAY），不再重复启动。
+					fmt.Printf("session %s PLAY ignored: stream already running\n", sess.ID)
+					break
+				}
 				video := rtspSess.track("video")
 				audio := rtspSess.track("audio")
 				// 3.2.6：音视频各起一个 goroutine，各用各的 seq/timestamp/SSRC；
 				// 4.2.3：UDP 和 TCP interleaved 两种传输都从这里起。
-				// 5.1.1：把会话的 Done 通道传进去，会话被回收时推流能及时退出。
 				if video != nil {
-					go streamH264(video, sess.Done())
+					go streamH264(video, playDone)
 				}
 				if audio != nil && aacSource != nil {
-					go streamAAC(audio, sess.Done())
+					go streamAAC(audio, playDone)
 				}
 				// 5.1.3：每 5s 发一次 RTCP SR，带 NTP↔RTP 映射。
-				// 每条轨独立 SSRC/时钟，所以各发各的；会话内只启动一次。
-				rtspSess.srOnce.Do(func() {
-					if video != nil {
-						go sendSenderReports(video, sess.Done())
-					}
-					if audio != nil && aacSource != nil {
-						go sendSenderReports(audio, sess.Done())
-					}
-				})
+				// 每条轨独立 SSRC/时钟，所以各发各的；随 PLAY 生命周期启停。
+				if video != nil {
+					go sendSenderReports(video, playDone)
+				}
+				if audio != nil && aacSource != nil {
+					go sendSenderReports(audio, playDone)
+				}
 			}
 		case "TEARDOWN":
 			sessHeader, ok := req.Headers["Session"]
@@ -867,6 +909,11 @@ func handleConn(conn *rtspConn) {
 				err = writeResponse(conn, "455 Method Not Valid In This State", hd, nil)
 				break
 			}
+			// P0-2：先停推流再回 200，客户端收到 PAUSE 响应后不会再看到新 RTP。
+			// 只取消 PLAY 生命周期：Session、SSRC、UDP 端口、源订阅都保留，
+			// 再次 PLAY 会重新 startPlay。
+			rtspSess := sess.Data.(*rtspSession)
+			rtspSess.stopPlay()
 			sess.SetState(session.StatePaused)
 			hd["Session"] = sessionHeaderValue(sess)
 			err = writeResponse(conn, "200 OK", hd, nil)

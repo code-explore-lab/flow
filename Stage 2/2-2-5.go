@@ -1,4 +1,4 @@
-package main
+package Stage2
 
 import (
 	"bufio"

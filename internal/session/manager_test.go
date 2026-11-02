@@ -56,6 +56,26 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestSessionContextCancelsOnClose(t *testing.T) {
+	m := NewManager(DefaultTimeout)
+	s := m.NewSession("127.0.0.1")
+
+	// 模拟 RTSP 层为一次 PLAY 派生的子 context。
+	playCtx, cancel := context.WithCancel(s.Context())
+	defer cancel()
+
+	s.Close()
+
+	select {
+	case <-playCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("child context was not canceled after Session.Close")
+	}
+	if s.Done() != s.Context().Done() {
+		t.Fatal("Done and Context should share the same lifecycle")
+	}
+}
+
 func TestSweepExpiresIdleSession(t *testing.T) {
 	m := NewManager(DefaultTimeout)
 	s := m.NewSession("127.0.0.1")

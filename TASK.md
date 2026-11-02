@@ -277,7 +277,7 @@ ffplay -v debug rtsp://127.0.0.1:8554/live
 - [x] **5.1.3 RTCP 发送者报告（SR）**：每 5 秒发一次 RTCP SR（PT=200），带 NTP/RTP timestamp 映射，否则有些播放器会停。
 - [x] **5.1.4 环形缓冲区**：源 goroutine 解码后写到 ring buffer，消费者各自按 seq 读，慢消费者丢老帧而不是拖慢整体。
 - [x] **5.1.5 优雅退出**：捕获 `SIGINT`，关闭所有 listener 和 session，UDP/TCP 都 close。
-- [ ] **5.1.6 接入真实摄像头**：用 ffmpeg 把 USB 摄像头（`/dev/video0` 或 Windows DirectShow）转成 `pipe:1` 输出裸 H264，server 改成从 stdin 读，模拟实时流。
+- [x] **5.1.6 接入真实摄像头**：用 ffmpeg 把 USB 摄像头（`/dev/video0` 或 Windows DirectShow）转成 `pipe:1` 输出裸 H264，server 改成从 stdin 读，模拟实时流。
 - [ ] **5.1.7 RTSP ANNOUNCE（推流端，加分项）**：让 ffmpeg 把流**推**到你的 server，server 接收后再转发给拉流客户端。
 - [ ] **5.1.8 压测**：写个脚本同时拉 20 路流，看 CPU/内存/Goroutine 数（用 `pprof`）。
 

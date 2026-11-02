@@ -2,6 +2,7 @@ package source
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -17,15 +18,21 @@ type Frame struct {
 }
 
 const (
-	videoFrameInterval = 40 * time.Millisecond // 25fps
-	videoTimestampStep = 90000 / 25            // 90000/25 = 3600
+	videoClockRate     = 90000                 // H.264 RTP 时钟 90kHz
+	videoFrameInterval = 40 * time.Millisecond // 文件模式按 25fps 播放
+	videoTimestampStep = videoClockRate / 25   // 90000/25 = 3600
 	videoRingCapacity  = 64                    // ring buffer 保留最近 64 帧（约 2.5s）
 )
 
-// H264Source 单源视频：一个 goroutine 读 test.h264，按 25fps 往 ring buffer 写 NALU。
-// 第一次 Subscribe 时启动源；文件读完自动结束，下一次 Subscribe 会重新读一遍。
+// H264Source 单源视频：一个 goroutine 读 Annex-B H.264，往 ring buffer 写 NALU。
+//   - 文件模式：按 25fps 节奏读 test.h264，读完自动结束，下一次 Subscribe 重新读；
+//   - 实时模式：从 io.Reader（通常是 stdin 的 ffmpeg pipe）读，帧到达就发，
+//     时间戳跟随墙上时钟，适合摄像头等没有尽头的流。
+//
+// 第一次 Subscribe 时启动源。
 type H264Source struct {
-	path string
+	path   string
+	reader io.Reader // 非 nil 表示实时流模式
 
 	mu  sync.Mutex
 	cur *h264Run
@@ -43,6 +50,12 @@ type h264Run struct {
 // NewH264Source 创建一个视频源，path 是 Annex-B 裸流文件。
 func NewH264Source(path string) *H264Source {
 	return &H264Source{path: path}
+}
+
+// NewH264SourceFromReader 创建一个实时视频源，从 r 持续读取 Annex-B H.264。
+// 典型用法是 os.Stdin 接 `ffmpeg ... -f h264 pipe:1`。
+func NewH264SourceFromReader(r io.Reader) *H264Source {
+	return &H264Source{reader: r}
 }
 
 // Subscribe 订阅视频帧。
@@ -77,18 +90,32 @@ func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
 	return rd, rd.Close
 }
 
+// naluReader 统一文件解封装和实时流解封装的接口。
+type naluReader interface {
+	NextNALU() ([]byte, error)
+}
+
 // run 是唯一的源 goroutine：读 NALU -> 打时间戳 -> 写 ring buffer。
 func (s *H264Source) run(run *h264Run) {
-	demux, err := media.NewH264Demux(s.path)
-	if err != nil {
-		fmt.Printf("h264 source: open %s: %v\n", s.path, err)
-		s.finish(run)
-		return
+	live := s.reader != nil
+	var demux naluReader
+	if live {
+		demux = media.NewH264StreamDemux(s.reader)
+		fmt.Println("h264 source: start (live stream)")
+	} else {
+		d, err := media.NewH264Demux(s.path)
+		if err != nil {
+			fmt.Printf("h264 source: open %s: %v\n", s.path, err)
+			s.finish(run)
+			return
+		}
+		demux = d
+		fmt.Printf("h264 source: start (%s)\n", s.path)
 	}
-	fmt.Printf("h264 source: start (%s)\n", s.path)
 
 	ticker := time.NewTicker(videoFrameInterval)
 	defer ticker.Stop()
+	start := time.Now()
 
 	var (
 		ts       uint32
@@ -106,7 +133,14 @@ func (s *H264Source) run(run *h264Run) {
 		}
 		// VCL NALU（type 1~5）才代表一帧；SPS/PPS 不占节奏、不推进时间戳
 		isVCL := typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR
-		if isVCL && !firstVCL {
+		if live {
+			if isVCL {
+				// 实时流不额外限速：ffmpeg 已经按摄像头节奏产出。
+				// 时间戳跟随墙上时钟，避免固定 25fps 步进和实际帧率不一致，
+				// 也保证和 RTCP SR 里的 NTP↔RTP 映射一致。
+				ts = uint32(time.Since(start).Seconds() * float64(videoClockRate))
+			}
+		} else if isVCL && !firstVCL {
 			<-ticker.C
 		}
 

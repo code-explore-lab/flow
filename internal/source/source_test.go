@@ -144,6 +144,35 @@ func TestH264SourceLateSubscriberGetsHeadersAndLastIDR(t *testing.T) {
 	}
 }
 
+func TestH264SourceFromReaderLiveTimestamps(t *testing.T) {
+	path := buildH264File(t, 2)
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := NewH264SourceFromReader(bytes.NewReader(blob))
+	rd, cancel := src.Subscribe()
+	defer cancel()
+
+	frames := collect(t, rd)
+	if len(frames) != 5 {
+		t.Fatalf("got %d frames, want 5", len(frames))
+	}
+	wantTypes := []uint8{7, 8, 5, 1, 1}
+	for i, f := range frames {
+		if got := f.Data[0] & 0x1F; got != wantTypes[i] {
+			t.Fatalf("frame %d type = %d, want %d", i, got, wantTypes[i])
+		}
+	}
+	// 实时模式时间戳来自墙上时钟：不保证 3600 步进，但必须单调不减
+	for i := 1; i < len(frames); i++ {
+		if frames[i].Timestamp < frames[i-1].Timestamp {
+			t.Fatalf("timestamps not monotonic: %v", frames)
+		}
+	}
+}
+
 func TestH264SourceRestartsAfterEOF(t *testing.T) {
 	src := NewH264Source(buildH264File(t, 0))
 

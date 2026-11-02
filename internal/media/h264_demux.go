@@ -2,6 +2,7 @@ package media
 
 //从 `test.h264`（Annex-B，`00 00 00 01` 起始码）里切出每个 NALU。
 import (
+	"bufio"
 	"errors"
 	"io"
 	"os"
@@ -104,6 +105,79 @@ func (d *H264Demux) skipStartCode(startPos int) int {
 		return i + 4
 	}
 	return -1
+}
+
+// H264StreamDemux 从连续字节流（ffmpeg 的 pipe:1、摄像头、网络）里切 NALU。
+// 与 H264Demux 的区别是它不把整个流读进内存，而是一边读一边找起始码，
+// 适合没有尽头的实时流。
+type H264StreamDemux struct {
+	r *bufio.Reader
+	// started 表示下一个 NALU 的起始码在上次调用里已经消费掉了。
+	// 这样跨调用不会重复扫描起始码，也不会把两个 NALU 之间的字节吞掉。
+	started bool
+}
+
+// NewH264StreamDemux 包装一个字节流。读多少取决于调用方什么时候要下一帧。
+func NewH264StreamDemux(r io.Reader) *H264StreamDemux {
+	return &H264StreamDemux{r: bufio.NewReaderSize(r, 64*1024)}
+}
+
+// NextNALU 读取下一个 NALU。没有新数据时会阻塞在 ReadByte 上；
+// 流结束返回 io.EOF；最后一个 NALU 后面没有起始码时，先返回数据，下一次再返回 EOF。
+func (d *H264StreamDemux) NextNALU() ([]byte, error) {
+	if !d.started {
+		if err := d.skipToStartCode(); err != nil {
+			return nil, err
+		}
+	}
+	d.started = false
+
+	var nalu []byte
+	zeros := 0 // 连续 0 的个数：起始码 00 00 01 / 00 00 00 01 的候选
+	for {
+		b, err := d.r.ReadByte()
+		if err != nil {
+			if len(nalu) > 0 {
+				// 流结束时最后一个 NALU 可能没有后继起始码
+				return nalu, nil
+			}
+			return nil, err
+		}
+		if b == 0 {
+			zeros++
+			continue
+		}
+		if b == 1 && zeros >= 2 {
+			// 找到下一个起始码（已消费），下一次调用直接从 NALU 数据开始读
+			d.started = true
+			return nalu, nil
+		}
+		// 这些 0 不是起始码的一部分，属于 NALU 数据
+		for ; zeros > 0; zeros-- {
+			nalu = append(nalu, 0)
+		}
+		nalu = append(nalu, b)
+	}
+}
+
+// skipToStartCode 丢弃起始码之前的字节（比如文件开头的脏数据），
+// 停在 00 00 01 的 1 之后。
+func (d *H264StreamDemux) skipToStartCode() error {
+	zeros := 0
+	for {
+		b, err := d.r.ReadByte()
+		if err != nil {
+			return err
+		}
+		switch {
+		case b == 0:
+			zeros++
+		case b == 1 && zeros >= 2:
+			return nil
+		default:
+			zeros = 0
+		}
+	}
 }
 
 /*

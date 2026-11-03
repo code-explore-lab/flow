@@ -43,9 +43,10 @@
   - 视频 timestamp 继续按源时间走，不重复上一帧；
   - 验收：ffmpeg 拉流中 PAUSE 10s 再 PLAY，画面正常、Wireshark 里 seq 单调；
   - ✅ 已实现：`trackStats` 增加 `seq`（uint32，写头时截断 uint16）、`ensureSSRC()`（首次随机生成后固定）、`nextSeq()`；`streamH264`/`streamAAC` 不再用局部 `seq`/`rand.Uint32()`。raw RTSP/TCP 实测 PAUSE 前后 ssrc=e39d1a52 不变、seq 17→18 连续。
-- [ ] **P0-5 端到端验证脚本**
+- [x] **P0-5 端到端验证脚本**
   - 用 raw socket 或 ffmpeg 构造 `PLAY → PAUSE → PLAY`；
-  - 验收：服务端日志只有一次 `stream start`，无重复发送。
+  - 验收：服务端日志只有一次 `stream start`，无重复发送；
+  - ✅ 已实现：`test/e2e/rtsp_pause_play.py`（标准库 raw RTSP/TCP 客户端）固化 `PLAY→PAUSE→PLAY` 全流程，自动断言 SSRC 不变、seq 跨 PAUSE 单调、PAUSE 后静默、速率不翻倍、单通道单 SSRC。实测 PASS；服务端日志确认 h264/aac source 各 `start` 一次，PAUSE 后 `stream stopped`、再次 PLAY 恢复。
 
 ---
 
@@ -55,14 +56,16 @@
 
 ### P1-A 接收侧基础
 
-- [ ] **P1-1 新增 `ExternalSource`：接受外部写入的 Frame**
+- [x] **P1-1 新增 `ExternalSource`：接受外部写入的 Frame**
   - `internal/source/external.go`：复用 `RingBuffer[Frame]`，提供 `Write(Frame)` / `Subscribe()`；
   - 缓存 SPS/PPS/最近 IDR，供中途加入的拉流客户端预热；
-  - 验收：单测两个读者收到同一批帧，`Dropped()` 对慢读者生效。
-- [ ] **P1-2 RTP 包解析**
+  - 验收：单测两个读者收到同一批帧，`Dropped()` 对慢读者生效；
+  - ✅ 已实现：`ExternalSource` 无源 goroutine，`Write` 按 NAL 类型缓存参数集、`Subscribe` 预加载 SPS/PPS/IDR、`Close` 结束源。3 个单测覆盖双读者同帧、慢读者丢帧（Dropped=6）、中途加入预加载，全部 `-race` 通过。
+- [x] **P1-2 RTP 包解析**
   - `internal/rtp/depacketizer.go`：解析 12 字节固定头，处理 CSRC（CC）、扩展头（X）、padding（P）；
   - 记录 seq、timestamp、SSRC、marker；
   - 验收：表驱动测试覆盖普通包、带 CSRC、带扩展、padding。
+  - ✅ 已实现：`Parse` 零拷贝解析，扩展头按 profile + 32 位字 length 跳过并暴露 `ExtensionProfile/ExtensionData`，padding 按尾字节截断；`Depacketizer` 在解析成功后记录最近 seq/timestamp/SSRC/marker 和包数，失败不改状态。`Unmarshal` 改为委托 `Parse`，`Marshal` 补上扩展头与 padding 写出。表驱动覆盖普通/CSRC/扩展/padding/三者组合 + 7 种错误输入 + 往返测试，全部 `-race` 通过。
 - [ ] **P1-3 H.264 解包：单 NALU + FU-A 重组**
   - type 1~23 直接成包；type 28 按 S/E 位重组，丢包时丢弃半成品；
   - 处理 STAP-A（type 24）拆出多个 NALU；

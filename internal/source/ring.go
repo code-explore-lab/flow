@@ -38,17 +38,17 @@ func (r *RingBuffer[T]) Capacity() int {
 // Write 写入一帧并唤醒所有读者。写满时覆盖最老的帧，
 // 生产者不做任何等待——这正是“慢消费者不拖慢整体”的关键。
 func (r *RingBuffer[T]) Write(v T) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
+	r.mu.Lock()         // ① 加锁
+	defer r.mu.Unlock() // ⑤ 函数返回时解锁
+	if r.closed {       // ② 已关闭就丢弃
 		return
 	}
-	r.buf[r.nextSeq%uint64(len(r.buf))] = v
-	r.nextSeq++
-	for _, rd := range r.subs {
+	r.buf[r.nextSeq%uint64(len(r.buf))] = v // ③ 写入槽位
+	r.nextSeq++                             // ④ 序号自增
+	for _, rd := range r.subs {             // ⑥ 遍历所有读者
 		select {
-		case rd.notify <- struct{}{}:
-		default: // 已经有未处理的唤醒信号，合并掉
+		case rd.notify <- struct{}{}: // ⑦ 尝试发信号
+		default: // ⑧ 发不进就跳过
 		}
 	}
 }

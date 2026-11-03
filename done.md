@@ -66,14 +66,16 @@
   - 记录 seq、timestamp、SSRC、marker；
   - 验收：表驱动测试覆盖普通包、带 CSRC、带扩展、padding。
   - ✅ 已实现：`Parse` 零拷贝解析，扩展头按 profile + 32 位字 length 跳过并暴露 `ExtensionProfile/ExtensionData`，padding 按尾字节截断；`Depacketizer` 在解析成功后记录最近 seq/timestamp/SSRC/marker 和包数，失败不改状态。`Unmarshal` 改为委托 `Parse`，`Marshal` 补上扩展头与 padding 写出。表驱动覆盖普通/CSRC/扩展/padding/三者组合 + 7 种错误输入 + 往返测试，全部 `-race` 通过。
-- [ ] **P1-3 H.264 解包：单 NALU + FU-A 重组**
+- [x] **P1-3 H.264 解包：单 NALU + FU-A 重组**
   - type 1~23 直接成包；type 28 按 S/E 位重组，丢包时丢弃半成品；
   - 处理 STAP-A（type 24）拆出多个 NALU；
   - 验收：单测覆盖单包、FU-A、乱序、缺首片、缺尾片、STAP-A。
-- [ ] **P1-4 AAC 解包（RFC 3640）**
+  - ✅ 已实现：`internal/rtp/h264_depacketizer.go` 新增 `H264Depacketizer.Depacketize`，单 NALU 直接返回，STAP-A 按 2 字节长度前缀拆包，FU-A 用 `frag` 跨包累积并按 S/E 收尾；seq 不连续、timestamp/SSRC 变化或新的单 NALU 到来时 `abandon()` 丢弃半成品并计入 `Dropped`，孤立中间片/尾片同样丢弃。`-race` 下单测覆盖单包（type 1/5/7/8/23）、多片 FU-A、S+E 单包、乱序、缺首片、缺中间片、缺尾片、timestamp/SSRC 变化、STAP-A 及非法长度、未知类型，另有 packer→depacketizer 往返测试。
+- [x] **P1-4 AAC 解包（RFC 3640）**
   - 解析 `AU-headers-length`、每个 `AU-header` 的 size/index，支持一包多 AU；
   - 从 SDP fmtp 读 `SizeLength` / `IndexLength` / `IndexDeltaLength`；
   - 验收：单测 1 AU/包、2 AU/包。
+  - ✅ 已实现：`internal/rtp/aac_depacketizer.go` 新增 `AACDepacketizer.Depacketize`，`AU-headers-length` 按 bit 解析并校验字节对齐，首个 AU-header 读 size + `IndexLength` 位绝对 index，后续读 size + `IndexDeltaLength` 位增量并累加；按 AU-size 切分 AU-data，总长不符报 `ErrAACSizeMismatch`。`ParseAACFmtp` 支持 fmtp 值或整行 SDP、大小写不敏感、缺省回退 13/3/3，非法位宽返回 `ErrAACInvalidConfig`。`-race` 下单测覆盖 1 AU/包、手写两 AU 位布局、index 累加、自定义 6/2/2 位宽、packer→depacketizer 往返及 8 类非法输入。
 
 ### P1-B RTSP 推流交互
 

@@ -11,6 +11,7 @@ import (
 const (
 	AACSizeLength         = 13 // SizeLength：AU size 占 13 bit
 	AACIndexLength        = 3  // IndexLength：AU index 占 3 bit
+	AACIndexDeltaLength   = 3  // IndexDeltaLength：多 AU 时后续 index 增量占 3 bit
 	AACAUHeaderLength     = AACSizeLength + AACIndexLength
 	AACMaxAUSize          = (1 << AACSizeLength) - 1 // 13 bit 能表达的最大 AU 长度
 	AACFrameSamples       = 1024                     // AAC LC 一个 AU 固定 1024 个采样，音频 timestamp 每次 +1024

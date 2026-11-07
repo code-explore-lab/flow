@@ -28,6 +28,10 @@ type Conn struct {
 	// 响应里拿到 Session 后会复用；万一它不带，后续 SETUP 用这条连接上的
 	// 会话兜底，避免同一路推流裂成两个会话、丢失已解析的 SDP。
 	announceID string
+
+	// describeStream 记录 DESCRIBE 命中的已发布流名。拉流 SETUP 的 URI
+	// 写法可能与 DESCRIBE 不同（有的客户端会改写路径），按连接记住更稳。
+	describeStream string
 }
 
 func (c *Conn) write(b []byte) error {
@@ -70,6 +74,20 @@ func (c *Conn) announceSession() string {
 	c.sessMu.Lock()
 	defer c.sessMu.Unlock()
 	return c.announceID
+}
+
+// setDescribeStream 记录这条连接 DESCRIBE 命中的已发布流名。
+func (c *Conn) setDescribeStream(name string) {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	c.describeStream = name
+}
+
+// describeStreamName 返回这条连接 DESCRIBE 命中的流名，没有则返回空串。
+func (c *Conn) describeStreamName() string {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return c.describeStream
 }
 
 // readInterleavedFrame 从同一个 TCP 字节流里切出一个 $ 帧：

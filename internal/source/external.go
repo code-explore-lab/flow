@@ -24,6 +24,10 @@ type ExternalSource struct {
 	// 参数集缓存：中途加入的订阅者先补 SPS/PPS + 最近一个 IDR，收到就能解码。
 	// 在 Write 里写、在 Subscribe 里读，都拿 mu 串行化。
 	sps, pps, idr *Frame
+
+	// rate 音频 RTP 时钟（= AAC 采样率），从 ANNOUNCE 的 rtpmap 带过来。
+	// 拉流端 streamAAC 用它设置 RTCP SR 的 RTP 时钟。
+	rate uint32
 }
 
 // NewExternalSource 创建一个空的视频推流源（缓存 SPS/PPS/IDR 供预热）。
@@ -34,7 +38,30 @@ func NewExternalSource() *ExternalSource {
 // NewExternalAudioSource 创建一个空的音频推流源。
 // 音频 AU 没有 NAL 头，不做参数集缓存，订阅者直接跟实时帧。
 func NewExternalAudioSource() *ExternalSource {
-	return newExternalSource(false)
+	s := newExternalSource(false)
+	s.rate = aacDefaultFrequency
+	return s
+}
+
+// SetSamplingRate 记录音频采样率（ANNOUNCE rtpmap 的 clock rate）。
+func (s *ExternalSource) SetSamplingRate(rate uint32) {
+	if rate == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.rate = rate
+	s.mu.Unlock()
+}
+
+// SamplingRate 返回音频采样率；未设置时返回 AAC 默认值。
+// 与 AACSource 的同名方法保持同一语义，streamAAC 不区分源的类型。
+func (s *ExternalSource) SamplingRate() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rate == 0 {
+		return aacDefaultFrequency
+	}
+	return s.rate
 }
 
 func newExternalSource(cacheParamSets bool) *ExternalSource {

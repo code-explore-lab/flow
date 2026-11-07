@@ -12,6 +12,7 @@ import (
 
 	"flow/internal/rtcp"
 	"flow/internal/session"
+	"flow/internal/source"
 )
 
 // mediaTrack 一条媒体轨（video/audio）的传输参数。
@@ -42,6 +43,12 @@ type mediaTrack struct {
 	payloadType int    // ANNOUNCE SDP 协商出的 RTP payload type
 	encoding    string // "H264" / "MPEG4-GENERIC"
 	fmtp        string // ANNOUNCE SDP 的 a=fmtp（AAC 解包位宽用）
+
+	// external 这条轨对应的推流源：
+	//   - 推流端 SETUP 时指向 publishedStream 的源（解包后写进去）；
+	//   - 拉流端 SETUP 时指向同一个源（PLAY 后订阅它转发）；
+	//   - 文件/live 模式为 nil，PLAY 时退回 Server 上的全局源。
+	external *source.ExternalSource
 
 	// 接收侧状态。pushRx 在 RECORD/SETUP 时创建，解包后的帧写进它的
 	// ExternalSource；统计字段供验收对比「收到多少包/帧」。
@@ -211,6 +218,12 @@ type Session struct {
 	announcedIndex map[string]int
 	push           bool
 
+	// pub 这个会话关联的已发布流：推流会话在 ANNOUNCE 时创建，
+	// 拉流会话在 SETUP 时按 URL 找到并挂上。SETUP/PLAY 用它取编码参数和
+	// ExternalSource。pubCleanup 在会话关闭时把这条流从 Server 注册表摘掉。
+	pub        *publishedStream
+	pubCleanup func()
+
 	// 每次 PLAY 的独立生命周期。PAUSE 时取消它，TEARDOWN 时由会话
 	// context 级联取消。playMu 保护下面两个字段。
 	playMu     sync.Mutex
@@ -262,6 +275,24 @@ func (s *Session) isPush() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.push
+}
+
+// setPublished 给会话挂上已发布流。cleanup 可为 nil（拉流会话不需要注销）。
+// 重复 ANNOUNCE 时整体替换，并保留最后一次注册的 cleanup。
+func (s *Session) setPublished(pub *publishedStream, cleanup func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pub = pub
+	if cleanup != nil {
+		s.pubCleanup = cleanup
+	}
+}
+
+// published 返回会话关联的已发布流（推流/拉流都可能非 nil）。
+func (s *Session) published() *publishedStream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pub
 }
 
 // pushTrackByRTPChannel 按 interleaved 的 RTP channel 找推流轨。
@@ -362,10 +393,20 @@ func (s *Session) stopPlay() {
 
 // closeAll 关掉会话下所有轨的 UDP socket 和推流接收源
 // （TEARDOWN / 超时回收时由 OnClose 调用）。
+//
+// 推流会话还会把已发布流从 Server 注册表摘掉并关闭源：拉流端的 reader
+// 读完剩余帧后返回 false，不会永远挂在等待上。
 func (s *Session) closeAll() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	tracks := make([]*mediaTrack, 0, len(s.tracks))
 	for _, t := range s.tracks {
+		tracks = append(tracks, t)
+	}
+	cleanup := s.pubCleanup
+	s.pubCleanup = nil
+	s.mu.Unlock()
+
+	for _, t := range tracks {
 		if t.isPush {
 			// 打一条终态统计，便于和推流端（ffmpeg）的发送量对比。
 			packets, bytes, frames, gaps := t.recvSummary()
@@ -379,6 +420,10 @@ func (s *Session) closeAll() {
 		if t.rtcpConn != nil {
 			t.rtcpConn.Close()
 		}
+	}
+	// 放在锁外：unpublish 会拿 Server 的锁并关闭源，避免和别的路径形成锁序环。
+	if cleanup != nil {
+		cleanup()
 	}
 }
 

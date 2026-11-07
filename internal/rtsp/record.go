@@ -32,14 +32,20 @@ type pushReceiver struct {
 }
 
 // newPushReceiver 按 ANNOUNCE 协商出的编码创建解包器。
-func newPushReceiver(encoding, fmtp string) (*pushReceiver, error) {
-	rx := &pushReceiver{}
+// external 是已发布流的帧源（拉流端也要订阅同一个）；为空时退回私有源，
+// 兼容不经过 ANNOUNCE 注册发布的直接调用（单测）。
+func newPushReceiver(encoding, fmtp string, external *source.ExternalSource) (*pushReceiver, error) {
+	rx := &pushReceiver{external: external}
 	switch strings.ToUpper(encoding) {
 	case "H264":
-		rx.external = source.NewExternalSource()
+		if rx.external == nil {
+			rx.external = source.NewExternalSource()
+		}
 		rx.h264 = &rtp.H264Depacketizer{}
 	case "MPEG4-GENERIC":
-		rx.external = source.NewExternalAudioSource()
+		if rx.external == nil {
+			rx.external = source.NewExternalAudioSource()
+		}
 		cfg, err := rtp.ParseAACFmtp(fmtp)
 		if err != nil {
 			return nil, fmt.Errorf("parse AAC fmtp: %w", err)
@@ -63,7 +69,7 @@ func (t *mediaTrack) ensurePushReceiver() (*pushReceiver, error) {
 	if t.pushRx != nil {
 		return t.pushRx, nil
 	}
-	rx, err := newPushReceiver(t.encoding, t.fmtp)
+	rx, err := newPushReceiver(t.encoding, t.fmtp, t.external)
 	if err != nil {
 		return nil, err
 	}

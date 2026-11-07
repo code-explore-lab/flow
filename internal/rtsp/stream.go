@@ -5,19 +5,60 @@ import (
 	"time"
 
 	"flow/internal/rtp"
+	"flow/internal/source"
 )
+
+// videoFrameSource 拉流端订阅的帧源抽象。
+// 本地文件/live 模式的 *source.H264Source 和推流场景的 *source.ExternalSource
+// 都满足这个接口，streamH264 不需要区分数据从哪来。
+type videoFrameSource interface {
+	Subscribe() (*source.Reader[source.Frame], func())
+}
+
+// audioFrameSource 音频帧源额外提供采样率，用来设置 RTCP SR 的 RTP 时钟。
+type audioFrameSource interface {
+	videoFrameSource
+	SamplingRate() uint32
+}
+
+// videoSourceFor 选择这条轨的帧源：已发布流优先，否则用本地全局源。
+// 返回 nil 表示没有可用的源（调用方不要启动转发 goroutine）。
+func (s *Server) videoSourceFor(t *mediaTrack) videoFrameSource {
+	if t.external != nil {
+		return t.external
+	}
+	if s.video != nil {
+		return s.video
+	}
+	return nil
+}
+
+// audioSourceFor 选择音频帧源，规则同 videoSourceFor。
+func (s *Server) audioSourceFor(t *mediaTrack) audioFrameSource {
+	if t.external != nil {
+		return t.external
+	}
+	if s.audio != nil {
+		return s.audio
+	}
+	return nil
+}
 
 // streamH264 每个客户端一条订阅 goroutine：
 // 从共享视频源拿 Frame → 封 RTP → 发送。
 // 源只读一次，多个客户端各自从自己的 Reader 取同一批 NALU；
 // seq/SSRC 仍然每个客户端独立，时间戳由源统一打好，保证多路一致。
-func (s *Server) streamH264(track *mediaTrack, done <-chan struct{}) {
+func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan struct{}) {
 	// 每个客户端拿一个独立的 Reader，按自己的 seq 从共享 ring buffer 读。
 	// 客户端慢只会让自己的游标落后、被新帧覆盖，不会阻塞源和其他客户端。
-	reader, cancel := s.video.Subscribe()
+	reader, cancel := src.Subscribe()
 	defer cancel()
 
 	packer := rtp.NewH264Packer(1400)
+	// 推流场景沿用 ANNOUNCE 的 payload type，保证和 DESCRIBE 一致。
+	if track.payloadType > 0 {
+		packer.PT = uint8(track.payloadType)
+	}
 	var dropped uint64
 	// SSRC 和 seq 从 track 取，跨 PAUSE/PLAY 连续。
 	ssrc := track.ensureSSRC()
@@ -59,11 +100,14 @@ func (s *Server) streamH264(track *mediaTrack, done <-chan struct{}) {
 
 // streamAAC 每个客户端一条订阅 goroutine：从共享音频源拿 AU → RFC 3640 封包 → 发送。
 // 音频时间戳（采样数，每个 AU +1024）由源统一维护，客户端只负责封包和 seq/SSRC。
-func (s *Server) streamAAC(track *mediaTrack, done <-chan struct{}) {
-	reader, cancel := s.audio.Subscribe()
+func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan struct{}) {
+	reader, cancel := src.Subscribe()
 	defer cancel()
 
 	packer := rtp.NewAACPacker()
+	if track.payloadType > 0 {
+		packer.PT = uint8(track.payloadType)
+	}
 	var dropped uint64
 	ssrc := track.ensureSSRC()
 	rateSet := false
@@ -82,9 +126,9 @@ func (s *Server) streamAAC(track *mediaTrack, done <-chan struct{}) {
 			dropped = d
 		}
 		// RTCP SR 的 RTP 时钟 = AAC 采样率。
-		// 第一帧到达时源已经解析完 ADTS 头，这时取到的值才是准的。
+		// 文件源在第一帧到达时已经解析完 ADTS 头；推流源来自 ANNOUNCE rtpmap。
 		if !rateSet {
-			track.setClockRate(s.audio.SamplingRate())
+			track.setClockRate(src.SamplingRate())
 			rateSet = true
 		}
 		pkts, err := packer.Pack(f.Data)

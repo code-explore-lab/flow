@@ -90,6 +90,29 @@ func TestExternalAudioSourceSkipsParamSetPreload(t *testing.T) {
 	}
 }
 
+// TestExternalAudioSourceSamplingRate 音频源默认 44100；ANNOUNCE 带不同
+// 采样率时以 SetSamplingRate 为准（拉流端 RTCP SR 的 RTP 时钟）。
+func TestExternalAudioSourceSamplingRate(t *testing.T) {
+	src := NewExternalAudioSource()
+	if got := src.SamplingRate(); got != 44100 {
+		t.Fatalf("default sampling rate = %d, want 44100", got)
+	}
+	src.SetSamplingRate(48000)
+	if got := src.SamplingRate(); got != 48000 {
+		t.Fatalf("sampling rate = %d, want 48000", got)
+	}
+	src.SetSamplingRate(0) // 0 不覆盖已有值
+	if got := src.SamplingRate(); got != 48000 {
+		t.Fatalf("sampling rate after SetSamplingRate(0) = %d, want 48000", got)
+	}
+
+	// 视频源不参与采样率协商，读到的应是默认值而不是未初始化状态。
+	video := NewExternalSource()
+	if got := video.SamplingRate(); got != 44100 {
+		t.Fatalf("video source sampling rate = %d, want default", got)
+	}
+}
+
 // TestExternalSourceSlowReaderDrops 慢读者落后时跳过被覆盖的帧，Dropped 记录数量。
 func TestExternalSourceSlowReaderDrops(t *testing.T) {
 	src := NewExternalSource()

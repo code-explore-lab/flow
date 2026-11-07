@@ -27,6 +27,10 @@ type Server struct {
 
 	sessions *session.Manager
 
+	// 已发布流注册表（ANNOUNCE 创建，拉流端按 URL 路径查找）。P1-8。
+	pubMu     sync.RWMutex
+	published map[string]*publishedStream
+
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
@@ -42,6 +46,7 @@ func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 		videoPath: "testdata/test.h264",
 		audioPath: "testdata/test.aac",
 		sessions:  session.NewManager(session.DefaultTimeout),
+		published: make(map[string]*publishedStream),
 		conns:     make(map[*Conn]struct{}),
 	}
 }

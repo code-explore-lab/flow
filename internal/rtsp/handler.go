@@ -67,7 +67,13 @@ func (s *Server) handleConn(conn *Conn) {
 			respErr = writeResponse(conn, "200 OK", hd, nil)
 		case "DESCRIBE":
 			hd["Content-Type"] = "application/sdp"
-			sdp, errSDP := s.buildSDP()
+			// 记住命中的已发布流，后续 SETUP 即使 URI 写法不同也能找回来。
+			if pub := s.publishedFromURI(req.URI); pub != nil {
+				conn.setDescribeStream(pub.name)
+			} else {
+				conn.setDescribeStream("")
+			}
+			sdp, errSDP := s.buildSDP(req.URI)
 			if errSDP != nil {
 				respErr = writeResponse(conn, "500 Internal Server Error", hd, nil)
 				break
@@ -165,8 +171,15 @@ func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
 }
 
 // buildSDP 生成 DESCRIBE 响应的 SDP 文本。
-// 文件模式下 video + audio 两条 m= 行；实时模式只有 video（带内参数集）。
-func (s *Server) buildSDP() (string, error) {
+//
+// 优先按 URI 查找已发布流：推流场景下编码参数（rtpmap/fmtp，包括
+// sprop-parameter-sets 和 AAC config）全部来自 ANNOUNCE，拉流端与推流端一致。
+// 没有已发布流时退回本地文件/实时源的原有逻辑。
+func (s *Server) buildSDP(uri string) (string, error) {
+	if pub := s.publishedFromURI(uri); pub != nil {
+		return pub.sdp(), nil
+	}
+
 	sdp := "v=0\r\n" +
 		"o=- 0 0 IN IP4 127.0.0.1\r\n" +
 		"s=TestStream\r\n" +
@@ -249,6 +262,13 @@ func (s *Server) handleAnnounce(conn *Conn, req *Request, hd map[string]string) 
 
 	rtspSess := sess.Data.(*Session)
 	rtspSess.setAnnounced(tracks)
+
+	// 按 URL 路径登记已发布流：拉流端 DESCRIBE/SETUP 用同一个路径找到它。
+	// 同一个会话重复 ANNOUNCE 时替换旧流；会话关闭时再从注册表摘掉。
+	name := streamKeyFromURI(req.URI)
+	pub := s.publish(name, tracks)
+	rtspSess.setPublished(pub, func() { s.unpublish(name, pub) })
+
 	conn.bindSession(sess.ID)
 	conn.setAnnounceSession(sess.ID)
 
@@ -299,17 +319,46 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	// 判断这次 SETUP 建哪条轨。
 	// 推流模式（ANNOUNCE 已建会话）：URI 里的 control 去 announced 索引查，
 	//   拿到客户端 SDP 里写死的 kind / clockRate / payloadType。
-	// 拉流模式：URI 里 trackID/streamid 映射，客户端没带就按“video 先、audio 后”推断。
+	// 拉流模式：先按 URL 找到已发布流，用它 ANNOUNCE 的编码参数；
+	//   找不到已发布流时才退回 trackID/streamid 映射和本地源。
 	announced := rtspSess.announcedTracks()
 	// 有 ANNOUNCE 轨道说明这是推流会话：SETUP 的方向是客户端 → 服务端。
 	push := len(announced) > 0
+
+	var pub *publishedStream
+	if !push {
+		describeName := conn.describeStreamName()
+		pub = s.publishedFromURI(req.URI)
+		if pub == nil && describeName != "" {
+			// 有些客户端 SETUP 的 URL 与 DESCRIBE 不同，用连接上记录的流兜底。
+			pub = s.publishedStreamByName(describeName)
+		}
+		if pub == nil && describeName != "" {
+			// DESCRIBE 时流还在、SETUP 时已经下线：不能退回本地文件源冒充，
+			// 否则客户端会收到完全不相关的 testdata 流。
+			return writeResponse(conn, "404 Not Found", hd, nil)
+		}
+		if pub != nil {
+			rtspSess.setPublished(pub, nil)
+		}
+	}
+
 	kind := ""
 	clockRate := uint32(90000)
 	payloadType := 0
 	encoding := ""
 	fmtp := ""
-	if push {
+	switch {
+	case push:
 		if at, ok := rtspSess.announcedTrack(req.URI); ok {
+			kind = at.Kind
+			clockRate = uint32(at.ClockRate)
+			payloadType = at.PayloadType
+			encoding = at.Encoding
+			fmtp = at.FMTP
+		}
+	case pub != nil:
+		if at, ok := pub.trackByControl(req.URI); ok {
 			kind = at.Kind
 			clockRate = uint32(at.ClockRate)
 			payloadType = at.PayloadType
@@ -326,12 +375,24 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			kind = "audio"
 		}
 	}
+	// URI 里没有 control 段时按 kind 补齐已发布流的编码参数。
+	if pub != nil && payloadType == 0 {
+		if at, ok := pub.firstTrackOfKind(kind); ok {
+			clockRate = uint32(at.ClockRate)
+			payloadType = at.PayloadType
+			encoding = at.Encoding
+			fmtp = at.FMTP
+		}
+	}
 
 	// 音频轨是否存在：
 	//   推流模式 → announced SDP 里有没有 m=audio；
-	//   拉流模式 → 服务端有没有挂音频源。
+	//   拉流模式 → 已发布流里有没有音频轨，或服务端有没有挂本地音频源。
 	if kind == "audio" {
 		hasAudio := s.audio != nil
+		if pub != nil && pub.audio != nil {
+			hasAudio = true
+		}
 		for _, at := range announced {
 			if at.Kind == "audio" {
 				hasAudio = true
@@ -341,9 +402,9 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		if !hasAudio {
 			return writeResponse(conn, "404 Not Found", hd, nil)
 		}
-		// 拉流模式音频 clockRate 先用 44100 占位，streamAAC 拿到首帧后会覆盖；
-		// 推流模式已从 announced SDP 取到实际采样率。
-		if len(announced) == 0 {
+		// 本地文件模式音频 clockRate 先用 44100 占位，streamAAC 拿到首帧后会覆盖；
+		// 推流/已发布流模式已从 ANNOUNCE 的 rtpmap 取到实际采样率。
+		if len(announced) == 0 && pub == nil {
 			clockRate = 44100
 		}
 	}
@@ -358,6 +419,14 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		payloadType:   payloadType,
 		encoding:      encoding,
 		fmtp:          fmtp,
+	}
+	// 推流端写这个源、拉流端订阅同一个源；本地文件/live 模式保持 nil。
+	pubForTrack := pub
+	if push {
+		pubForTrack = rtspSess.published()
+	}
+	if pubForTrack != nil {
+		t.external = pubForTrack.sourceFor(kind)
 	}
 
 	var respTransport string
@@ -463,17 +532,23 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 	}
 	video := rtspSess.track("video")
 	audio := rtspSess.track("audio")
+	// 已发布流的轨用 track.external（推流端解包后写入的源），
+	// 本地文件/live 模式退回 Server 上的全局源。
 	if video != nil {
-		go s.streamH264(video, playDone)
+		if src := s.videoSourceFor(video); src != nil {
+			go s.streamH264(video, src, playDone)
+		}
 	}
-	if audio != nil && s.audio != nil {
-		go s.streamAAC(audio, playDone)
+	if audio != nil {
+		if src := s.audioSourceFor(audio); src != nil {
+			go s.streamAAC(audio, src, playDone)
+		}
 	}
 	// 每 5s 发一次 RTCP SR，带 NTP↔RTP 映射；随 PLAY 生命周期启停。
 	if video != nil {
 		go sendSenderReports(video, playDone)
 	}
-	if audio != nil && s.audio != nil {
+	if audio != nil {
 		go sendSenderReports(audio, playDone)
 	}
 	return nil

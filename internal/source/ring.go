@@ -15,7 +15,7 @@ type RingBuffer[T any] struct {
 	buf     []T
 	nextSeq uint64 // 下一帧的序号，同时也是累计写入数
 	closed  bool
-	subs    map[int]*Reader[T]
+	subs    map[int]*Reader[T] // key=reader.id, value = *Reader[T]
 	nextID  int
 }
 
@@ -106,11 +106,11 @@ type Reader[T any] struct {
 	ring    *RingBuffer[T]
 	id      int
 	pos     uint64 // 下一个要读的 seq
-	preload []T
+	preload []T    //External: 预加载的帧，优先于实时帧返回
 	notify  chan struct{}
 	cancel  chan struct{}
-	dropped uint64
-	closed  bool // 受 ring.mu 保护
+	dropped uint64 //追不上生产者，被覆盖而丢掉的帧
+	closed  bool   // 受 ring.mu 保护
 	once    sync.Once
 }
 
@@ -137,11 +137,11 @@ func (rd *Reader[T]) Next(done <-chan struct{}) (T, bool) {
 		}
 
 		oldest := r.oldestLocked()
-		if rd.pos < oldest {
+		if rd.pos < oldest { //读者游标落后太多， 帧已经被覆盖
 			rd.dropped += oldest - rd.pos
 			rd.pos = oldest
 		}
-		if rd.pos < r.nextSeq {
+		if rd.pos < r.nextSeq { // 取出新帧
 			v := r.buf[int(rd.pos%uint64(len(r.buf)))]
 			rd.pos++
 			r.mu.Unlock()

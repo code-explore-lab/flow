@@ -69,6 +69,27 @@ func TestExternalSourceLateJoinerGetsPreload(t *testing.T) {
 	}
 }
 
+// TestExternalAudioSourceSkipsParamSetPreload 音频 AU 首字节可能恰好是
+// SPS/PPS/IDR 的类型值，但不能被当成 NAL 缓存并预加载给新订阅者。
+func TestExternalAudioSourceSkipsParamSetPreload(t *testing.T) {
+	src := NewExternalAudioSource()
+	src.Write(Frame{Data: []byte{0x67, 1}}) // 视频里是 SPS
+	src.Write(Frame{Data: []byte{0x68, 2}}) // 视频里是 PPS
+	src.Write(Frame{Data: []byte{0x65, 3}}) // 视频里是 IDR
+
+	rd, cancel := src.Subscribe()
+	defer cancel()
+	src.Write(Frame{Data: []byte{0x21, 4}, Timestamp: 1024})
+
+	f, ok := nextWithTimeout(t, rd)
+	if !ok {
+		t.Fatal("expected a live audio frame")
+	}
+	if f.Data[0] != 0x21 {
+		t.Fatalf("first frame = %#x, want live AU 0x21 (no preload)", f.Data[0])
+	}
+}
+
 // TestExternalSourceSlowReaderDrops 慢读者落后时跳过被覆盖的帧，Dropped 记录数量。
 func TestExternalSourceSlowReaderDrops(t *testing.T) {
 	src := NewExternalSource()

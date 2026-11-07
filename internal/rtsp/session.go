@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,25 @@ type mediaTrack struct {
 	// SR goroutine 每 5s 读一次。
 	clockRate uint32
 	stats     trackStats
+
+	// 推流（ANNOUNCE/RECORD）方向：客户端把 RTP 发到服务端，服务端只接收。
+	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
+	isPush      bool
+	payloadType int    // ANNOUNCE SDP 协商出的 RTP payload type
+	encoding    string // "H264" / "MPEG4-GENERIC"
+	fmtp        string // ANNOUNCE SDP 的 a=fmtp（AAC 解包位宽用）
+
+	// 接收侧状态。pushRx 在 RECORD/SETUP 时创建，解包后的帧写进它的
+	// ExternalSource；统计字段供验收对比「收到多少包/帧」。
+	recvMu       sync.Mutex
+	pushRx       *pushReceiver
+	recvPackets  uint64
+	recvBytes    uint64
+	recvFrames   uint64
+	recvGaps     uint64
+	recvLastSeq  uint16
+	recvLastSSRC uint32
+	recvLastPT   uint8
 }
 
 // trackStats 记录这条轨已经发了多少 RTP，供 RTCP SR 填入 packet/octet count
@@ -181,6 +201,16 @@ type Session struct {
 	mu     sync.Mutex
 	tracks map[string]*mediaTrack // key: "video" / "audio"
 
+	// ANNOUNCE 带来的推流描述（P1-5）。announcedIndex 把规范化后的
+	// a=control（streamid=0 / trackID=0 / 裸 "0"）映射到 announced 下标，
+	// SETUP 时按 URI 里的 control 找回具体轨道（P1-6 使用）。
+	//
+	// push 为 true 表示这个会话是客户端推流（ANNOUNCE 创建），
+	// SETUP 的方向是“服务端收 RTP”，而不是拉流会话的“服务端发 RTP”。
+	announced      []announcedTrack
+	announcedIndex map[string]int
+	push           bool
+
 	// 每次 PLAY 的独立生命周期。PAUSE 时取消它，TEARDOWN 时由会话
 	// context 级联取消。playMu 保护下面两个字段。
 	playMu     sync.Mutex
@@ -205,6 +235,97 @@ func (s *Session) track(kind string) *mediaTrack {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tracks[kind]
+}
+
+// setAnnounced 保存 ANNOUNCE 解析出的轨道列表，并建立 control → track 索引。
+// 同一个会话重复 ANNOUNCE 时整体替换。
+func (s *Session) setAnnounced(tracks []announcedTrack) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.push = true
+	s.announced = append([]announcedTrack(nil), tracks...)
+	s.announcedIndex = make(map[string]int, len(tracks)*3)
+	for i, t := range tracks {
+		// 客户端 SDP 里可能写 streamid=N，SETUP URI 也可能用 trackID=N，
+		// 两种写法和裸 N 都指向同一条轨。
+		s.announcedIndex[controlLookupKey(t.Control)] = i
+		if t.TrackID != "" {
+			s.announcedIndex[controlLookupKey("trackID="+t.TrackID)] = i
+			s.announcedIndex[strings.ToLower(t.TrackID)] = i
+		}
+	}
+}
+
+// isPush 判断会话是不是推流会话（ANNOUNCE 创建，客户端向服务端发 RTP）。
+func (s *Session) isPush() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.push
+}
+
+// pushTrackByRTPChannel 按 interleaved 的 RTP channel 找推流轨。
+// 只有推流轨才匹配，拉流会话同一通道号不会被误判成收到的媒体。
+func (s *Session) pushTrackByRTPChannel(channel int) (*mediaTrack, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tracks {
+		if t.isPush && t.isInterleaved && t.interleavedRTP == channel {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// pushTrackByPT 按 RTP payload type 找推流轨。
+// interleaved 已经用 channel 定位，UDP 用端口定位；PT 路由用于
+// 通道号未登记或同一条连接上多轨复用时的兜底，也能校验报文归属。
+func (s *Session) pushTrackByPT(pt int) (*mediaTrack, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tracks {
+		if t.isPush && t.payloadType == pt {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// trackCount 返回已 SETUP 的轨数量（RECORD 校验用）。
+func (s *Session) trackCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.tracks)
+}
+
+// tracksSnapshot 返回已 SETUP 轨的快照（RECORD 时逐条初始化接收器）。
+func (s *Session) tracksSnapshot() []*mediaTrack {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*mediaTrack, 0, len(s.tracks))
+	for _, t := range s.tracks {
+		out = append(out, t)
+	}
+	return out
+}
+
+// announcedTracks 返回 ANNOUNCE 轨道列表的快照。
+func (s *Session) announcedTracks() []announcedTrack {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]announcedTrack(nil), s.announced...)
+}
+
+// announcedTrack 按 control 查找轨道。control 可以是 "streamid=0"、
+// "trackID=0"、裸 "0"，也可以是带路径的完整 URL。
+func (s *Session) announcedTrack(control string) (announcedTrack, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i, ok := s.announcedIndex[controlLookupKey(control)]
+	if !ok {
+		return announcedTrack{}, false
+	}
+	return s.announced[i], true
 }
 
 // startPlay 为一次 PLAY 建立独立的推流生命周期。
@@ -239,11 +360,19 @@ func (s *Session) stopPlay() {
 	}
 }
 
-// closeAll 关掉会话下所有轨的 UDP socket（TEARDOWN / 超时回收时由 OnClose 调用）。
+// closeAll 关掉会话下所有轨的 UDP socket 和推流接收源
+// （TEARDOWN / 超时回收时由 OnClose 调用）。
 func (s *Session) closeAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range s.tracks {
+		if t.isPush {
+			// 打一条终态统计，便于和推流端（ffmpeg）的发送量对比。
+			packets, bytes, frames, gaps := t.recvSummary()
+			fmt.Printf("push recv summary (%s): packets=%d frames=%d bytes=%d gaps=%d\n",
+				t.kind, packets, frames, bytes, gaps)
+			t.closePushReceiver()
+		}
 		if t.rtpConn != nil {
 			t.rtpConn.Close()
 		}

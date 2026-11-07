@@ -79,19 +79,22 @@
 
 ### P1-B RTSP 推流交互
 
-- [ ] **P1-5 ANNOUNCE 处理**
+- [x] **P1-5 ANNOUNCE 处理**
   - 解析请求体 SDP：`m=video/audio`、`a=rtpmap`、`a=fmtp`、`a=control`；
   - 建 session 和 track 映射（control → trackID），返回 `200 OK`；
   - 不支持的编码返回 `415 Unsupported Media Type`，SDP 非法返回 `400`；
   - 验收：ffmpeg 推流时服务端日志打印 announce 的 track 列表。
-- [ ] **P1-6 推流 SETUP**
+  - ✅ 已实现：`readRequest` 按 `Content-Length` 读取请求体（1 MiB 上限，读完后不影响后续 `$` 帧）；新增 `internal/rtsp/sdp.go` 解析 `v=`、`m=video/audio`、`a=rtpmap`、`a=fmtp`、`a=control`，支持 `streamid=N` / `trackID=N` / 完整 URL / 缺失时按轨道序号生成 `trackID=N`；只接受 H264 与 MPEG4-GENERIC，其余编码/媒体类型回 415，结构错误回 400。ANNOUNCE 创建（或复用）会话并把轨道列表存到 `Session`，建立 control→track 索引；响应带 `Session`，连接上也记录该会话，SETUP 未回带 Session 时自动复用。实测 `ffmpeg -f rtsp` 推送 mp4：OPTIONS → ANNOUNCE 返回 200，日志打印 2 条轨（video/H264/streamid=0、audio/MPEG4-GENERIC/streamid=1），后续 SETUP 复用 `sess-1`，RECORD 暂回 501（P1-6/P1-7）。`-race` 下单测覆盖 SDP 解析、control 映射、请求体读取及 200/400/415/454 响应。
+- [x] **P1-6 推流 SETUP**
   - 先支持 `RTP/AVP/TCP;interleaved=N-M`：记录通道号，不再开 UDP 端口；
   - 再支持 `RTP/AVP;unicast;client_port=x-y`：服务端分配端口对，回 `server_port`；
   - 验收：ffmpeg 推流 `-rtsp_transport tcp` 时服务端收到 `$` 帧。
-- [ ] **P1-7 RECORD：接收 RTP → 解包 → 写 ExternalSource**
+  - ✅ 已实现：`Session` 增加 `push` 方向标记，ANNOUNCE 建会话即置位；SETUP 记录 `isPush`、ANNOUNCE 协商出的 PT/编码，响应 Transport 追加 `mode=record`。interleaved 推流只记录 `interleavedRTP/RTCP`，不开 UDP socket；UDP 推流仍由 `openUDPPortPair` 分配 `server_port`，并新增 `serveUDPRTP` 读 goroutine（否则内核缓冲区满后丢包）。`handleInterleaved` 先按推流轨的 RTP channel 路由到 `handlePushedRTP`，再做原有 RTCP 判断；收到的媒体报文同时 `TouchRTCP` 续命。新增 `RECORD` 方法（200 + `Recording` 状态），ffmpeg 收到后才开始发 RTP；解包落源留给 P1-7。`-race` 下单测覆盖推流 interleaved/UDP SETUP、UDP server_port 实收 RTP、$ 帧 channel 路由、RECORD 的 200/454/455。端到端实测：`ffmpeg -rtsp_transport tcp` 推流日志出现 `push RTP recv (video): packets=1/100 ...`；`-rtsp_transport udp` 同样收到，server_port=50000。
+- [x] **P1-7 RECORD：接收 RTP → 解包 → 写 ExternalSource**
   - 按 PT/SSRC 路由到对应 track；
   - seq 跳变只记日志并丢弃半成品，不 panic；
   - 验收：服务端统计收到的包数/帧数与 ffmpeg 发送大致一致。
+  - ✅ 已实现：每条推流轨懒创建 `pushReceiver`（`H264Depacketizer` 或按 SDP fmtp 配置的 `AACDepacketizer` + `ExternalSource`）。路由以 SETUP 的 channel/端口为提示、最终按 RTP **PT** 选轨（`pushTrackByPT`），记录 SSRC 变化；H.264 支持单 NALU/STAP-A/FU-A 重组，AAC 支持一包多 AU（时间戳按每 AU +1024 递增）；解包结果复制后 `Write(Frame)`，避免复用 UDP 接收缓冲区导致帧数据被覆盖。seq 缺口按 16 位回绕计算（正数丢包/负数重复乱序），限频打日志；FU-A 缺片由解包器 `Drop` 半成品，不 panic。每 100 包打印 packets/frames/bytes/gaps，会话关闭时打印 `push recv summary`。`-race` 下单测覆盖单 NALU、IDR、FU-A 重组、FU-A 缺片丢弃后恢复、AAC 单 AU、按 PT 改路由；全量测试通过。端到端实测 5s TCP 推流（with_audio.mp4）：ffmpeg 127 视频帧 → 服务端 frames=128（含参数集）、RTP packets=183（FU-A 分片）；音频约 217 AU → frames=215、RTP packets=69（一个 RTP 包多个 AU），gaps=0。3s UDP 推流：video frames=78 / audio frames=128，gaps=0。
 - [ ] **P1-8 转发给拉流客户端**
   - 拉流 DESCRIBE 使用 ANNOUNCE 带来的编码参数；
   - 拉流 SETUP/PLAY 复用现有逻辑，订阅 `ExternalSource`；

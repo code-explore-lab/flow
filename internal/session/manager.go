@@ -23,10 +23,11 @@ const (
 type State int
 
 const (
-	StateInit State = iota // SETUP 完成，还未 PLAY
+	StateInit State = iota // SETUP 完成，还未 PLAY/RECORD
 	StatePlaying
 	StatePaused
-	StateTeardown // 已销毁
+	StateRecording // 推流端已 RECORD，服务端正在接收 RTP
+	StateTeardown  // 已销毁
 )
 
 func (s State) String() string {
@@ -37,6 +38,8 @@ func (s State) String() string {
 		return "Playing"
 	case StatePaused:
 		return "Paused"
+	case StateRecording:
+		return "Recording"
 	case StateTeardown:
 		return "Teardown"
 	default:

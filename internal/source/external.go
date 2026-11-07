@@ -16,31 +16,51 @@ type ExternalSource struct {
 	mu   sync.Mutex
 	ring *RingBuffer[Frame]
 
+	// cacheParamSets 为 true 时（视频轨）按 NAL 类型缓存 SPS/PPS/IDR，
+	// 中途加入的订阅者先补齐再解码。音频帧没有 NAL 头，必须关掉，
+	// 否则 AU 首字节会被误判成 SPS/PPS/IDR。
+	cacheParamSets bool
+
 	// 参数集缓存：中途加入的订阅者先补 SPS/PPS + 最近一个 IDR，收到就能解码。
 	// 在 Write 里写、在 Subscribe 里读，都拿 mu 串行化。
 	sps, pps, idr *Frame
 }
 
-// NewExternalSource 创建一个空的推流源。
+// NewExternalSource 创建一个空的视频推流源（缓存 SPS/PPS/IDR 供预热）。
 func NewExternalSource() *ExternalSource {
-	return &ExternalSource{ring: NewRingBuffer[Frame](videoRingCapacity)}
+	return newExternalSource(true)
 }
 
-// Write 写入一帧。按 NAL 类型缓存 SPS/PPS/IDR，供中途加入的订阅者预热。
+// NewExternalAudioSource 创建一个空的音频推流源。
+// 音频 AU 没有 NAL 头，不做参数集缓存，订阅者直接跟实时帧。
+func NewExternalAudioSource() *ExternalSource {
+	return newExternalSource(false)
+}
+
+func newExternalSource(cacheParamSets bool) *ExternalSource {
+	return &ExternalSource{
+		ring:           NewRingBuffer[Frame](videoRingCapacity),
+		cacheParamSets: cacheParamSets,
+	}
+}
+
+// Write 写入一帧。视频轨按 NAL 类型缓存 SPS/PPS/IDR，供中途加入的订阅者预热。
 // 任意 goroutine 都可以调用；源 Close 之后写入会被忽略。
 func (s *ExternalSource) Write(f Frame) {
-	if typ, err := media.NALType(f.Data); err == nil {
-		c := f
-		s.mu.Lock()
-		switch typ {
-		case rtp.NALUTypeSPS:
-			s.sps = &c
-		case rtp.NALUTypePPS:
-			s.pps = &c
-		case rtp.NALUTypeIDR:
-			s.idr = &c
+	if s.cacheParamSets {
+		if typ, err := media.NALType(f.Data); err == nil {
+			c := f
+			s.mu.Lock()
+			switch typ {
+			case rtp.NALUTypeSPS:
+				s.sps = &c
+			case rtp.NALUTypePPS:
+				s.pps = &c
+			case rtp.NALUTypeIDR:
+				s.idr = &c
+			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 	s.ring.Write(f)
 }

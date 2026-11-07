@@ -3,9 +3,13 @@ package rtsp
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 )
+
+// maxRequestBody 请求体上限。SDP 通常只有 1~2 KB，1 MiB 足够且能挡住畸形包。
+const maxRequestBody = 1 << 20
 
 // Request 一条解析好的 RTSP 请求。
 type Request struct {
@@ -14,6 +18,7 @@ type Request struct {
 	Version string
 	CSeq    int
 	Headers map[string]string
+	Body    []byte // 按 Content-Length 读取的请求体（ANNOUNCE 的 SDP）
 }
 
 // parseHeaderBlock 解析 RTSP 请求的文本块（不含末尾的 \r\n\r\n）。
@@ -70,7 +75,32 @@ func readRequest(br *bufio.Reader) (*Request, error) {
 		}
 	}
 	headerRaw := string(buf[:len(buf)-4])
-	return parseHeaderBlock(headerRaw)
+	req, err := parseHeaderBlock(headerRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	// ANNOUNCE 的 SDP 在请求体里，必须按 Content-Length 精确读走，
+	// 否则剩下的字节会被当成下一条 RTSP 请求或 interleaved $ 帧。
+	cl, ok := req.Headers["Content-Length"]
+	if !ok {
+		return req, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(cl))
+	if err != nil || n < 0 {
+		return nil, fmt.Errorf("invalid Content-Length: %q", cl)
+	}
+	if n > maxRequestBody {
+		return nil, fmt.Errorf("request body too large: %d bytes", n)
+	}
+	if n == 0 {
+		return req, nil
+	}
+	req.Body = make([]byte, n)
+	if _, err := io.ReadFull(br, req.Body); err != nil {
+		return nil, fmt.Errorf("read request body: %w", err)
+	}
+	return req, nil
 }
 
 // writeResponse 拼一个 RTSP 响应。

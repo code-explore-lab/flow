@@ -2,6 +2,7 @@ package rtsp
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -62,7 +63,7 @@ func (s *Server) handleConn(conn *Conn) {
 		var respErr error
 		switch req.Method {
 		case "OPTIONS":
-			hd["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN"
+			hd["Public"] = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN"
 			respErr = writeResponse(conn, "200 OK", hd, nil)
 		case "DESCRIBE":
 			hd["Content-Type"] = "application/sdp"
@@ -72,12 +73,16 @@ func (s *Server) handleConn(conn *Conn) {
 				break
 			}
 			respErr = writeResponse(conn, "200 OK", hd, []byte(sdp))
+		case "ANNOUNCE":
+			respErr = s.handleAnnounce(conn, req, hd)
 		case "SETUP":
 			respErr = s.handleSetup(conn, req, hd)
 		case "PLAY":
 			respErr = s.handlePlay(conn, req, hd)
 		case "PAUSE":
 			respErr = s.handlePause(conn, req, hd)
+		case "RECORD":
+			respErr = s.handleRecord(conn, req, hd)
 		case "TEARDOWN":
 			respErr = s.handleTeardown(conn, req, hd)
 		default:
@@ -91,8 +96,51 @@ func (s *Server) handleConn(conn *Conn) {
 }
 
 // handleInterleaved 处理客户端通过 TCP 发来的 interleaved 帧。
-// 客户端主要用它发 RTCP（RR/SDES 等），这里只刷新会话活跃时间。
+//
+// 拉流会话主要用它发 RTCP（RR/SDES 等），只需要刷新活跃时间；
+// 推流会话（ANNOUNCE/RECORD）则会在协商出的 RTP channel 上发来媒体数据，
+// 这里按 channel 找到对应轨，交给 handlePushedRTP（P1-6 只计数，P1-7 解包）。
 func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
+	// 先按推流轨的 RTP channel 路由。RTP 的 PT 是 96/97 这类动态值，
+	// 与 RTCP 的 200~204 不冲突，但必须优先判断：拉流会话没有 isPush 轨，
+	// 不会把对端 RTCP 误当媒体。
+	for _, id := range conn.boundSessions() {
+		sess, ok := s.sessions.Get(id)
+		if !ok {
+			continue
+		}
+		st := sess.Data.(*Session)
+		if track, ok := st.pushTrackByRTPChannel(int(channel)); ok {
+			if len(payload) >= 12 { // 小于 RTP 固定头，丢弃
+				sess.TouchRTCP() // 收到的媒体报文也算活跃
+				s.handlePushedRTP(st, track, payload)
+			}
+			return
+		}
+	}
+
+	// 通道号没登记时退回按 PT 路由（例如客户端协商后改用其他 channel）。
+	// 只对推流会话生效，拉流会话的 RTCP channel 不会走到这里。
+	if len(payload) >= 12 {
+		pt := int(payload[1] & 0x7f)
+		for _, id := range conn.boundSessions() {
+			sess, ok := s.sessions.Get(id)
+			if !ok {
+				continue
+			}
+			st := sess.Data.(*Session)
+			if !st.isPush() {
+				continue
+			}
+			if _, ok := st.pushTrackByPT(pt); !ok {
+				continue
+			}
+			sess.TouchRTCP()
+			s.handlePushedRTP(st, nil, payload)
+			return
+		}
+	}
+
 	if len(payload) < 2 {
 		return
 	}
@@ -150,6 +198,69 @@ func (s *Server) buildSDP() (string, error) {
 	return sdp, nil
 }
 
+// newClientSession 新建一个 RTSP 会话，并把 RTSP 层的轨道状态挂到 Data 上。
+// 拉流（SETUP 建会话）和推流（ANNOUNCE 建会话）共用。
+func (s *Server) newClientSession(conn *Conn) *session.Session {
+	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	sess := s.sessions.NewSession(ip)
+	st := newSession()
+	sess.Data = st
+	sess.OnClose = st.closeAll
+	fmt.Printf("new session %s from %s\n", sess.ID, ip)
+	return sess
+}
+
+// handleAnnounce 处理 ANNOUNCE：解析推流端带来的 SDP，记录轨道列表和
+// control → trackID 映射，返回 200 和 Session（后续 SETUP/RECORD 复用）。
+//
+//	400 Bad Request            SDP 结构非法（空 body、没有 m=、rtpmap 缺失等）
+//	415 Unsupported Media Type SDP 合法但编码不支持（只支持 H264 / MPEG4-GENERIC）
+//	454 Session Not Found      带了 Session 头但服务端没有这个会话
+func (s *Server) handleAnnounce(conn *Conn, req *Request, hd map[string]string) error {
+	tracks, err := parseAnnounceSDP(req.Body)
+	if err != nil {
+		if errors.Is(err, errUnsupportedCodec) {
+			fmt.Printf("ANNOUNCE rejected (415): %v\n", err)
+			return writeResponse(conn, "415 Unsupported Media Type", hd, nil)
+		}
+		fmt.Printf("ANNOUNCE rejected (400): %v\n", err)
+		return writeResponse(conn, "400 Bad Request", hd, nil)
+	}
+
+	// ANNOUNCE 可以带 Session 更新已有会话；ffmpeg 首次推送不带，新建一个。
+	var sess *session.Session
+	if sh, ok := req.Headers["Session"]; ok {
+		id := strings.Split(sh, ";")[0]
+		found, foundOK := s.sessions.Get(id)
+		if !foundOK {
+			return writeResponse(conn, "454 Session Not Found", hd, nil)
+		}
+		sess = found
+		sess.TouchRTSP()
+	} else if id := conn.announceSession(); id != "" {
+		// 同一条连接上重复 ANNOUNCE：复用上次建的会话。
+		if found, foundOK := s.sessions.Get(id); foundOK {
+			sess = found
+		}
+	}
+	if sess == nil {
+		sess = s.newClientSession(conn)
+	}
+
+	rtspSess := sess.Data.(*Session)
+	rtspSess.setAnnounced(tracks)
+	conn.bindSession(sess.ID)
+	conn.setAnnounceSession(sess.ID)
+
+	fmt.Printf("ANNOUNCE session %s: %d track(s) from %s\n", sess.ID, len(tracks), sess.RemoteIP)
+	for i, t := range tracks {
+		fmt.Printf("  track %d: %s\n", i, t)
+	}
+
+	hd["Session"] = s.sessionHeaderValue(sess)
+	return writeResponse(conn, "200 OK", hd, nil)
+}
+
 // handleSetup 处理 SETUP：分配/复用会话，建视频或音频轨，回 Transport + Session。
 func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) error {
 	transReq, ok := req.Headers["Transport"]
@@ -171,43 +282,82 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			return writeResponse(conn, "454 Session Not Found", hd, nil)
 		}
 		sess.TouchRTSP()
-	} else {
-		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		sess = s.sessions.NewSession(ip)
-		st := newSession()
-		sess.Data = st
-		sess.OnClose = st.closeAll
-		fmt.Printf("new session %s from %s\n", sess.ID, ip)
+	} else if id := conn.announceSession(); id != "" {
+		// 推流端在 ANNOUNCE 响应里拿到 Session 通常会回带；
+		// 万一没带，用同一条连接上 ANNOUNCE 建的会话，保留已解析的 SDP。
+		if found, foundOK := s.sessions.Get(id); foundOK {
+			sess = found
+			sess.TouchRTSP()
+		}
+	}
+	if sess == nil {
+		sess = s.newClientSession(conn)
 	}
 	conn.bindSession(sess.ID)
 	rtspSess := sess.Data.(*Session)
 
-	// 判断这次 SETUP 建哪条轨：优先看 URI 里的 trackID/streamid，
-	// 客户端没带就按“video 先、audio 后”的顺序推断。
-	kind := trackKindFromURI(req.URI)
+	// 判断这次 SETUP 建哪条轨。
+	// 推流模式（ANNOUNCE 已建会话）：URI 里的 control 去 announced 索引查，
+	//   拿到客户端 SDP 里写死的 kind / clockRate / payloadType。
+	// 拉流模式：URI 里 trackID/streamid 映射，客户端没带就按“video 先、audio 后”推断。
+	announced := rtspSess.announcedTracks()
+	// 有 ANNOUNCE 轨道说明这是推流会话：SETUP 的方向是客户端 → 服务端。
+	push := len(announced) > 0
+	kind := ""
+	clockRate := uint32(90000)
+	payloadType := 0
+	encoding := ""
+	fmtp := ""
+	if push {
+		if at, ok := rtspSess.announcedTrack(req.URI); ok {
+			kind = at.Kind
+			clockRate = uint32(at.ClockRate)
+			payloadType = at.PayloadType
+			encoding = at.Encoding
+			fmtp = at.FMTP
+		}
+	}
+	if kind == "" {
+		kind = trackKindFromURI(req.URI)
+	}
 	if kind == "" {
 		kind = "video"
 		if rtspSess.track("video") != nil {
 			kind = "audio"
 		}
 	}
-	// 实时模式只有视频源，没有音频可建。
-	if kind == "audio" && s.audio == nil {
-		return writeResponse(conn, "404 Not Found", hd, nil)
+
+	// 音频轨是否存在：
+	//   推流模式 → announced SDP 里有没有 m=audio；
+	//   拉流模式 → 服务端有没有挂音频源。
+	if kind == "audio" {
+		hasAudio := s.audio != nil
+		for _, at := range announced {
+			if at.Kind == "audio" {
+				hasAudio = true
+				break
+			}
+		}
+		if !hasAudio {
+			return writeResponse(conn, "404 Not Found", hd, nil)
+		}
+		// 拉流模式音频 clockRate 先用 44100 占位，streamAAC 拿到首帧后会覆盖；
+		// 推流模式已从 announced SDP 取到实际采样率。
+		if len(announced) == 0 {
+			clockRate = 44100
+		}
 	}
 
-	// RTCP SR 的 RTP 时钟频率：视频固定 90kHz；音频是 AAC 采样率，
-	// streamAAC 拿到第一帧后会按实际值覆盖。
-	clockRate := uint32(90000)
-	if kind == "audio" {
-		clockRate = 44100
-	}
 	t := &mediaTrack{
 		kind:          kind,
 		isInterleaved: isInter,
 		interleavedCh: interStr,
 		conn:          conn,
 		clockRate:     clockRate,
+		isPush:        push,
+		payloadType:   payloadType,
+		encoding:      encoding,
+		fmtp:          fmtp,
 	}
 
 	var respTransport string
@@ -220,6 +370,9 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		t.interleavedRTP = rtpCh
 		t.interleavedRTCP = rtcpCh
 		respTransport = fmt.Sprintf("RTP/AVP/TCP;unicast;interleaved=%d-%d", rtpCh, rtcpCh)
+		if push {
+			respTransport += ";mode=record"
+		}
 	} else {
 		rtpConn, rtcpConn, errUDP := openUDPPortPair()
 		if errUDP != nil {
@@ -234,6 +387,9 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		t.serverRtcpPort = rtcpConn.LocalAddr().(*net.UDPAddr).Port
 		respTransport = fmt.Sprintf("RTP/AVP;unicast;client_port=%s;server_port=%d-%d",
 			clientPortStr, t.serverRtpPort, t.serverRtcpPort)
+		if push {
+			respTransport += ";mode=record"
+		}
 		// 收 RTCP：给会话打活跃点，超时回收靠它。
 		go func(kind string, rtcpConn *net.UDPConn, sess *session.Session) {
 			buf := make([]byte, 2048)
@@ -256,6 +412,11 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		if old.rtcpConn != nil {
 			old.rtcpConn.Close()
 		}
+	}
+	// 推流 UDP 模式：客户端把 RTP 发到 server_port，服务端必须有人读，
+	// 否则内核缓冲区满了以后丢包。TCP interleaved 由 handleConn 统一读。
+	if push && !isInter {
+		go s.serveUDPRTP(t, sess)
 	}
 
 	hd["Transport"] = respTransport
@@ -337,6 +498,44 @@ func (s *Server) handlePause(conn *Conn, req *Request, hd map[string]string) err
 	rtspSess.stopPlay()
 	sess.SetState(session.StatePaused)
 	hd["Session"] = s.sessionHeaderValue(sess)
+	return writeResponse(conn, "200 OK", hd, nil)
+}
+
+// handleRecord 处理推流端的 RECORD：确认会话和 SETUP 好的轨都存在，
+// 进入 Recording 状态并回 200。ffmpeg 收到 200 后才开始发 $ 帧/RTP 报文；
+// 报文本身的解包和落源在 P1-7。
+//
+//	400 Bad Request           没带 Session
+//	454 Session Not Found     会话不存在
+//	455 Method Not Valid In This State 不是推流会话，或还没 SETUP 任何轨
+func (s *Server) handleRecord(conn *Conn, req *Request, hd map[string]string) error {
+	sessHeader, ok := req.Headers["Session"]
+	if !ok {
+		return writeResponse(conn, "400 Bad Request", hd, nil)
+	}
+	sessID := strings.Split(sessHeader, ";")[0]
+	sess, ok := s.sessions.Get(sessID)
+	if !ok {
+		return writeResponse(conn, "454 Session Not Found", hd, nil)
+	}
+	sess.TouchRTSP()
+
+	rtspSess := sess.Data.(*Session)
+	if !rtspSess.isPush() || rtspSess.trackCount() == 0 {
+		return writeResponse(conn, "455 Method Not Valid In This State", hd, nil)
+	}
+	// 每条推流轨按 ANNOUNCE 的编码准备解包器和 ExternalSource。
+	for _, t := range rtspSess.tracksSnapshot() {
+		if _, err := t.ensurePushReceiver(); err != nil {
+			fmt.Printf("RECORD session %s: init %s receiver: %v\n", sess.ID, t.kind, err)
+			return writeResponse(conn, "500 Internal Server Error", hd, nil)
+		}
+	}
+
+	conn.bindSession(sess.ID)
+	sess.SetState(session.StateRecording)
+	hd["Session"] = s.sessionHeaderValue(sess)
+	fmt.Printf("RECORD session %s: %d track(s) ready to receive\n", sess.ID, rtspSess.trackCount())
 	return writeResponse(conn, "200 OK", hd, nil)
 }
 

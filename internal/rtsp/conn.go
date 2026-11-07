@@ -23,6 +23,11 @@ type Conn struct {
 	// handleConn 退出，顺手把这些会话回收掉，不用干等 60s 超时。
 	sessMu     sync.Mutex
 	sessionIDs []string
+
+	// announceID 记录 ANNOUNCE 创建的会话 ID。ffmpeg 等客户端在 ANNOUNCE
+	// 响应里拿到 Session 后会复用；万一它不带，后续 SETUP 用这条连接上的
+	// 会话兜底，避免同一路推流裂成两个会话、丢失已解析的 SDP。
+	announceID string
 }
 
 func (c *Conn) write(b []byte) error {
@@ -51,6 +56,20 @@ func (c *Conn) boundSessions() []string {
 	out := make([]string, len(c.sessionIDs))
 	copy(out, c.sessionIDs)
 	return out
+}
+
+// setAnnounceSession 记住 ANNOUNCE 创建的会话。
+func (c *Conn) setAnnounceSession(id string) {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	c.announceID = id
+}
+
+// announceSession 返回 ANNOUNCE 创建的会话 ID，没有则返回空串。
+func (c *Conn) announceSession() string {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return c.announceID
 }
 
 // readInterleavedFrame 从同一个 TCP 字节流里切出一个 $ 帧：

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -221,6 +222,223 @@ func TestStreamH264ForwardsPublishedFrames(t *testing.T) {
 		if !bytes.Equal(pkt.Payload, nalus[i]) {
 			t.Fatalf("frame %d: payload = % x, want % x", i, pkt.Payload, nalus[i])
 		}
+	}
+}
+
+// TestPushTeardownClosesSourceAndRemovesSession 推流端 TEARDOWN 后：
+//   - 会话从管理器删除；
+//   - 已发布流从注册表摘掉，ExternalSource 关闭，拉流端读者读到结束；
+//   - 之后再来的 RTP 不再产生新帧。
+func TestPushTeardownClosesSourceAndRemovesSession(t *testing.T) {
+	s := New(nil, nil, false)
+	conn, closeConn := newDrainedConn(t)
+	defer closeConn()
+
+	hd := map[string]string{"CSeq": "1"}
+	req := &Request{
+		Method:  "ANNOUNCE",
+		URI:     "rtsp://127.0.0.1:8554/push",
+		Version: "RTSP/1.0",
+		CSeq:    1,
+		Headers: map[string]string{"Content-Type": "application/sdp"},
+		Body:    []byte(ffmpegAnnounceSDP),
+	}
+	if err := s.handleAnnounce(conn, req, hd); err != nil {
+		t.Fatalf("handleAnnounce: %v", err)
+	}
+	sessID := strings.Split(hd["Session"], ";")[0]
+	pub := s.publishedFromURI("rtsp://127.0.0.1:8554/push")
+	if pub == nil {
+		t.Fatal("ANNOUNCE did not register a published stream")
+	}
+
+	rd, cancel := pub.video.Subscribe()
+	defer cancel()
+	pub.video.Write(source.Frame{Data: []byte{0x41, 0x01}, Timestamp: 3600})
+
+	thd := map[string]string{"CSeq": "2"}
+	td := &Request{
+		Method:  "TEARDOWN",
+		URI:     "rtsp://127.0.0.1:8554/push",
+		Version: "RTSP/1.0",
+		CSeq:    2,
+		Headers: map[string]string{"Session": sessID},
+	}
+	if err := s.handleTeardown(conn, td, thd); err != nil {
+		t.Fatalf("handleTeardown: %v", err)
+	}
+
+	if _, ok := s.sessions.Get(sessID); ok {
+		t.Fatal("push session still registered after TEARDOWN")
+	}
+	if got := s.publishedFromURI("rtsp://127.0.0.1:8554/push"); got != nil {
+		t.Fatal("published stream still registered after TEARDOWN")
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	if f, ok := rd.Next(done); !ok || f.Data[0] != 0x41 {
+		t.Fatalf("pending frame = %x ok=%v, want the frame written before teardown", f.Data, ok)
+	}
+	if _, ok := rd.Next(done); ok {
+		t.Fatal("ExternalSource still open after TEARDOWN; pull readers would block")
+	}
+}
+
+// TestPushTCPDisconnectClosesSourceAndRemovesSession 模拟推流端 Ctrl-C：
+// TCP 连接直接断开（没发 TEARDOWN）时，handleConn 的清理路径必须
+// 立刻删除会话、注销已发布流并关闭源，不用等 60s 超时。
+func TestPushTCPDisconnectClosesSourceAndRemovesSession(t *testing.T) {
+	s := New(nil, nil, false)
+	serverConn, clientConn := net.Pipe()
+	conn := &Conn{Conn: serverConn}
+	go s.handleConn(conn)
+
+	sdp := ffmpegAnnounceSDP
+	raw := fmt.Sprintf("ANNOUNCE rtsp://127.0.0.1:8554/push RTSP/1.0\r\n"+
+		"CSeq: 1\r\nContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
+		len(sdp), sdp)
+	if _, err := clientConn.Write([]byte(raw)); err != nil {
+		t.Fatalf("write ANNOUNCE: %v", err)
+	}
+	br := bufio.NewReader(clientConn)
+	if resp := readResponseHeader(t, br); !strings.HasPrefix(resp, "RTSP/1.0 200 OK") {
+		t.Fatalf("ANNOUNCE response = %q", resp)
+	}
+
+	pub := s.publishedFromURI("rtsp://127.0.0.1:8554/push")
+	if pub == nil {
+		t.Fatal("ANNOUNCE did not register a published stream")
+	}
+	rd, cancel := pub.video.Subscribe()
+	defer cancel()
+	if got := s.sessions.Len(); got != 1 {
+		t.Fatalf("sessions = %d, want 1", got)
+	}
+
+	clientConn.Close() // 推流端进程消失，TCP 断开
+
+	waitFor(t, 2*time.Second, func() bool {
+		return s.publishedFromURI("rtsp://127.0.0.1:8554/push") == nil && s.sessions.Len() == 0
+	})
+	expectReaderEnded(t, rd)
+}
+
+// TestPullSourceEndClosesSessionAndConn 推流端断开后，拉流端源关闭：
+// 拉流会话要被立即回收、TCP 连接关闭，客户端读到 EOF 而不是一直等 RTP。
+func TestPullSourceEndClosesSessionAndConn(t *testing.T) {
+	s := New(nil, nil, false)
+	tracks, err := parseAnnounceSDP([]byte(ffmpegAnnounceSDP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := s.publish("live", tracks)
+
+	serverConn, clientConn := net.Pipe()
+	conn := &Conn{Conn: serverConn}
+	sess := s.newClientSession(conn)
+	st := sess.Data.(*Session)
+	st.setPublished(pub, nil)
+
+	track := &mediaTrack{
+		kind:            "video",
+		isInterleaved:   true,
+		interleavedRTP:  0,
+		interleavedRTCP: 1,
+		conn:            conn,
+		payloadType:     96,
+		external:        pub.video,
+	}
+	st.setTrack("video", track)
+
+	drained := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, clientConn)
+		close(drained)
+	}()
+
+	hd := map[string]string{"CSeq": "3"}
+	req := &Request{
+		Method:  "PLAY",
+		URI:     "rtsp://127.0.0.1:8554/live",
+		Version: "RTSP/1.0",
+		CSeq:    3,
+		Headers: map[string]string{"Session": sess.ID},
+	}
+	if err := s.handlePlay(conn, req, hd); err != nil {
+		t.Fatalf("handlePlay: %v", err)
+	}
+
+	// 推流端断开 = 已发布流关闭，拉流端 reader 会读到结束。
+	s.unpublish("live", pub)
+
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pull connection was not closed after the source ended")
+	}
+	if _, ok := s.sessions.Get(sess.ID); ok {
+		t.Fatal("pull session still registered after the source ended")
+	}
+}
+
+// newDrainedConn 建一条 net.Pipe 包装的 Conn，后台丢弃所有写出的响应，
+// 让 handler 的同步写不会阻塞。
+func newDrainedConn(t *testing.T) (*Conn, func()) {
+	t.Helper()
+	serverConn, clientConn := net.Pipe()
+	go func() { _, _ = io.Copy(io.Discard, clientConn) }()
+	return &Conn{Conn: serverConn}, func() {
+		clientConn.Close()
+		serverConn.Close()
+	}
+}
+
+// readResponseHeader 读到响应头的空行为止，返回已读文本。
+func readResponseHeader(t *testing.T, br *bufio.Reader) string {
+	t.Helper()
+	var b strings.Builder
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read response header: %v", err)
+		}
+		b.WriteString(line)
+		if line == "\r\n" {
+			return b.String()
+		}
+	}
+}
+
+// waitFor 轮询条件，超时则让测试失败。
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met before timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// expectReaderEnded 断言读者在源关闭后返回 false（读不到更多帧）。
+func expectReaderEnded(t *testing.T, rd *source.Reader[source.Frame]) {
+	t.Helper()
+	done := make(chan struct{})
+	defer close(done)
+	result := make(chan bool, 1)
+	go func() {
+		_, ok := rd.Next(done)
+		result <- ok
+	}()
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("reader returned a frame, want end of stream")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader did not observe end of stream")
 	}
 }
 

@@ -534,14 +534,24 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 	audio := rtspSess.track("audio")
 	// 已发布流的轨用 track.external（推流端解包后写入的源），
 	// 本地文件/live 模式退回 Server 上的全局源。
+	// 源结束（推流端断开）时回收本拉流会话，让客户端立即收到 EOF；
+	// 只是 PAUSE/TEARDOWN 导致 done 关闭时不做额外清理。
 	if video != nil {
 		if src := s.videoSourceFor(video); src != nil {
-			go s.streamH264(video, src, playDone)
+			go func() {
+				if s.streamH264(video, src, playDone) {
+					s.endPullSession(sess, conn, rtspSess)
+				}
+			}()
 		}
 	}
 	if audio != nil {
 		if src := s.audioSourceFor(audio); src != nil {
-			go s.streamAAC(audio, src, playDone)
+			go func() {
+				if s.streamAAC(audio, src, playDone) {
+					s.endPullSession(sess, conn, rtspSess)
+				}
+			}()
 		}
 	}
 	// 每 5s 发一次 RTCP SR，带 NTP↔RTP 映射；随 PLAY 生命周期启停。
@@ -552,6 +562,27 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 		go sendSenderReports(audio, playDone)
 	}
 	return nil
+}
+
+// endPullSession 在推流源结束后回收拉流会话（P1-9）。
+//
+// 源关闭只意味着「没有新帧了」：拉流端的转发 goroutine 会退出，但 RTSP
+// 连接还开着，播放器会一直等下去，直到 60s 会话超时才被回收。这里主动
+// 关掉会话和 TCP 连接，客户端读到 EOF，立即知道流结束。
+//
+// 只处理源自然结束的情况；PAUSE/TEARDOWN/连接断开走原有的关闭路径。
+// endOnce 防止音视频两条转发 goroutine 同时触发。
+func (s *Server) endPullSession(sess *session.Session, conn *Conn, rtspSess *Session) {
+	if !rtspSess.markEnded() {
+		return
+	}
+	fmt.Printf("session %s closed: pull source ended\n", sess.ID)
+	rtspSess.stopPlay()
+	s.sessions.Delete(sess.ID)
+	sess.Close()
+	if conn != nil {
+		conn.Close()
+	}
 }
 
 // handlePause 处理 PAUSE：先停推流再回 200，客户端收到响应后不会再看到新 RTP。

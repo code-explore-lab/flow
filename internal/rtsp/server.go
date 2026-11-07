@@ -21,7 +21,7 @@ import (
 type Server struct {
 	video     *source.H264Source
 	audio     *source.AACSource
-	live      bool
+	live      bool   //true 实时流， false 文件回放
 	videoPath string // 文件模式 SDP 里取 SPS/PPS 用的源文件
 	audioPath string // 文件模式 SDP 里取 AudioSpecificConfig 用的源文件
 
@@ -29,7 +29,7 @@ type Server struct {
 
 	// 已发布流注册表（ANNOUNCE 创建，拉流端按 URL 路径查找）。P1-8。
 	pubMu     sync.RWMutex
-	published map[string]*publishedStream
+	published map[string]*publishedStream //key是RTSP url路径
 
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
@@ -58,7 +58,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		fmt.Printf("session %s auto teardown: no RTCP/RTSP for %s (last RTCP %s)\n",
 			sess.ID, s.sessions.Timeout(), sess.LastRTCP().Format(time.RFC3339))
 	}
-	go s.sessions.Run(ctx)
+	go s.sessions.Run(ctx) //启动会话管理器
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {

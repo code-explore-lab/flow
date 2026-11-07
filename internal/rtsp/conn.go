@@ -105,6 +105,7 @@ func readInterleavedFrame(br *bufio.Reader) (channel byte, payload []byte, err e
 	}
 	length := binary.BigEndian.Uint16(hdr[2:4])
 	payload = make([]byte, length)
+	// io.ReadFUll(r, buf) 必须把buf填满
 	if _, err := io.ReadFull(br, payload); err != nil {
 		return 0, nil, err
 	}

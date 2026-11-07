@@ -71,12 +71,12 @@ type mediaTrack struct {
 //   - seq 要连续递增，恢复播放后不回退、不重置，Wireshark 里才看不到断层。
 type trackStats struct {
 	mu       sync.Mutex
-	ssrc     uint32
-	seq      uint32 // 下一个要用的 RTP seq（写进 RTP 头时截断成 uint16）
-	packets  uint32
-	octets   uint32
-	lastRTP  uint32
-	lastSent time.Time
+	ssrc     uint32    // 本轨道RTP SSRC，整条RTSP会话固定不变
+	seq      uint32    // 下一个RTP序列号，内部用uint32，发包截断uint16
+	packets  uint32    // 已经发送RTP包总数（RTCP SR packet count）
+	octets   uint32    // 负载字节总数（不含RTP头，SR octet count）
+	lastRTP  uint32    // 最后一个发出包的RTP timestamp
+	lastSent time.Time // 最后一包发送的系统时间，用来算SR里NTP <-> RTP时间映射
 }
 
 // ensureSSRC 返回本路的 SSRC：第一次调用时随机生成并固定下来，
@@ -156,6 +156,11 @@ func (t *mediaTrack) writeRTCP(pkt []byte) error {
 // writeInterleavedChannel 把一个 RTCP/RTP 包按 $ 帧格式写到 RTSP 的 TCP 连接：
 //
 //	$ + channel(1) + length(2, 大端) + packet
+/*
+$      channel     length(2B大端)     payload(原始RTP/RTCP包)
+0x24   1字节        2字节              N字节
+
+*/
 func (t *mediaTrack) writeInterleavedChannel(channel int, pkt []byte) error {
 	if len(pkt) > 0xFFFF {
 		return fmt.Errorf("packet too large for interleaved: %d bytes", len(pkt))
@@ -188,6 +193,7 @@ func (t *mediaTrack) senderReport(now time.Time) ([]byte, bool) {
 	if lastSent.IsZero() {
 		return nil, false
 	}
+	//elapsed 从上一包发出，到现在过去了多久
 	if elapsed := now.Sub(lastSent); elapsed > 0 && clockRate > 0 {
 		rtp += uint32(elapsed.Seconds() * float64(clockRate))
 	}
@@ -215,7 +221,7 @@ type Session struct {
 	// push 为 true 表示这个会话是客户端推流（ANNOUNCE 创建），
 	// SETUP 的方向是“服务端收 RTP”，而不是拉流会话的“服务端发 RTP”。
 	announced      []announcedTrack
-	announcedIndex map[string]int
+	announcedIndex map[string]int //setup根据url去找到对应的announcedTrack
 	push           bool
 
 	// pub 这个会话关联的已发布流：推流会话在 ANNOUNCE 时创建，
@@ -229,6 +235,10 @@ type Session struct {
 	playMu     sync.Mutex
 	playCancel context.CancelFunc
 	playDone   <-chan struct{}
+
+	// endOnce 保证「推流源结束 → 回收拉流会话」只执行一次。
+	// 视频/音频两条转发的 goroutine 可能同时看到源关闭。
+	endOnce sync.Once
 }
 
 func newSession() *Session {
@@ -262,6 +272,7 @@ func (s *Session) setAnnounced(tracks []announcedTrack) {
 	for i, t := range tracks {
 		// 客户端 SDP 里可能写 streamid=N，SETUP URI 也可能用 trackID=N，
 		// 两种写法和裸 N 都指向同一条轨。
+		//sdp带trackID
 		s.announcedIndex[controlLookupKey(t.Control)] = i
 		if t.TrackID != "" {
 			s.announcedIndex[controlLookupKey("trackID="+t.TrackID)] = i
@@ -286,6 +297,13 @@ func (s *Session) setPublished(pub *publishedStream, cleanup func()) {
 	if cleanup != nil {
 		s.pubCleanup = cleanup
 	}
+}
+
+// markEnded 标记「源结束回收」已经执行过，返回本次是否是第一次调用。
+func (s *Session) markEnded() bool {
+	first := false
+	s.endOnce.Do(func() { first = true })
+	return first
 }
 
 // published 返回会话关联的已发布流（推流/拉流都可能非 nil）。

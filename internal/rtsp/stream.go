@@ -48,7 +48,10 @@ func (s *Server) audioSourceFor(t *mediaTrack) audioFrameSource {
 // 从共享视频源拿 Frame → 封 RTP → 发送。
 // 源只读一次，多个客户端各自从自己的 Reader 取同一批 NALU；
 // seq/SSRC 仍然每个客户端独立，时间戳由源统一打好，保证多路一致。
-func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan struct{}) {
+//
+// 返回 true 表示帧源已经结束（推流端断开 / 文件读完），false 表示是
+// done 关闭或写连接失败导致的退出。调用方据此决定是否回收拉流会话。
+func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan struct{}) bool {
 	// 每个客户端拿一个独立的 Reader，按自己的 seq 从共享 ring buffer 读。
 	// 客户端慢只会让自己的游标落后、被新帧覆盖，不会阻塞源和其他客户端。
 	reader, cancel := src.Subscribe()
@@ -67,10 +70,10 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		if !ok {
 			if isDone(done) {
 				fmt.Println("video stream stopped")
-			} else {
-				fmt.Println("video source ended")
+				return false
 			}
-			return
+			fmt.Println("video source ended")
+			return true
 		}
 		if d := reader.Dropped(); d != dropped {
 			fmt.Printf("video stream: dropped %d old frames (slow consumer)\n", d-dropped)
@@ -90,7 +93,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			}
 			if err := track.writeRTP(data); err != nil {
 				fmt.Println("write video rtp:", err)
-				return
+				return false
 			}
 			// 给 SR 累计包数/字节数，并记下最后一个时间戳。
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
@@ -100,7 +103,8 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 
 // streamAAC 每个客户端一条订阅 goroutine：从共享音频源拿 AU → RFC 3640 封包 → 发送。
 // 音频时间戳（采样数，每个 AU +1024）由源统一维护，客户端只负责封包和 seq/SSRC。
-func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan struct{}) {
+// 返回值语义同 streamH264：true 表示音频源结束。
+func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan struct{}) bool {
 	reader, cancel := src.Subscribe()
 	defer cancel()
 
@@ -116,10 +120,10 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 		if !ok {
 			if isDone(done) {
 				fmt.Println("audio stream stopped")
-			} else {
-				fmt.Println("aac source ended")
+				return false
 			}
-			return
+			fmt.Println("aac source ended")
+			return true
 		}
 		if d := reader.Dropped(); d != dropped {
 			fmt.Printf("audio stream: dropped %d old frames (slow consumer)\n", d-dropped)
@@ -145,7 +149,7 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 			}
 			if err := track.writeRTP(data); err != nil {
 				fmt.Println("write audio rtp:", err)
-				return
+				return false
 			}
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
 		}

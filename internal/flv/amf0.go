@@ -166,6 +166,7 @@ func writeAMF0Value(w io.Writer, v Value) error {
 }
 
 // writeMembers 写 key/value 序列和结尾的空 key + 0x09。
+// ECMA-Array 的 payload 是一串 `[UTF-8 key][AMF value]`
 func writeMembers(w io.Writer, members []Member) error {
 	for _, m := range members {
 		if err := writeU8(w, byte(len(m.Key)>>8), byte(len(m.Key))); err != nil {

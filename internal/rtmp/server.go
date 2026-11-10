@@ -8,6 +8,7 @@ package rtmp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -79,18 +80,56 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	return nil
 }
 
-// handleConn 处理一条 RTMP 连接。握手与 Chunk Stream 循环在 M2 的
-// handshake.go / chunk.go 里接进来；这里先保留连接生命周期：
-// 登记 → 阻塞读 → 连接关闭即退出。
+// handleConn 处理一条 RTMP 连接：握手 → Chunk Stream 消息循环 → 断开清理。
 func (s *Server) handleConn(conn *Conn) {
 	s.registerConn(conn)
-	defer s.unregisterConn(conn)
-	defer conn.Close()
+	conn.srv = s
+	// 清理顺序有讲究：先 Close 让阻塞中的写立即失败，再停播（等播放
+	// goroutine 退出），最后注销推流并登记表。
+	defer func() {
+		conn.Close()
+		conn.stopPlay()
+		conn.stopPublish()
+		s.unregisterConn(conn)
+	}()
 
-	buf := make([]byte, 4096)
+	if err := conn.handshake(); err != nil {
+		fmt.Printf("rtmp: handshake with %s failed: %v\n", conn.RemoteAddr(), err)
+		return
+	}
+
 	for {
-		if _, err := conn.Read(buf); err != nil {
+		m, err := conn.readMessage()
+		if err != nil {
+			if err != io.EOF {
+				fmt.Printf("rtmp: client %s disconnected: %v\n", conn.RemoteAddr(), err)
+			}
 			return
+		}
+		if err := conn.maybeAck(); err != nil {
+			fmt.Printf("rtmp: ack to %s failed: %v\n", conn.RemoteAddr(), err)
+			return
+		}
+
+		if handled, err := conn.handleControl(m); err != nil {
+			fmt.Printf("rtmp: control message from %s: %v\n", conn.RemoteAddr(), err)
+			return
+		} else if handled {
+			continue
+		}
+
+		switch m.TypeID {
+		case msgCommandAMF0:
+			if err := conn.handleCommand(m); err != nil {
+				fmt.Printf("rtmp: command from %s: %v\n", conn.RemoteAddr(), err)
+				return
+			}
+		case msgVideo:
+			conn.handleVideo(m)
+		case msgAudio:
+			conn.handleAudio(m)
+		default:
+			// onMetaData（type 18）等数据消息与未知类型暂不处理。
 		}
 	}
 }

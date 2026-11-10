@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// TestHandshakeEcho 字节级验证简单握手：S0=0x03，S1/S2 都回显 C1，
-// 读完 C2 后 handshake 正常返回。
+// TestHandshakeEcho 字节级验证简单握手：S0=0x03，S1 回显 C1 但版本字段清零，
+// S2 回显整个 C1，读完 C2 后 handshake 正常返回。
 func TestHandshakeEcho(t *testing.T) {
 	server, client := net.Pipe()
 	conn := newConn(server)
@@ -46,8 +46,13 @@ func TestHandshakeEcho(t *testing.T) {
 	if _, err := io.ReadFull(client, s2); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(s1, c1) {
-		t.Fatal("S1 is not an echo of C1")
+	wantS1 := bytes.Clone(c1)
+	clear(wantS1[4:8]) // 版本字段清零，ffmpeg 才会走 simple 握手
+	if !bytes.Equal(s1, wantS1) {
+		t.Fatal("S1 is not an echo of C1 with a zeroed version field")
+	}
+	if wantS1[4] != 0 || s1[0] != c1[0] || s1[8] != c1[8] {
+		t.Fatalf("S1 time/version/random = %x/%x/%x", s1[:8], s1[8:12], s1[0])
 	}
 	if !bytes.Equal(s2, c1) {
 		t.Fatal("S2 is not an echo of C1")

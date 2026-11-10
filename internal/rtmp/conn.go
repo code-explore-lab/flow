@@ -12,8 +12,10 @@ package rtmp
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 // RTMP 默认 chunk size（协议规定 128）。
@@ -28,7 +30,9 @@ type Conn struct {
 	net.Conn
 
 	// br 缓冲读；chunk 的 basic/message header 和负载都从这里读。
+	// cr 在底层统计已接收字节数，供 Ack 使用。
 	br *bufio.Reader
+	cr *countingReader
 
 	mu sync.Mutex // 串行化写操作
 
@@ -49,6 +53,29 @@ type Conn struct {
 	peerAckWindow uint32
 	peerBandwidth uint32
 	lastAckSeq    uint32
+
+	// lastAckSent 上次发送 Ack 时的已接收字节数（只由读循环更新）。
+	lastAckSent uint64
+
+	// 命令层状态（command.go / publish.go），只在连接的读循环里使用。
+	srv          *Server
+	app          string
+	streamName   string
+	nextStreamID uint32
+	publish      *publishState
+	play         *playState
+}
+
+// countingReader 统计底层连接读到的字节总数，用于周期性回 Ack。
+type countingReader struct {
+	r io.Reader
+	n atomic.Uint64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(uint64(n))
+	return n, err
 }
 
 // chunkStream 一个 CSID 上正在接收/最近收到的消息状态。
@@ -67,9 +94,11 @@ type chunkStream struct {
 
 // newConn 包装一条裸 TCP 连接。
 func newConn(c net.Conn) *Conn {
+	cr := &countingReader{r: c}
 	return &Conn{
 		Conn:           c,
-		br:             bufio.NewReader(c),
+		br:             bufio.NewReader(cr),
+		cr:             cr,
 		readChunkSize:  defaultChunkSize,
 		writeChunkSize: defaultChunkSize,
 		chunks:         make(map[uint32]*chunkStream),

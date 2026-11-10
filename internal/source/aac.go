@@ -33,6 +33,12 @@ func NewAACSource(path string) *AACSource {
 	return &AACSource{path: path}
 }
 
+// Path 返回音频文件路径。RTMP 拉流端用它读取首帧的 ADTS 头，生成 FLV 的
+// AAC 序列头（AudioSpecificConfig）。
+func (s *AACSource) Path() string {
+	return s.path
+}
+
 // SamplingRate 返回最近一轮解析出的采样率；还没解析到 ADTS 头时返回默认值。
 // RTP 音频时间戳的时钟频率就是采样率，RTCP SR 必须用同一个值。
 func (s *AACSource) SamplingRate() uint32 {

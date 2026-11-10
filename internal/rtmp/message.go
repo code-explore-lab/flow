@@ -110,6 +110,31 @@ func (c *Conn) writeSetPeerBandwidth(n uint32, limit uint8) error {
 	return c.writeControl(msgSetPeerBandwidth, buildSetPeerBandwidth(n, limit))
 }
 
+// ackWindow 本端通告的 Window Acknowledgement Size（也是对端没声明时的
+// 默认 Ack 间隔）。2.5MB 是 RTMP 实现的常见值。
+const ackWindow uint32 = 2500000
+
+// maybeAck 已接收字节数比上次 Ack 多出一个窗口时回一次 Ack。
+// 读循环每处理完一条消息调用一次；TCP 缓冲可能已多读，Ack 语义允许。
+func (c *Conn) maybeAck() error {
+	if c.cr == nil {
+		return nil
+	}
+	window := c.peerAckWindow
+	if window == 0 {
+		window = ackWindow
+	}
+	total := c.cr.n.Load()
+	if total-c.lastAckSent < uint64(window) {
+		return nil
+	}
+	if err := c.writeAck(uint32(total)); err != nil {
+		return err
+	}
+	c.lastAckSent = total
+	return nil
+}
+
 // ---- 接收 ----
 
 // handleControl 处理一条协议控制消息，返回 handled=false 表示这不是控制

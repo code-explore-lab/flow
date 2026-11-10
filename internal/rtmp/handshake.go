@@ -6,11 +6,16 @@ package rtmp
 // 随机块以确认对方是活的 RTMP 端点。这里采用最简单的回显方案：
 //
 //	C0/C1          客户端 → 服务端：版本 0x03 + 1536 字节随机块
-//	S0/S1/S2       服务端 → 客户端：版本 0x03 + S1(回显 C1) + S2(回显 C1)
+//	S0/S1/S2       服务端 → 客户端：版本 0x03 + S1(回显 C1、版本字段清零) + S2(回显 C1)
 //	C2             客户端 → 服务端：回显 S1
 //
-// ffmpeg/ffplay 默认发带摘要的复杂握手，但发现服务端回的是纯回显后会自动
-// 退化成 simple 握手，所以这个最小实现足以兼容它们。
+// S1 的版本字段（第 5~8 字节）必须清零：ffmpeg 拉流时看到 S1 版本 >= 3
+// 会当作复杂握手去校验 HMAC 摘要，失败后直接断开（"Server response
+// validating failed"）。清零后 ffmpeg/ffplay 走 simple 握手。（推流方向
+// ffmpeg 不做这个校验，所以 M3 才能用纯回显跑通。）
+//
+// S2 仍按规范回显整个 C1；C2 只读取不校验。复杂度低于 nginx-rtmp 等
+// 实现，但足够兼容 ffmpeg/ffplay。
 
 import (
 	"fmt"
@@ -38,10 +43,16 @@ func (c *Conn) handshake() error {
 		return fmt.Errorf("rtmp handshake: read c1: %w", err)
 	}
 
-	// S0 + S1 + S2，S1/S2 都回显 C1。
+	// S1：回显 C1 的时间（前 4 字节），版本字段（接下来 4 字节）清零，
+	// 其余照抄——对端只把 S1 当不透明数据回显进 C2。
+	s1 := make([]byte, handshakeSize)
+	copy(s1, c1)
+	clear(s1[4:8])
+
+	// S0 + S1 + S2，S2 回显整个 C1。
 	out := make([]byte, 0, 1+2*handshakeSize)
 	out = append(out, handshakeVersion) // S0
-	out = append(out, c1...)            // S1
+	out = append(out, s1...)            // S1
 	out = append(out, c1...)            // S2
 	if err := c.write(out); err != nil {
 		return fmt.Errorf("rtmp handshake: write s0s1s2: %w", err)

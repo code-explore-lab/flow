@@ -8,7 +8,10 @@ package rtmp
 //
 //	basic header:   fmt(2 位) + csid（1/2/3 字节）
 //	message header: fmt 0=11 字节(含 4 字节 LE 的 stream id)、fmt 1=7、
-//	                fmt 2=3、fmt 3=0；时间戳字段为 0xFFFFFF 时后面跟 4 字节扩展
+//	                fmt 2=3、fmt 3=0
+//	ext timestamp:  时间戳字段为 0xFFFFFF 时，在完整 message header 之后再跟
+//	                4 字节大端扩展时间戳；该消息的每个 fmt 3 chunk 也重复这
+//	                4 字节（ffmpeg 按此布局解析）
 //	payload:        按 chunk size 拆分，续片用 fmt 3
 
 import (
@@ -69,11 +72,7 @@ func (c *Conn) readMessage() (*Message, error) {
 
 		switch hfmt {
 		case 0:
-			ts, err := readUint24(c.br)
-			if err != nil {
-				return nil, err
-			}
-			ts, err = readExtendedTimestamp(c.br, ts)
+			ts, ext, err := readUint24Ext(c.br)
 			if err != nil {
 				return nil, err
 			}
@@ -89,18 +88,20 @@ func (c *Conn) readMessage() (*Message, error) {
 			if err != nil {
 				return nil, err
 			}
+			if ext {
+				if ts, err = readUint32(c.br); err != nil {
+					return nil, err
+				}
+			}
 			st.timestamp = ts
 			st.timestampDelta = 0 // fmt 0 没有增量可继承
 			st.length = length
 			st.typeID = typeID
 			st.streamID = streamID
+			st.extTimestamp = ext
 			st.reset()
 		case 1:
-			delta, err := readUint24(c.br)
-			if err != nil {
-				return nil, err
-			}
-			delta, err = readExtendedTimestamp(c.br, delta)
+			delta, ext, err := readUint24Ext(c.br)
 			if err != nil {
 				return nil, err
 			}
@@ -112,24 +113,39 @@ func (c *Conn) readMessage() (*Message, error) {
 			if err != nil {
 				return nil, err
 			}
+			if ext {
+				if delta, err = readUint32(c.br); err != nil {
+					return nil, err
+				}
+			}
 			st.timestampDelta = delta
 			st.timestamp += delta
 			st.length = length
 			st.typeID = typeID
+			st.extTimestamp = ext
 			st.reset()
 		case 2:
-			delta, err := readUint24(c.br)
+			delta, ext, err := readUint24Ext(c.br)
 			if err != nil {
 				return nil, err
 			}
-			delta, err = readExtendedTimestamp(c.br, delta)
-			if err != nil {
-				return nil, err
+			if ext {
+				if delta, err = readUint32(c.br); err != nil {
+					return nil, err
+				}
 			}
 			st.timestampDelta = delta
 			st.timestamp += delta
+			st.extTimestamp = ext
 			st.reset()
 		case 3:
+			if st.extTimestamp {
+				// 该消息用扩展时间戳时，每个 fmt 3 chunk 都重复 4 字节；
+				// 续片沿用已记录的时间戳，值本身可以忽略。
+				if _, err := readUint32(c.br); err != nil {
+					return nil, err
+				}
+			}
 			if st.received == 0 {
 				// 新消息复用上一个 header。
 				if st.length == 0 {
@@ -169,12 +185,13 @@ func (c *Conn) readMessage() (*Message, error) {
 	}
 }
 
-// readExtendedTimestamp 时间戳字段为 0xFFFFFF 时读 4 字节扩展时间戳，否则原样返回。
-func readExtendedTimestamp(r io.Reader, v24 uint32) (uint32, error) {
-	if v24 == 0xFFFFFF {
-		return readUint32(r)
+// readUint24Ext 读 3 字节时间戳字段，并报告是否为 0xFFFFFF（扩展时间戳标记）。
+func readUint24Ext(r io.Reader) (uint32, bool, error) {
+	v, err := readUint24(r)
+	if err != nil {
+		return 0, false, err
 	}
-	return v24, nil
+	return v, v == 0xFFFFFF, nil
 }
 
 // writeMessage 把一条消息按当前 writeChunkSize 拆成 chunk 写出去。
@@ -202,11 +219,15 @@ func (c *Conn) writeMessage(m *Message, csid uint32) error {
 	}
 	payload = payload[n:]
 
-	// fmt 3 续片。
+	ext := m.Timestamp >= 0xFFFFFF
+	// fmt 3 续片。消息用扩展时间戳时，每个续片也要重复 4 字节。
 	for len(payload) > 0 {
 		n := min(chunkSize, uint32(len(payload)))
-		chunk := make([]byte, 0, len(encodeBasicHeader(3, csid))+int(n))
+		chunk := make([]byte, 0, len(encodeBasicHeader(3, csid))+8+int(n))
 		chunk = append(chunk, encodeBasicHeader(3, csid)...)
+		if ext {
+			chunk = appendUint32(chunk, m.Timestamp)
+		}
 		chunk = append(chunk, payload[:n]...)
 		if err := c.write(chunk); err != nil {
 			return err
@@ -229,18 +250,23 @@ func encodeBasicHeader(fmt uint8, csid uint32) []byte {
 	}
 }
 
-// appendMessageHeaderFmt0 追加 fmt 0 的 11 字节 header（含可选的扩展时间戳）。
-// 扩展时间戳紧跟 3 字节时间戳字段之后、message length 之前（与 readMessage 对应）。
+// appendMessageHeaderFmt0 追加 fmt 0 的 header。
+// 时间戳 >= 0xFFFFFF 时，时间戳字段写 0xFFFFFF，并在完整的 11 字节 header
+// （时间戳/length/type/stream id）之后再追加 4 字节扩展时间戳 —— 这是
+// ffmpeg 的布局；放在时间戳字段后面会导致对端 packet 边界错位。
 func appendMessageHeaderFmt0(buf []byte, ts, length uint32, typeID uint8, streamID uint32) []byte {
-	if ts >= 0xFFFFFF {
+	ext := ts >= 0xFFFFFF
+	if ext {
 		buf = appendUint24(buf, 0xFFFFFF)
-		buf = appendUint32(buf, ts) // 扩展时间戳紧跟时间戳字段
 	} else {
 		buf = appendUint24(buf, ts)
 	}
 	buf = appendUint24(buf, length)
 	buf = append(buf, typeID)
 	buf = appendUint32LE(buf, streamID)
+	if ext {
+		buf = appendUint32(buf, ts)
+	}
 	return buf
 }
 

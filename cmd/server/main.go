@@ -6,13 +6,20 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
+	"flow/internal/rtmp"
 	"flow/internal/rtsp"
 	"flow/internal/source"
+	"flow/internal/stream"
 )
 
-// 入口：解析参数、搭好媒体源、启动 RTSP 服务器。
+// 入口：解析参数、搭好媒体源、并发启动 RTSP(:8554) 与 RTMP(:1935) 服务器。
+//
+// 两个服务器共用同一个 stream.Registry：任一协议推上来的流，另一协议都能
+// 按流名拉到；注册表未命中时回退到下面的本地文件源，所以
+// ffplay rtmp://127.0.0.1:1935/live/test 也能直接放 testdata。
 //
 // -live 让视频源从 stdin 读裸 H.264，模拟实时摄像头。
 // Windows DirectShow（先用 ffmpeg -list_devices true -f dshow -i dummy 查设备名）：
@@ -39,8 +46,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := rtsp.New(video, audio, *live)
-	if err := srv.Serve(ctx, ":8554"); err != nil {
-		fmt.Printf("listen failed: %v\n", err)
+	// 两个协议共用一份注册表，实现互通。
+	reg := stream.NewRegistry()
+	rtspSrv := rtsp.New(video, audio, *live)
+	rtspSrv.SetRegistry(reg)
+	rtmpSrv := rtmp.New(reg, video, audio)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// 任何一个监听失败就取消 ctx，让另一个也退出。
+	serve := func(name string, addr string, f func(context.Context, string) error) {
+		defer wg.Done()
+		if err := f(ctx, addr); err != nil {
+			fmt.Printf("%s listen failed on %s: %v\n", name, addr, err)
+			stop()
+		}
 	}
+	go serve("rtsp", ":8554", rtspSrv.Serve)
+	go serve("rtmp", ":1935", rtmpSrv.Serve)
+	wg.Wait()
 }

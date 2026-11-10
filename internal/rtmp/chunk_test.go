@@ -183,14 +183,15 @@ func TestReadFmt3NewMessageAfterDelta(t *testing.T) {
 }
 
 func TestExtendedTimestamp(t *testing.T) {
-	// 手写 fmt0，ts 字段 0xFFFFFF + 4 字节扩展 0x01020304（紧跟时间戳字段）。
+	// 手写 fmt0：ts 字段 0xFFFFFF，4 字节扩展 0x01020304 在完整 header 之后
+	// （stream id 之后），与 ffmpeg 的布局一致。
 	raw := []byte{}
 	raw = append(raw, encodeBasicHeader(0, 5)...)
-	raw = appendUint24(raw, 0xFFFFFF)   // ts 字段
-	raw = appendUint32(raw, 0x01020304) // 扩展时间戳，紧跟 ts 字段
-	raw = appendUint24(raw, 2)          // length
-	raw = append(raw, 20)               // type
-	raw = appendUint32LE(raw, 0)        // streamID
+	raw = appendUint24(raw, 0xFFFFFF) // ts 字段
+	raw = appendUint24(raw, 2)        // length
+	raw = append(raw, 20)             // type
+	raw = appendUint32LE(raw, 0)      // streamID
+	raw = appendUint32(raw, 0x01020304)
 	raw = append(raw, []byte("xy")...)
 
 	c := newReaderConn(t, raw)
@@ -208,6 +209,39 @@ func TestExtendedTimestamp(t *testing.T) {
 	got := writeThenRead(t, server, client, want, 3)
 	if got.Timestamp != want.Timestamp {
 		t.Fatalf("round-trip timestamp = %#x, want %#x", got.Timestamp, want.Timestamp)
+	}
+}
+
+func TestExtendedTimestampContinuation(t *testing.T) {
+	// 带扩展时间戳的 200 字节消息：fmt0 头 + 4 字节扩展，续片 fmt3 也重复扩展。
+	payload := bytes.Repeat([]byte{0x5A}, 200)
+	raw := []byte{}
+	raw = append(raw, encodeBasicHeader(0, 5)...)
+	raw = appendUint24(raw, 0xFFFFFF)
+	raw = appendUint24(raw, 200)
+	raw = append(raw, 20)
+	raw = appendUint32LE(raw, 0)
+	raw = appendUint32(raw, 0x01020304)
+	raw = append(raw, payload[:128]...)
+	raw = append(raw, encodeBasicHeader(3, 5)...)
+	raw = appendUint32(raw, 0x01020304)
+	raw = append(raw, payload[128:]...)
+
+	c := newReaderConn(t, raw)
+	m, err := c.readMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Timestamp != 0x01020304 || !bytes.Equal(m.Payload, payload) {
+		t.Fatalf("m = ts %#x len %d, want 0x01020304/%d", m.Timestamp, len(m.Payload), len(payload))
+	}
+
+	// write 侧往返：跨 chunk 的扩展时间戳消息。
+	server, client := pipeConns(t)
+	want := &Message{TypeID: 20, StreamID: 0, Timestamp: 0x01020304, Payload: payload}
+	got := writeThenRead(t, server, client, want, 3)
+	if got.Timestamp != want.Timestamp || !bytes.Equal(got.Payload, payload) {
+		t.Fatalf("round-trip ts=%#x len=%d", got.Timestamp, len(got.Payload))
 	}
 }
 

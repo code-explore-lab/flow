@@ -37,25 +37,38 @@ type playState struct {
 	streamID uint32
 	cancel   chan struct{}
 	wg       sync.WaitGroup
-
-	// 音视频共用同一个首帧基准，避免两轨各自归零导致不同步。
-	mu      sync.Mutex
-	baseSet bool
-	baseMS  uint32
 }
 
-// relativeMS 把绝对毫秒时间戳换算成相对首帧的毫秒数。
-func (ps *playState) relativeMS(ms uint32) uint32 {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	if !ps.baseSet {
-		ps.baseSet = true
-		ps.baseMS = ms
-	}
-	if ms < ps.baseMS {
+// relativeClock 一条轨的播放时间基准，由该轨的播放 goroutine 独占，无需加锁。
+//
+// 音视频各用一个：RTSP 源的音频/视频 RTP 时钟互不相关（可能相差上亿），
+// 共用一个基准会让其中一轨的相对毫秒远超 0xFFFFFF，触发扩展时间戳并让
+// 播放时间线完全错乱。
+//
+// FLV tag 的 dts 必须单调递增，但 RTSP 推流带 B 帧时 RTP 时间戳按解码顺序
+// 到达、会小幅回退，所以回退的帧贴到上一帧之后（+1ms）。
+type relativeClock struct {
+	set  bool
+	base uint32
+	last uint32
+}
+
+// relative 把绝对毫秒时间戳换算成相对首帧的毫秒数。
+func (rc *relativeClock) relative(ms uint32) uint32 {
+	if !rc.set {
+		rc.set = true
+		rc.base = ms
 		return 0
 	}
-	return ms - ps.baseMS
+	if ms < rc.base {
+		ms = rc.base
+	}
+	rel := ms - rc.base
+	if rel <= rc.last {
+		rel = rc.last + 1
+	}
+	rc.last = rel
+	return rel
 }
 
 // handlePlay 处理 play 命令：选定帧源、订阅、回状态并启动播放 goroutine。
@@ -198,6 +211,7 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 	if params != nil {
 		sps, pps = params.SPS, params.PPS
 	}
+	var clock relativeClock
 	headerSent := false
 	sendHeader := func() error {
 		if headerSent || len(sps) == 0 || len(pps) == 0 {
@@ -250,7 +264,7 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		if err := c.writeMessage(&Message{
 			TypeID:    msgVideo,
 			StreamID:  ps.streamID,
-			Timestamp: ps.relativeMS(ms),
+			Timestamp: clock.relative(ms),
 			Payload:   flv.BuildVideoTag(f.Data, f.Keyframe, 0),
 		}, videoCSID); err != nil {
 			return
@@ -277,6 +291,7 @@ func (c *Conn) playAudio(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		}
 	}
 
+	var clock relativeClock
 	for {
 		f, ok := rd.Next(ps.cancel)
 		if !ok {
@@ -286,7 +301,7 @@ func (c *Conn) playAudio(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		if err := c.writeMessage(&Message{
 			TypeID:    msgAudio,
 			StreamID:  ps.streamID,
-			Timestamp: ps.relativeMS(ms),
+			Timestamp: clock.relative(ms),
 			Payload:   flv.BuildAudioTag(f.Data, rate, ch),
 		}, audioCSID); err != nil {
 			return

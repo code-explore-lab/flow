@@ -87,6 +87,10 @@ type chunkStream struct {
 	typeID         uint8  // message type id
 	streamID       uint32 // message stream id
 
+	// extTimestamp 最近一次 fmt 0/1/2 header 的时间戳字段是否为 0xFFFFFF。
+	// 是的话每个 fmt 3 chunk 的 header 后都要跟 4 字节扩展时间戳。
+	extTimestamp bool
+
 	// 重组缓冲
 	buf      []byte
 	received uint32 // 已收到该消息的字节数（不含 chunk header）

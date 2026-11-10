@@ -65,23 +65,43 @@ func stopPlayer(t *testing.T, server, client *Conn) {
 	server.stopPlay()
 }
 
-func TestRelativeMSBaseline(t *testing.T) {
-	ps := &playState{}
+func TestRelativeClockBaseline(t *testing.T) {
+	var rc relativeClock
 	// 首帧建立基准。
-	if got := ps.relativeMS(1000); got != 0 {
+	if got := rc.relative(1000); got != 0 {
 		t.Fatalf("first = %d, want 0", got)
 	}
-	// 音视频共享同一个基准。
-	if got := ps.relativeMS(1040); got != 40 {
+	if got := rc.relative(1040); got != 40 {
 		t.Fatalf("1040 = %d, want 40", got)
 	}
-	// 早于基准的帧（混流时可能先到）钳到 0。
-	if got := ps.relativeMS(900); got != 0 {
-		t.Fatalf("900 = %d, want 0", got)
+	// 早于基准的帧（RTSP 源时间戳回退）贴到上一帧之后，保证 dts 单调。
+	if got := rc.relative(900); got != 41 {
+		t.Fatalf("900 = %d, want 41", got)
+	}
+	// 重复时间戳同样 +1，避免 ffmpeg 报 non-monotonic dts。
+	if got := rc.relative(1040); got != 42 {
+		t.Fatalf("repeat 1040 = %d, want 42", got)
 	}
 	// 基准不会被后续帧覆盖。
-	if got := ps.relativeMS(1200); got != 200 {
+	if got := rc.relative(1200); got != 200 {
 		t.Fatalf("1200 = %d, want 200", got)
+	}
+}
+
+func TestRelativeClockPerTrack(t *testing.T) {
+	// 音视频各一个基准：两轨绝对时钟互不相关（RTSP 源），不能互相影响。
+	var v, a relativeClock
+	if got := v.relative(500_000); got != 0 {
+		t.Fatalf("video first = %d, want 0", got)
+	}
+	if got := a.relative(90_000_000); got != 0 {
+		t.Fatalf("audio first = %d, want 0", got)
+	}
+	if got := a.relative(90_000_023); got != 23 {
+		t.Fatalf("audio second = %d, want 23", got)
+	}
+	if got := v.relative(500_040); got != 40 {
+		t.Fatalf("video second = %d, want 40", got)
 	}
 }
 

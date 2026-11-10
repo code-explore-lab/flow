@@ -25,11 +25,11 @@ func newPublishConn(t *testing.T) (*Server, *Conn, *stream.Stream) {
 	return srv, c, st
 }
 
-// nextFrame 带超时地从读者取一帧。
+// nextFrame 带超时地从读者取一帧。帧由服务端 goroutine 异步写入，必须阻塞
+// 等待；只有超时才关闭 done 让 Next 返回（ch 带缓冲，goroutine 不会泄漏）。
 func nextFrame(t *testing.T, rd *source.Reader[source.Frame]) source.Frame {
 	t.Helper()
 	done := make(chan struct{})
-	close(done)
 	type result struct {
 		f  source.Frame
 		ok bool
@@ -46,6 +46,7 @@ func nextFrame(t *testing.T, rd *source.Reader[source.Frame]) source.Frame {
 		}
 		return r.f
 	case <-time.After(2 * time.Second):
+		close(done)
 		t.Fatal("timed out waiting for a frame")
 		return source.Frame{}
 	}

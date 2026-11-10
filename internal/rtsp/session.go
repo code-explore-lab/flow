@@ -13,6 +13,7 @@ import (
 	"flow/internal/rtcp"
 	"flow/internal/session"
 	"flow/internal/source"
+	"flow/internal/stream"
 )
 
 // mediaTrack 一条媒体轨（video/audio）的传输参数。
@@ -45,7 +46,7 @@ type mediaTrack struct {
 	fmtp        string // ANNOUNCE SDP 的 a=fmtp（AAC 解包位宽用）
 
 	// external 这条轨对应的推流源：
-	//   - 推流端 SETUP 时指向 publishedStream 的源（解包后写进去）；
+	//   - 推流端 SETUP 时指向已发布流（stream.Stream）的源（解包后写进去）；
 	//   - 拉流端 SETUP 时指向同一个源（PLAY 后订阅它转发）；
 	//   - 文件/live 模式为 nil，PLAY 时退回 Server 上的全局源。
 	external *source.ExternalSource
@@ -227,7 +228,7 @@ type Session struct {
 	// pub 这个会话关联的已发布流：推流会话在 ANNOUNCE 时创建，
 	// 拉流会话在 SETUP 时按 URL 找到并挂上。SETUP/PLAY 用它取编码参数和
 	// ExternalSource。pubCleanup 在会话关闭时把这条流从 Server 注册表摘掉。
-	pub        *publishedStream
+	pub        *stream.Stream
 	pubCleanup func()
 
 	// 每次 PLAY 的独立生命周期。PAUSE 时取消它，TEARDOWN 时由会话
@@ -290,7 +291,7 @@ func (s *Session) isPush() bool {
 
 // setPublished 给会话挂上已发布流。cleanup 可为 nil（拉流会话不需要注销）。
 // 重复 ANNOUNCE 时整体替换，并保留最后一次注册的 cleanup。
-func (s *Session) setPublished(pub *publishedStream, cleanup func()) {
+func (s *Session) setPublished(pub *stream.Stream, cleanup func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pub = pub
@@ -307,7 +308,7 @@ func (s *Session) markEnded() bool {
 }
 
 // published 返回会话关联的已发布流（推流/拉流都可能非 nil）。
-func (s *Session) published() *publishedStream {
+func (s *Session) published() *stream.Stream {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pub

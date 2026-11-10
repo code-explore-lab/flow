@@ -58,6 +58,32 @@ func TestParseADTSHeader(t *testing.T) {
 	}
 }
 
+func TestParseASC(t *testing.T) {
+	// AAC LC / 44100(sfi=4) / 立体声 → 0x12 0x10，与 AudioSpecificConfig 往返一致。
+	h, err := ParseADTSHeader(buildADTSFrame([]byte{0x01}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	asc := h.AudioSpecificConfig()
+	if !bytes.Equal(asc, []byte{0x12, 0x10}) {
+		t.Fatalf("ASC = % x, want 12 10", asc)
+	}
+	rate, channels, err := ParseASC(asc)
+	if err != nil {
+		t.Fatalf("ParseASC: %v", err)
+	}
+	if rate != 44100 || channels != 2 {
+		t.Fatalf("ParseASC(% x) = %dHz/%dch, want 44100Hz/2ch", asc, rate, channels)
+	}
+
+	if _, _, err := ParseASC([]byte{0x12}); err == nil {
+		t.Fatal("ParseASC accepted a 1-byte config")
+	}
+	if _, _, err := ParseASC([]byte{0x17, 0x90}); err == nil {
+		t.Fatal("ParseASC accepted reserved sampling frequency index 15")
+	}
+}
+
 func TestNextAUSplitByFrameLength(t *testing.T) {
 	payloads := [][]byte{
 		{0x01, 0x02, 0x03, 0x04},

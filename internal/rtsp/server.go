@@ -14,6 +14,7 @@ import (
 
 	"flow/internal/session"
 	"flow/internal/source"
+	"flow/internal/stream"
 )
 
 // Server 一个 RTSP 服务器实例。一个进程通常只有一个：共享一组媒体源，
@@ -28,8 +29,9 @@ type Server struct {
 	sessions *session.Manager
 
 	// 已发布流注册表（ANNOUNCE 创建，拉流端按 URL 路径查找）。P1-8。
-	pubMu     sync.RWMutex
-	published map[string]*publishedStream //key是RTSP url路径
+	// 与 RTMP 共用同一份 internal/stream.Registry；New 默认自建一份，
+	// main 可以用 SetRegistry 注入共享实例。
+	registry *stream.Registry
 
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
@@ -46,8 +48,16 @@ func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 		videoPath: "testdata/test.h264",
 		audioPath: "testdata/test.aac",
 		sessions:  session.NewManager(session.DefaultTimeout),
-		published: make(map[string]*publishedStream),
+		registry:  stream.NewRegistry(),
 		conns:     make(map[*Conn]struct{}),
+	}
+}
+
+// SetRegistry 注入共享的已发布流注册表（main 里让 RTSP 与 RTMP 互通）。
+// 传 nil 时保持自建的那份。必须在 Serve 之前调用。
+func (s *Server) SetRegistry(reg *stream.Registry) {
+	if reg != nil {
+		s.registry = reg
 	}
 }
 

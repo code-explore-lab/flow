@@ -37,11 +37,18 @@ func TestAnnouncePublishesAndDescribeUsesCodecParams(t *testing.T) {
 	if pub == nil {
 		t.Fatal("ANNOUNCE did not register a published stream")
 	}
-	if pub.video == nil || pub.audio == nil {
-		t.Fatalf("published sources = video%v audio%v, want both", pub.video != nil, pub.audio != nil)
+	video, audio := pub.VideoTrack(), pub.AudioTrack()
+	if video == nil || audio == nil {
+		t.Fatalf("published tracks = video%v audio%v, want both", video != nil, audio != nil)
 	}
-	if got := pub.audio.SamplingRate(); got != 44100 {
+	if got := audio.Src.SamplingRate(); got != 44100 {
 		t.Fatalf("audio sampling rate = %d, want 44100", got)
+	}
+	if vc, ok := pub.VideoParams(); !ok || len(vc.SPS) == 0 || len(vc.PPS) == 0 {
+		t.Fatalf("video params = %+v ok=%v, want SPS/PPS parsed from ANNOUNCE", vc, ok)
+	}
+	if ac, ok := pub.AudioParams(); !ok || len(ac.Config) != 2 || ac.SampleRate != 44100 || ac.Channels != 2 {
+		t.Fatalf("audio params = %+v ok=%v, want ASC 44100/2", ac, ok)
 	}
 
 	sdp, err := s.buildSDP("rtsp://127.0.0.1:8554/push")
@@ -117,7 +124,7 @@ func TestPullSetupUsesPublishedTrack(t *testing.T) {
 		if track.isPush {
 			t.Fatal("pull SETUP created a push track")
 		}
-		if track.external != pub.video {
+		if track.external != pub.VideoTrack().Src {
 			t.Fatal("pull video track does not subscribe the published video source")
 		}
 		if track.payloadType != 96 || track.encoding != "H264" || track.clockRate != 90000 {
@@ -158,7 +165,7 @@ func TestPullSetupUsesPublishedTrack(t *testing.T) {
 		if track == nil {
 			t.Fatal("audio track not created")
 		}
-		if track.external != pub.audio {
+		if track.external != pub.AudioTrack().Src {
 			t.Fatal("pull audio track does not subscribe the published audio source")
 		}
 		if track.payloadType != 97 || track.encoding != "MPEG4-GENERIC" || track.clockRate != 44100 {
@@ -252,9 +259,9 @@ func TestPushTeardownClosesSourceAndRemovesSession(t *testing.T) {
 		t.Fatal("ANNOUNCE did not register a published stream")
 	}
 
-	rd, cancel := pub.video.Subscribe()
+	rd, cancel := pub.VideoTrack().Src.Subscribe()
 	defer cancel()
-	pub.video.Write(source.Frame{Data: []byte{0x41, 0x01}, Timestamp: 3600})
+	pub.VideoTrack().Src.Write(source.Frame{Data: []byte{0x41, 0x01}, Timestamp: 3600})
 
 	thd := map[string]string{"CSeq": "2"}
 	td := &Request{
@@ -310,7 +317,7 @@ func TestPushTCPDisconnectClosesSourceAndRemovesSession(t *testing.T) {
 	if pub == nil {
 		t.Fatal("ANNOUNCE did not register a published stream")
 	}
-	rd, cancel := pub.video.Subscribe()
+	rd, cancel := pub.VideoTrack().Src.Subscribe()
 	defer cancel()
 	if got := s.sessions.Len(); got != 1 {
 		t.Fatalf("sessions = %d, want 1", got)
@@ -347,7 +354,7 @@ func TestPullSourceEndClosesSessionAndConn(t *testing.T) {
 		interleavedRTCP: 1,
 		conn:            conn,
 		payloadType:     96,
-		external:        pub.video,
+		external:        pub.VideoTrack().Src,
 	}
 	st.setTrack("video", track)
 

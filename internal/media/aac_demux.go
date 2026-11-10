@@ -3,6 +3,7 @@ package media
 //从 `test.aac`（ADTS，每帧带 7 字节头）里按 `frame_length` 切出每个 AU。
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 )
@@ -74,6 +75,36 @@ func (h *ADTSHeader) AudioSpecificConfig() []byte {
 		uint16(h.SamplingFrequencyIndex&0x0F)<<7 |
 		uint16(h.ChannelConfig&0x0F)<<3
 	return []byte{byte(asc >> 8), byte(asc)}
+}
+
+// ParseASC 解析 AudioSpecificConfig（ISO/IEC 14496-3），返回采样率和声道数。
+// 位布局与 AudioSpecificConfig 相反：
+//
+//	bit 15..11 audioObjectType（AAC LC = 2；31 表示后面还有 6 位显式类型，暂不支持）
+//	bit 10..7  samplingFrequencyIndex（15 表示后面跟 24 位显式采样率，暂不支持）
+//	bit  6..3  channelConfiguration（0 表示 PCE，暂不支持）
+//
+// RTMP 推流收到 FLV 音频序列头后用它推算 SDP/FLV 需要的参数。
+func ParseASC(asc []byte) (sampleRate int, channels uint8, err error) {
+	if len(asc) < 2 {
+		return 0, 0, errors.New("asc too short, min 2 bytes")
+	}
+	audioObjectType := asc[0] >> 3
+	if audioObjectType == 31 {
+		return 0, 0, errors.New("explicit audio object type not supported")
+	}
+	sfi := (asc[0]&0x07)<<1 | asc[1]>>7
+	if sfi == 15 {
+		return 0, 0, errors.New("explicit sampling frequency not supported")
+	}
+	if int(sfi) >= len(samplingFrequencyTable) {
+		return 0, 0, fmt.Errorf("reserved sampling frequency index %d", sfi)
+	}
+	ch := (asc[1] >> 3) & 0x0F
+	if ch == 0 {
+		return 0, 0, errors.New("channel configuration 0 (PCE) not supported")
+	}
+	return samplingFrequencyTable[sfi], ch, nil
 }
 
 // AACDemux ADTS 音频解封装器：按 ADTS 头里的 frame_length 切出每个 AU。

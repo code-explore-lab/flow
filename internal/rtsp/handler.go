@@ -11,6 +11,7 @@ import (
 
 	"flow/internal/media"
 	"flow/internal/session"
+	"flow/internal/stream"
 )
 
 // handleConn 处理一条 RTSP TCP 连接直到关闭。
@@ -69,7 +70,7 @@ func (s *Server) handleConn(conn *Conn) {
 			hd["Content-Type"] = "application/sdp"
 			// 记住命中的已发布流，后续 SETUP 即使 URI 写法不同也能找回来。
 			if pub := s.publishedFromURI(req.URI); pub != nil {
-				conn.setDescribeStream(pub.name)
+				conn.setDescribeStream(pub.Name)
 			} else {
 				conn.setDescribeStream("")
 			}
@@ -177,7 +178,7 @@ func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
 // 没有已发布流时退回本地文件/实时源的原有逻辑。
 func (s *Server) buildSDP(uri string) (string, error) {
 	if pub := s.publishedFromURI(uri); pub != nil {
-		return pub.sdp(), nil
+		return publishedSDP(pub), nil
 	}
 
 	sdp := "v=0\r\n" +
@@ -325,7 +326,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	// 有 ANNOUNCE 轨道说明这是推流会话：SETUP 的方向是客户端 → 服务端。
 	push := len(announced) > 0
 
-	var pub *publishedStream
+	var pub *stream.Stream
 	if !push {
 		describeName := conn.describeStreamName()
 		pub = s.publishedFromURI(req.URI)
@@ -358,7 +359,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			fmtp = at.FMTP
 		}
 	case pub != nil:
-		if at, ok := pub.trackByControl(req.URI); ok {
+		if at, ok := trackByControl(pub, req.URI); ok {
 			kind = at.Kind
 			clockRate = uint32(at.ClockRate)
 			payloadType = at.PayloadType
@@ -377,7 +378,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	}
 	// URI 里没有 control 段时按 kind 补齐已发布流的编码参数。
 	if pub != nil && payloadType == 0 {
-		if at, ok := pub.firstTrackOfKind(kind); ok {
+		if at, ok := firstTrackOfKind(pub, kind); ok {
 			clockRate = uint32(at.ClockRate)
 			payloadType = at.PayloadType
 			encoding = at.Encoding
@@ -390,7 +391,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	//   拉流模式 → 已发布流里有没有音频轨，或服务端有没有挂本地音频源。
 	if kind == "audio" {
 		hasAudio := s.audio != nil
-		if pub != nil && pub.audio != nil {
+		if pub != nil && pub.AudioTrack() != nil {
 			hasAudio = true
 		}
 		for _, at := range announced {
@@ -426,7 +427,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		pubForTrack = rtspSess.published()
 	}
 	if pubForTrack != nil {
-		t.external = pubForTrack.sourceFor(kind)
+		t.external = pubForTrack.SourceFor(kind)
 	}
 
 	var respTransport string

@@ -41,6 +41,14 @@ type Conn struct {
 
 	// 每个 CSID 的重组状态，key 是 chunk stream id。
 	chunks map[uint32]*chunkStream
+
+	// 对端声明的流控参数（见 message.go 的 handleControl）：
+	//   peerAckWindow  对端要求本端每收这么多字节回一次 Ack；
+	//   peerBandwidth  对端要求本端未确认的发送窗口上限；
+	//   lastAckSeq     对端最近确认的本端已发字节数。
+	peerAckWindow uint32
+	peerBandwidth uint32
+	lastAckSeq    uint32
 }
 
 // chunkStream 一个 CSID 上正在接收/最近收到的消息状态。

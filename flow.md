@@ -350,7 +350,7 @@ $ (0x24) + channel(1B) + length(2B 大端，只算 payload) + RTP/RTCP 包
 
 ## 3. P1：推流端（ANNOUNCE / RECORD）要提前懂的知识
 
-这是你接下来马上要写的部分：P1-6（推流 SETUP/RECORD 接包）和 P1-7（RTP 解包写 ExternalSource）已完成，`done.md` P1-8 ~ P1-9 还没做。
+这一节对应 P1-6 ~ P1-9：推流 SETUP/RECORD 接包、RTP 解包写 ExternalSource、拉流端订阅推流源转发、推流断开后回收会话并让拉流端收到流结束都已完成。
 
 ### 3.1 完整推流时序
 
@@ -385,10 +385,10 @@ ffmpeg                                flow server
 
 4. **推流数据写到哪里？**
    - `ExternalSource.Write(Frame)`；拉流端 `Subscribe()` 拿同一个源，中途加入靠 SPS/PPS/IDR preload。
-   - **设计取舍**：单个全局 `ExternalSource` 只能支持一路推流；多路推流需要 `map[streamPath]*ExternalSource` + DESCRIBE 按 URL 查找。这是 P1-8 前必须定的架构。
+   - **已落地的架构**：`Server.published map[streamPath]*publishedStream`（`internal/rtsp/publish.go`）。`publishedStream` 持有 ANNOUNCE 的轨道描述和每类轨一个 `ExternalSource`；ANNOUNCE 时登记，拉流 DESCRIBE/SETUP 按 URL 路径查找。不同路径可并存多路推流，同一路径重复 ANNOUNCE 视为重新发布。
 
 5. **拉流 DESCRIBE 的 SDP 从哪来？**
-   - 现在 `buildSDP()` 读本地 `testdata` 文件（`handler.go:124-154`）。推流场景必须改成「从 ANNOUNCE 保存的 `announcedTrack` 生成 SDP」。
+   - `buildSDP(uri)` 优先按 URL 找 `publishedStream`，用它的 `announcedTrack`（rtpmap/fmtp、sprop-parameter-sets、AAC config）生成 SDP；找不到才退回本地 `testdata`/live 源。
 
 6. **推流断开怎么让拉流端感知？**
    - TEARDOWN / TCP 断开 → 关闭 `ExternalSource` → 所有 reader 读完剩余帧后返回 false → 推流 goroutine 退出。不能只删会话不关源。
@@ -495,14 +495,14 @@ ffmpeg                                flow server
 ## 8. 当前实现的边界（别学错 / 面试别吹过头）
 
 - ✅ 拉流已完整：文件 + live stdin、UDP + TCP interleaved、视频 + 音频、SR、PAUSE 语义、幂等 PLAY、优雅退出
-- ✅ ANNOUNCE/SETUP/RECORD + RTP 收包、解包、写 ExternalSource 已通（P1-6/P1-7）；**拉流端订阅推流源还没接**（P1-8）
+- ✅ ANNOUNCE/SETUP/RECORD + RTP 收包、解包、写 ExternalSource 已通（P1-6/P1-7）；拉流端按 URL 找到已发布流、订阅同一个 `ExternalSource` 转发（P1-8），DESCRIBE 用 ANNOUNCE 的编码参数
 - ⚠️ RTCP 只发 SR；客户端发来的 RR 只刷新活跃时间，**不统计丢包/抖动**（C-3/C-4 未做）
 - ⚠️ 客户端 NACK(205)/PLI(206) 目前在 `handleInterleaved` 中被忽略（只认 200~204）
 - ⚠️ 无鉴权、无连接上限、无 TLS（A/E 段未做）
 - ⚠️ CSeq 只解析不校验顺序/重放
 - ⚠️ live 模式没有音频；DESCRIBE 实时模式不返回 `sprop-parameter-sets`（靠带内参数集）
-- ⚠️ SDP 生成仍读本地 `testdata` 文件，推流场景需要重构
-- ⚠️ 单全局视频源/音频源，不支持多路独立推流
+- ⚠️ 文件/live 模式仍用全局源；推流模式按 URL 注册，多路推流靠不同路径区分，同一路径只保留最后一路
+- ✅ 推流端 TEARDOWN / TCP 断开时立即删除会话、关闭 ExternalSource、注销已发布流；拉流端检测到源结束会主动关闭 RTSP 连接，客户端读到 EOF（P1-9）
 
 ---
 

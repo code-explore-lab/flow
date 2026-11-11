@@ -33,6 +33,12 @@ type Server struct {
 	// main 可以用 SetRegistry 注入共享实例。
 	registry *stream.Registry
 
+	// Basic 鉴权配置。user 与 pass 都为空表示不鉴权（默认）。
+	// 只在 Serve 前配置，读取时加读锁以兼容测试并发。
+	authMu   sync.RWMutex
+	authUser string
+	authPass string
+
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
@@ -61,6 +67,21 @@ func (s *Server) SetRegistry(reg *stream.Registry) {
 	}
 }
 
+// SetAuth 启用 RTSP Basic 鉴权。user 与 pass 都为空表示关闭鉴权（默认）。
+// 必须在 Serve 之前调用；运行期修改不会让已建立的连接重新认证。
+func (s *Server) SetAuth(user, pass string) {
+	s.authMu.Lock()
+	s.authUser, s.authPass = user, pass
+	s.authMu.Unlock()
+}
+
+// authEnabled 报告是否配置了 Basic 鉴权。
+func (s *Server) authEnabled() bool {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.authUser != "" || s.authPass != ""
+}
+
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
 // 返回的错误只有监听失败这一种（Accept 错误按信号区分，正常退出返回 nil）。
 func (s *Server) Serve(ctx context.Context, addr string) error {
@@ -80,6 +101,9 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		fmt.Println("input: stdin (live H.264, audio disabled)")
 	} else {
 		fmt.Println("input: testdata/test.h264 + testdata/test.aac")
+	}
+	if s.authEnabled() {
+		fmt.Println("auth: basic (realm=flow)")
 	}
 
 	// 收到退出信号后关掉 listener，让下面阻塞的 Accept 立即返回。

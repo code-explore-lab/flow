@@ -61,6 +61,20 @@ func (s *Server) handleConn(conn *Conn) {
 		}
 		fmt.Printf("recv: %s %s, CSeq=%d\n", req.Method, req.URI, req.CSeq)
 		hd := map[string]string{"CSeq": strconv.Itoa(req.CSeq)}
+
+		// OPTIONS 用于探测服务端能力，放行不鉴权；其余方法在启用 Basic
+		// 鉴权时必须带有效凭据。401 只带 challenge，不泄露请求细节。
+		if req.Method != "OPTIONS" && !s.checkRequestAuth(req) {
+			fmt.Printf("auth failed: %s %s\n", req.Method, req.URI)
+			hd["WWW-Authenticate"] = `Basic realm="` + basicRealm + `"`
+			hd["Content-Length"] = "0"
+			if err := writeResponse(conn, "401 Unauthorized", hd, nil); err != nil {
+				fmt.Println("write resp err:", err)
+				return
+			}
+			continue
+		}
+
 		var respErr error
 		switch req.Method {
 		case "OPTIONS":

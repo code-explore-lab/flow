@@ -33,6 +33,8 @@ import (
 //	       -f h264 pipe:1 | ./flow -live
 func main() {
 	live := flag.Bool("live", false, "read Annex-B H.264 from stdin (e.g. ffmpeg camera pipe); audio disabled")
+	user := flag.String("user", "", "RTSP Basic auth username (empty with -pass disables auth)")
+	pass := flag.String("pass", "", "RTSP Basic auth password")
 	flag.Parse()
 
 	video := source.NewH264Source("testdata/test.h264")
@@ -50,6 +52,7 @@ func main() {
 	reg := stream.NewRegistry()
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
+	rtspSrv.SetAuth(*user, *pass)
 	rtmpSrv := rtmp.New(reg, video, audio)
 
 	var wg sync.WaitGroup

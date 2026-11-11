@@ -1,26 +1,34 @@
-# done.md — 剩余任务拆解（RTSP / RTP / RTCP）
+# done.md — 剩余任务拆解（RTSP / RTP / RTCP / RTMP + 生产化）
 
-> 当前基线：Stage 5/5-1-6 已完成（RTSP 拉流、UDP/TCP interleaved、H.264+AAC、SR、ring buffer、优雅退出、stdin 实时源）。
-> 这份文件把「已实现」与「协议完整 + 生产可用」之间的差距拆成可独立完成、独立提交的小任务。
+> 当前基线（2026-11）：
+>
+> - **RTSP**：拉流 + 推流都已跑通 —— 文件/stdin 源、UDP/TCP interleaved、H.264+AAC、RTCP SR、PAUSE/PLAY、ANNOUNCE/SETUP/RECORD、RTP 收包解包、转发给拉流端、断开清理（P0-1~P0-5、P1-1~P1-9 全部完成）。
+> - **RTMP**：握手、Chunk Stream、AMF0、FLV、控制消息、publish/play、共享注册表、main 双协议接线全部完成（M0~M5，历史计划见 [rtmp.md](rtmp.md)）。
+> - **互通**：RTSP ↔ RTMP 按流名共享同一组 `ExternalSource`；本地文件回放、跨协议推拉、断开回收均已 e2e 验证。
+> - 当前 `go build` / `go vet` / `go test ./...` 全绿。下面这份清单是「协议完整 + 生产可用 + 产品化」之间剩余的差距。
 >
 > 规则：
+>
 > - 一次只做一个任务，完成后打勾；
 > - 每个任务都要有单元测试或可复现的验收命令；
 > - 涉及协议行为的，用 ffmpeg/ffplay/VLC 或 Wireshark 做端到端验证；
-> - 完成后按 AGENTS.md 把真实过程追加到 `日志-导出.md`。
+> - 完成后把真实现象/根因/取舍追加到 `日志-导出.md`（该文件尚未创建，见 DOC-2）。
+>
+> 优先级：**P0** 部署前必须；**P1** 质量/可观测性；**P2** 协议增强；**P3** 产品化扩展（按目标取舍，不属于「单机 RTSP/RTMP 转发器」这个窄场景）。
 
 ## 建议顺序
 
-1. **P0** 修 PAUSE（当前唯一功能性 bug）
-2. **P1** ANNOUNCE/RECORD 推流端（原 5.1.7）
-3. **A-1 ~ A-3、E-5** 鉴权 + 连接上限（部署前必须）
-4. **R-6 ~ R-8、C-1 ~ C-4** 丢包恢复与质量反馈
-5. **E-1 ~ E-4** 压测、pprof、指标
-6. 其余按兴趣补
+1. **P0 部署前**：A-1 ~ A-3（RTSP 鉴权）、T-3（RTMP 鉴权）、E-5（连接/会话上限）
+2. **P0 基础一致性**：A-4 ~ A-6（keepalive / OPTIONS / CSeq）、E-9（资源回收）
+3. **P1 弱网与反馈**：R-1 ~ R-3、R-7、R-8、C-1 ~ C-4、T-10（RTMP e2e）
+4. **P1 生产化**：E-1 ~ E-4、E-6、E-8
+5. **P2 协议增强**：H/D/G、R-4 ~ R-6、R-9 ~ R-12、C-5 ~ C-6、T-1/T-2/T-4/T-5/T-7/T-8
+6. **P2 工程债**：DOC-1 ~ DOC-7
+7. **P3 产品化**：F / P / S / O / T-6/T-9，按实际目标挑选
 
 ---
 
-## P0 — 修复 PAUSE 语义
+## P0（已完成）— 修复 PAUSE 语义
 
 原问题（P0-1/P0-2 已修）：`PAUSE` 只把状态改成 `Paused`，[Stage5/5-1-6.go](Stage5/5-1-6.go) 里推流 goroutine 只监听 `sess.Done()`，不会停；再次 `PLAY` 会再起一组，RTP 重复发送。
 
@@ -50,7 +58,7 @@
 
 ---
 
-## P1 — RTSP 推流端（原 5.1.7，ANNOUNCE / RECORD）
+## P1（已完成）— RTSP 推流端（原 5.1.7，ANNOUNCE / RECORD）
 
 目标：`ffmpeg -re -i input -f rtsp rtsp://127.0.0.1:8554/push` 推到本服务，其他客户端再拉流。
 
@@ -95,21 +103,24 @@
   - seq 跳变只记日志并丢弃半成品，不 panic；
   - 验收：服务端统计收到的包数/帧数与 ffmpeg 发送大致一致。
   - ✅ 已实现：每条推流轨懒创建 `pushReceiver`（`H264Depacketizer` 或按 SDP fmtp 配置的 `AACDepacketizer` + `ExternalSource`）。路由以 SETUP 的 channel/端口为提示、最终按 RTP **PT** 选轨（`pushTrackByPT`），记录 SSRC 变化；H.264 支持单 NALU/STAP-A/FU-A 重组，AAC 支持一包多 AU（时间戳按每 AU +1024 递增）；解包结果复制后 `Write(Frame)`，避免复用 UDP 接收缓冲区导致帧数据被覆盖。seq 缺口按 16 位回绕计算（正数丢包/负数重复乱序），限频打日志；FU-A 缺片由解包器 `Drop` 半成品，不 panic。每 100 包打印 packets/frames/bytes/gaps，会话关闭时打印 `push recv summary`。`-race` 下单测覆盖单 NALU、IDR、FU-A 重组、FU-A 缺片丢弃后恢复、AAC 单 AU、按 PT 改路由；全量测试通过。端到端实测 5s TCP 推流（with_audio.mp4）：ffmpeg 127 视频帧 → 服务端 frames=128（含参数集）、RTP packets=183（FU-A 分片）；音频约 217 AU → frames=215、RTP packets=69（一个 RTP 包多个 AU），gaps=0。3s UDP 推流：video frames=78 / audio frames=128，gaps=0。
-- [ ] **P1-8 转发给拉流客户端**
+- [x] **P1-8 转发给拉流客户端**
   - 拉流 DESCRIBE 使用 ANNOUNCE 带来的编码参数；
   - 拉流 SETUP/PLAY 复用现有逻辑，订阅 `ExternalSource`；
   - 验收：一路 ffmpeg 推、两路 ffplay 拉（TCP 和 UDP 各一路），画面同时正常。
-- [ ] **P1-9 推流断开清理**
+  - ✅ 已实现：新增 `Server.published map[streamPath]*publishedStream`（`internal/rtsp/publish.go`）。ANNOUNCE 按 URL 路径登记，`publishedStream` 保存 `announcedTrack` 和每类轨一个 `ExternalSource`；推流 SETUP 把 `mediaTrack.external` 指向它，RECORD 解包后写入。拉流 DESCRIBE 的 `buildSDP(uri)` 优先用该流的 rtpmap/fmtp（含 `sprop-parameter-sets`、AAC `config`）生成 SDP；SETUP 按 `trackID=<下标>` 或原 control 找到轨道，取 PT/编码/时钟并把 `external` 挂到拉流轨；PLAY 的 `streamH264/streamAAC` 改为接收帧源接口，已发布流轨订阅同一个 `ExternalSource`，文件/live 模式仍用全局源。推流会话关闭时 `Session.closeAll` 通过 cleanup 从注册表摘除并关闭源（reader 读完剩余帧后结束）。`ExternalSource` 增加采样率，供拉流端设置 RTCP SR 时钟。`-race` 下单测覆盖 ANNOUNCE 发布 + DESCRIBE SDP、拉流 SETUP 复用编码参数/共享源、`$` 帧转发；全量测试通过。端到端实测：ffmpeg（`-c copy`，H.264 96 + AAC 97）推 `rtsp://127.0.0.1:8554/push`，两路并发拉流分别 `-rtsp_transport tcp` 和 `udp`，5s 各解码 122/121 视频帧（约 25fps）且音视频均正常，推流端 `gaps=0`。
+- [x] **P1-9 推流断开清理**
   - TEARDOWN / TCP 断开时停止接收、关闭 ExternalSource、删除会话；
   - 验收：推流端 Ctrl-C 后，会话 60s 内回收，拉流端收到流结束而不是卡死。
+  - ✅ 已实现：推流 TEARDOWN 走 `handleTeardown` 删除会话；TCP 断开（Ctrl-C/kill）由 `handleConn` 的 defer 遍历 `conn.boundSessions()` 删除会话；两条路径都经 `Session.Close → closeAll` 停止接收（关闭 UDP RTP/RTCP socket，interleaved 报文因会话已删除而丢弃）、`closePushReceiver` 关闭 `ExternalSource`、cleanup 从注册表 `unpublish`。拉流端新增结束传播：`streamH264/streamAAC` 返回「源结束」标记（与 done 关闭/写失败区分），`handlePlay` 的包装 goroutine 调 `endPullSession`——先 `stopPlay`，再从会话管理器删除、`sess.Close()` 并关闭 RTSP TCP 连接，客户端读到 EOF 而不是等 60s 超时；`Session.endOnce` 防止音视频两路重复回收。`-race` 单测覆盖 TEARDOWN（会话/注册表删除、源关闭、读者读到结束）、推流 TCP 直接断开（无需 TEARDOWN 立即清理）、拉流源结束（连接关闭 + 会话回收）。端到端实测：ffmpeg 推流 + ffmpeg TCP 拉流，`taskkill /F` 模拟推流端消失后，服务端立即打印 `push recv summary` → `published stream "push" removed` → `session sess-1 closed with tcp conn` → `aac source ended` → `session sess-3 closed: pull source ended`，拉流进程随即退出（<1s），未卡到超时。
 
 ---
 
 ## A — RTSP 协议完整性
 
-- [ ] **A-1 Basic 鉴权（401 challenge）**
+- [x] **A-1 Basic 鉴权（401 challenge）**
   - 支持 `-user` / `-pass`；未带 `Authorization` 时返回 `401` + `WWW-Authenticate: Basic realm="flow"`；
   - 验收：`ffplay rtsp://user:pass@127.0.0.1:8554/live` 成功，错误密码 401。
+  - ✅ 已实现：`Server.SetAuth(user, pass)`（`internal/rtsp/server.go`），main 新增 `-user` / `-pass`；`internal/rtsp/auth.go` 解析 `Authorization: Basic base64(user:pass)`，头名/方案大小写不敏感，用户名密码用 `subtle.ConstantTimeCompare` 比较。`handleConn` 在方法分发前校验，失败返回 `401 Unauthorized` + `WWW-Authenticate: Basic realm="flow"` + `Content-Length: 0`，日志只打印 `auth failed: <method> <uri>`（不含凭据）。OPTIONS 按 A-3 约定放行；user/pass 都为空时保持原行为。`auth_test.go` 覆盖未配置/缺头/错误方案/非法 base64/缺冒号/错误用户名密码/大小写不敏感/空密码/密码含冒号，以及完整 handleConn 流程（OPTIONS 200 → 无凭据 DESCRIBE 401 → 错误密码 ANNOUNCE 401 且不建会话 → 正确凭据 ANNOUNCE 200）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：`flow-server -user alice -pass secret`，ffprobe 无凭据/错误密码均返回 401，`rtsp://alice:secret@127.0.0.1:8554/live` 解出 h264+aac，TEARDOWN 正常。
 - [ ] **A-2 Digest 鉴权（MD5，qop=auth）**
   - 生成 nonce，校验 `response = MD5(HA1:nonce:nc:cnonce:qop:HA2)`；
   - 支持 `stale=true` 让客户端重新认证；
@@ -122,8 +133,17 @@
   - 实现为 keepalive：`GET_PARAMETER` 无 body 时返回 `200` 并 `TouchRTSP()`；
   - 验收：长时间拉流不会被 60s 超时误杀。
 - [ ] **A-5 更新 OPTIONS 的 Public 头**
+  - 现状 `Public` 只列到 `TEARDOWN`，缺 `GET_PARAMETER`/`SET_PARAMETER`；
   - 按实际实现列出 `ANNOUNCE, RECORD, GET_PARAMETER, SET_PARAMETER` 等；
   - 验收：OPTIONS 响应与已实现方法一致。
+- [ ] **A-6 CSeq 顺序 / 重放校验（P1）**
+  - 现在只解析 CSeq，不校验单调递增；同一 CSeq 重放或跳号仍会被处理；
+  - 每连接记录上一条 CSeq，拒绝 ≤ 旧值或跳号过大的请求（可配置开关，避免误伤并发请求）；
+  - 验收：重放旧 CSeq 返回 `400`/忽略，正常 ffmpeg 推拉不受影响。
+- [ ] **A-7 live/文件模式 DESCRIBE 参数集一致性（P2）**
+  - 现状 live 模式 DESCRIBE 不返回 `sprop-parameter-sets`，依赖带内参数集；
+  - 源启动后缓存首个 SPS/PPS，DESCRIBE 时若已就绪则带上；未就绪保持现状；
+  - 验收：`ffprobe` 能直接读出 SDP 参数集，带内回退仍可用。
 
 ## H / D / G — 传输与播放控制
 
@@ -264,12 +284,175 @@
 
 ---
 
+## T — RTMP 完整性与生产化
+
+- [ ] **T-1 复杂握手（complex/digest handshake，P2）**
+  - 现状只做 simple echo（S1 版本字段清零），ffmpeg/ffplay 能退化兼容；只支持 complex handshake 的客户端会失败；
+  - 实现 C1/C2/S1/S2 的 HMAC-SHA256（FP9/FP10）校验，校验失败回退 simple；
+  - 验收：ffmpeg/ffplay 推拉流不变；complex-only 客户端能完成握手。
+- [ ] **T-2 RTMPS（P2）**
+  - 与 E-6 共用证书参数，用 `tls.Listen` 包住 RTMP 监听；
+  - 验收：`ffmpeg -f flv rtmps://127.0.0.1:1936/live/test` 推流、`ffplay rtmps://...` 拉流成功。
+- [ ] **T-3 RTMP 连接鉴权（P0）**
+  - 现状 `connect` / `publish` / `play` 不校验任何凭据，任意 app/流名都能推拉；
+  - 支持 token/密钥、app 白名单、推拉权限分离；凭据从文件/环境变量读取；
+  - 失败回 `NetConnection.Connect.Rejected` 或 `NetStream.Play.StreamNotFound`；日志不打印明文密钥；
+  - 验收：错误 token 被拒，正确 token 可推可拉。
+- [ ] **T-4 onMetaData（P2）**
+  - 现状 type 18 数据消息被忽略（`internal/rtmp/server.go` 注释）；
+  - 推流端保存 onMetaData，拉流端在 `Play.Start` 后下发（duration、videocodecid、audiocodecid、宽高、帧率、采样率、声道）；
+  - 验收：`ffprobe` 能读出时长/编码/分辨率，ffplay 无相关告警。
+- [ ] **T-5 NetStream Pause/Unpause/Seek（P2）**
+  - 现状只处理 `play`，没有 `pause` / `seek` 命令；
+  - 解析 `pause`/`seek`；暂停停发但保留订阅，恢复后 seq/时间戳连续；文件源按 G-2 索引 seek，live 源返回不支持；
+  - 验收：暂停 2s 恢复不重复/不跳变；文件 seek 后从 IDR 开始。
+- [ ] **T-6 视频 CTS / B 帧时间戳（P2）**
+  - 现状 FLV VideoTag 的 CompositionTime 固定 0，RTSP 侧也不重建 DTS，含 B 帧素材会出现 `non monotonically increasing dts` 告警；
+  - 推流侧解析 PTS-DTS 写入 CTS，拉流侧按 CTS 排序；无 B 帧时保持 0；
+  - 验收：`testdata/with_audio.mp4` 推拉后 ffmpeg 无 non-monotonic 告警，帧序正确。
+- [ ] **T-7 Chunk 层优化（P2，可选）**
+  - 评测 Set Chunk Size（当前 4096）对吞吐/延迟的影响；解包 Aggregate Message（type 22）；
+  - 验收：压测下吞吐提升且低延迟不退化，单测覆盖聚合消息边界。
+- [ ] **T-8 同名推流策略（P2）**
+  - 现状 `Registry.Publish` 同名整体替换并关闭旧源；
+  - 改为可配置 `replace`（默认）/ `reject`（回 Already Publishing）/ `reject-if-active`；
+  - 验收：三种策略行为符合预期，旧源 goroutine 正常回收。
+- [ ] **T-9 RTMP 客户端 / 回源（P3，可选）**
+  - 新增 client 模式：从上游 RTMP 拉流并作为一路源发布，支持断线重连；
+  - 验收：上游断开后自动重连，下游明确收到流结束或持续。
+- [ ] **T-10 RTMP e2e 自动化（P1）**
+  - 把 rtmp.md 的手工矩阵固化为脚本：本地回放、RTMP↔RTSP 双向、RTMP↔RTMP、断开回收；
+  - 断言收到帧数/音视频轨/退出码；
+  - 验收：一条命令跑通全矩阵。
+
+---
+
+## F — 编解码与媒体能力（当前只有 H.264 + AAC，P3）
+
+- [ ] **F-1 H.265 / HEVC**
+  - RTSP：SDP `H265/90000`、RTP 单 NALU/FU 解包打包、`sprop-vps/sps/pps`；
+  - RTMP：Enhanced RTMP / HEVC FourCC；拉流端对老客户端优雅降级；
+  - 验收：HEVC 推拉 RTSP/RTMP，另一协议能转出。
+- [ ] **F-2 音频扩展**
+  - RTSP：G.711（PCMA/PCMU）、Opus、MP3；RTMP：MP3/G.711（按需求）；
+  - 验收：各编码单独推拉成功，音画同步。
+- [ ] **F-3 转封装 / 录制**
+  - 把实时流写成 MP4/FLV/TS（按关键帧切分、断点续录、磁盘配额）；
+  - 验收：录制 1 分钟文件可被 ffprobe/ffplay 正常播放。
+- [ ] **F-4 转码**
+  - 解码 → 缩放/转码 → 编码（H.264/H.265、多分辨率）；纯 Go 性能有限，评估 cgo/外部进程方案；
+  - 验收：1080p 输入转 720p 输出，延迟与 CPU 有基线数据。
+- [ ] **F-5 多码率 / ABR**
+  - 同一路源生成多档码率，按客户端能力选择；输出 master playlist；
+  - 验收：播放器可切换档位且不断流。
+- [ ] **F-6 截图 / 缩略图**
+  - 从 IDR 解码一帧输出 JPEG/PNG，供预览；
+  - 验收：接口返回可显示图片，CPU 开销可接受。
+
+---
+
+## P — 协议与分发扩展（P3）
+
+- [ ] **P-1 HTTP-FLV**
+  - 复用 FLV 封装，HTTP 长连接推流；支持跨域/防盗链；
+  - 验收：`ffplay http://127.0.0.1:8080/live/test.flv` 正常。
+- [ ] **P-2 HLS（含 LL-HLS）**
+  - 切片、m3u8、音视频分离、低延迟部分段；
+  - 验收：浏览器/Safari/ffplay 播放，端到端延迟有数据。
+- [ ] **P-3 MPEG-DASH**
+  - fMP4 切片与 MPD，复用 P-2 的切片管线；
+  - 验收：dash.js 参考播放器可播。
+- [ ] **P-4 WebRTC（WHIP/WHEP）**
+  - ICE/DTLS/SRTP、H.264 打包；推流/拉流入口；
+  - 验收：浏览器 WHIP 推、WHEP 拉，延迟 < 500ms 基线。
+- [ ] **P-5 SRT**
+  - SRT 推拉、加密/重传；与注册表互通；
+  - 验收：`ffmpeg -f mpegts srt://...` 推拉成功。
+- [ ] **P-6 MPEG-TS 输入输出**
+  - UDP/文件 TS 解复用为 H.264/AAC 写入注册表；输出 TS 给 P-5/HLS；
+  - 验收：TS 推流后 RTSP/RTMP 可拉。
+
+---
+
+## S — 架构与集群（P3）
+
+- [ ] **S-1 回源 / 级联**
+  - 本机无该流时向上游 RTSP/RTMP/HTTP 拉流并缓存为源，失败回退；
+  - 验收：边缘节点按需回源，源站断开后按策略重连。
+- [ ] **S-2 边缘分发 / 负载均衡**
+  - 多节点注册中心（etcd/Redis/自研）记录流位置；客户端重定向或代理；
+  - 验收：两节点间推→拉成功，节点宕机后客户端可恢复。
+- [ ] **S-3 动态源注册与发现**
+  - 流注册/心跳/过期；与 D-1 Redirect 联动；
+  - 验收：源下线后注册表自动清理。
+- [ ] **S-4 多租户与资源隔离**
+  - app/路径命名空间、配额、按租户限速/限连接；
+  - 验收：租户 A 的流量不影响租户 B 的基线。
+- [ ] **S-5 分布式会话**
+  - 会话状态外置，多实例共享；拉流重定向时不重建会话；
+  - 验收：实例重启后会话按策略恢复或明确失败。
+
+---
+
+## O — 运维与产品（P2/P3）
+
+- [ ] **O-1 HTTP 管理 API（P2）**
+  - 流列表、会话列表、踢流/踢会话、配置查询；REST + JSON；
+  - 验收：curl 能查询并踢掉指定推流，拉流端收到 EOF。
+- [ ] **O-2 Web 控制台（P3，可选）**
+  - 简洁页面展示流/会话/指标，支持操作；
+  - 验收：浏览器完成查看与踢流。
+- [ ] **O-3 鉴权回调（P2）**
+  - 推/拉鉴权走 HTTP hook（token、IP、流名），支持超时与缓存；
+  - 验收：hook 返回拒绝时推拉被拒，超时按默认策略。
+- [ ] **O-4 健康检查与告警（P2）**
+  - `/healthz`、`/readyz`；流中断/端口占用/会话异常时告警；
+  - 验收：kill 推流端后健康状态与告警变化。
+- [ ] **O-5 配置热加载（P2）**
+  - YAML/环境变量/flag 合并；SIGHUP 或 watcher 热更新鉴权、限额、日志级别；
+  - 验收：不重启服务修改限额生效。
+- [ ] **O-6 DVR / 时移（P3）**
+  - 环形录制 + 按时间回看；与 F-3 录制、T-5/G-2 seek 联动；
+  - 验收：回看最近 5 分钟，拖动/暂停正常。
+- [ ] **O-7 日志聚合 / 追踪（P3，可选）**
+  - 结构化日志 + trace id（连接/会话/流），对接 Loki/OTel；
+  - 验收：一次推拉链路可按 trace 串起来。
+
+---
+
+## DOC — 文档与工程债
+
+- [ ] **DOC-1 CI（P1）**
+  - GitHub Actions：gofmt、go vet、`go test -race`、构建，缓存 Go 模块；
+  - 验收：PR 自动跑检查，失败阻断合并。
+- [ ] **DOC-2 创建 `日志-导出.md`（P1）**
+  - AGENTS.md 的 PR 日志流程与本文 DoD 都引用了它，但仓库里没有；
+  - 建立索引表 + `devlog/NNN-<slug>.md` 模板；
+  - 验收：完成一个任务后能按模板追加记录。
+- [ ] **DOC-3 清理 legacy 目录（P1）**
+  - `Stage 1` ~ `Stage5` 是早期单文件版本；归档到 `legacy/` 或删除并在 README 说明；
+  - 验收：`go build ./...` 不受影响，仓库结构清晰。
+- [ ] **DOC-4 覆盖率与 fuzz 基线（P2）**
+  - 关键包（rtsp/rtmp/rtp/flv/stream）覆盖率目标；为各解析器加 fuzz（与 R-3 合并）；
+  - 验收：覆盖率报告可查，fuzz 跑 10 分钟无崩溃。
+- [ ] **DOC-5 LICENSE（P2）**
+  - 选择许可证并在仓库根目录添加文件；
+  - 验收：仓库根目录有 LICENSE。
+- [ ] **DOC-6 版本与发布（P2）**
+  - `-version` 输出、git commit/构建时间注入（ldflags）、CHANGELOG；
+  - 验收：二进制能打印版本，发布流程有文档。
+- [ ] **DOC-7 一键检查（P2）**
+  - Makefile/Taskfile：`make check` = gofmt + vet + `go test -race`；`make e2e` 调 test/e2e；
+  - 验收：本地一条命令跑完提交前检查。
+
+---
+
 ## 完成定义（DoD）
 
 每个任务完成需同时满足：
 
 1. 代码 + 单元测试（涉及并发必须 `-race`）；
 2. 至少一条端到端验收命令或抓包证据；
-3. 不破坏既有 Stage 5 的 TCP/UDP 拉流；
+3. 不破坏既有 RTSP/RTMP 推拉、跨协议互通与 PAUSE 语义；
 4. `gofmt`、`go vet`、相关包 `go test` 通过；
-5. 在 `日志-导出.md` 记录真实现象、根因和取舍。
+5. 在 `日志-导出.md`（需先创建，见 DOC-2）记录真实现象、根因和取舍。

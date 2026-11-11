@@ -37,6 +37,16 @@ func (s *Server) handleConn(conn *Conn) {
 
 	// 整个连接共用一个 reader，RTSP 文本和 $ 二进制帧都从它读。
 	br := bufio.NewReader(conn)
+
+	// RTSP over HTTP 隧道：客户端（ffmpeg -rtsp_transport http）在 RTSP 端口上
+	// 直接发 HTTP 请求，GET / 是下行数据通道、POST / 是上行命令通道。
+	// RTSP 方法里没有以 "GET "（带空格）或 "POST" 开头的，4 字节前缀足够区分。
+	_ = conn.SetReadDeadline(time.Now().Add(s.sessions.Timeout() + session.DefaultScanInterval))
+	if method, ok := peekHTTPMethod(br); ok {
+		s.handleHTTPTunnel(conn, br, method)
+		return
+	}
+
 	// CSeq 状态是每条连接独立的，不同客户端互不影响。
 	cseq := newCSeqGuard(s.cseqCheck, s.cseqMaxGap)
 	for {
@@ -340,7 +350,16 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		return writeResponse(conn, "400 Bad Request", hd, nil)
 	}
 	isInter, interStr, clientPortStr, errPort := extractTransportInfo(transReq)
-	if errPort != nil {
+	switch {
+	case conn.tunnel:
+		// 隧道里只有 GET 通道这一条双向字节流，没有可用的 UDP 通道。
+		// 有些客户端仍会在 Transport 里写 client_port；按 Apple/LIVE555 的
+		// 做法忽略它，一律走 interleaved，没给 channel 就用 0-1。
+		if !isInter {
+			isInter = true
+			interStr = "0-1"
+		}
+	case errPort != nil:
 		return writeResponse(conn, "400 Bad Request", hd, nil)
 	}
 

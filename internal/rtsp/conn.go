@@ -19,6 +19,10 @@ type Conn struct {
 	net.Conn
 	mu sync.Mutex
 
+	// tunnel 表示这条「连接」来自 RTSP over HTTP 的命令通道。
+	// 隧道里只有一条双向字节流，没有独立的 UDP 通道，SETUP 必须走 interleaved。
+	tunnel bool
+
 	// 这条连接上建立/复用过的会话 ID。连接断开时（客户端 kill -9、网线拔掉）
 	// handleConn 退出，顺手把这些会话回收掉，不用干等 60s 超时。
 	sessMu     sync.Mutex

@@ -153,9 +153,11 @@
 
 ## H / D / G — 传输与播放控制
 
-- [ ] **H-1 HTTP tunneling（RTSP over HTTP）**
-  - 支持 `GET /` 打开通道、`POST /` 发送 RTSP，双向按 base64 行编码；
-  - 验收：`ffmpeg -rtsp_transport http` 能拉流。
+- [x] **H-1 HTTP tunneling（RTSP over HTTP）**
+  - 同一端口嗅探 `GET `/`POST`，按 `x-sessioncookie` 配对 GET 数据通道与 POST 命令通道；
+  - 上行（POST）流式 base64 解码后复用完整 RTSP 协议栈，下行（GET）明文（与 FFmpeg/LIVE555 一致，只有 POST 是 base64）；
+  - 隧道内 SETUP 强制 `RTP/AVP/TCP;interleaved`；
+  - 验收：`ffmpeg -rtsp_transport http -i rtsp://127.0.0.1:8554/live -t 3 -f null -` 拉流成功。
 - [ ] **D-1 Redirect（3xx）**
   - 开关 `-redirect rtsp://host:port/live`，响应 `302 Found` + `Location`；
   - 验收：ffprobe 跟随跳转成功。

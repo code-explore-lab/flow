@@ -50,6 +50,11 @@ type Server struct {
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
+
+	// HTTP 隧道（RTSP over HTTP）的 GET/POST 配对表，按 x-sessioncookie 索引。
+	// GET 先登记，POST 到达时按同一个 cookie 找回数据通道。
+	tunnelsMu sync.Mutex
+	tunnels   map[string]*httpTunnel
 }
 
 // New 构造一个服务器。live 为 true 时 video 应是从 reader 构造的实时源；
@@ -64,6 +69,7 @@ func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 		sessions:   session.NewManager(session.DefaultTimeout),
 		registry:   stream.NewRegistry(),
 		conns:      make(map[*Conn]struct{}),
+		tunnels:    make(map[string]*httpTunnel),
 		authScheme: AuthBasic,
 		authSecret: newAuthSecret(),
 		cseqCheck:  true,

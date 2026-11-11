@@ -2,6 +2,8 @@ package source
 
 import (
 	"bytes"
+	"encoding/base64"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -171,6 +173,38 @@ func TestH264SourceFromReaderLiveTimestamps(t *testing.T) {
 			t.Fatalf("timestamps not monotonic: %v", frames)
 		}
 	}
+}
+
+// TestH264SourceSPSPPSBase64 实时源：启动前参数集为空，读到 SPS/PPS 后能
+// 拿到 base64。用 io.Pipe 保持源不结束（不 close），run 停留在 NextNALU 等待
+// 下一帧，cur 不会被 finish 清掉。
+func TestH264SourceSPSPPSBase64(t *testing.T) {
+	pr, pw := io.Pipe()
+	src := NewH264SourceFromReader(pr)
+	_, cancel := src.Subscribe()
+	defer cancel()
+
+	if got := src.SPSPPSBase64(); got != "" {
+		t.Fatalf("before data: SPSPPSBase64 = %q, want empty", got)
+	}
+
+	sps := []byte{0x67, 0x42, 0xC0, 0x1E}
+	pps := []byte{0x68, 0xCE, 0x3C, 0x80}
+	idr := []byte{0x65, 0x88, 0x84, 0x00}
+	// 必须写三个 NALU：流式 demux 读到下一个起始码才会吐出上一个 NALU，
+	// 只写 SPS/PPS 时 PPS 会一直卡在 demux 内部缓冲区里出不来。
+	go func() { _, _ = pw.Write(annexB(sps, pps, idr)) }()
+
+	want := base64.StdEncoding.EncodeToString(sps) + "," + base64.StdEncoding.EncodeToString(pps)
+	deadline := time.Now().Add(time.Second)
+	for src.SPSPPSBase64() != want {
+		if time.Now().After(deadline) {
+			pw.Close()
+			t.Fatalf("SPSPPSBase64 = %q, want %q", src.SPSPPSBase64(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	pw.Close()
 }
 
 func TestH264SourceRestartsAfterEOF(t *testing.T) {

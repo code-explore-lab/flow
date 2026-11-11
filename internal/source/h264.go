@@ -90,6 +90,20 @@ func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
 	return rd, rd.Close
 }
 
+// SPSPPSBase64 返回已缓存参数集的 "base64(SPS),base64(PPS)"，供 SDP 的
+// sprop-parameter-sets 用。源还没启动、或还没读到参数集时返回空串。
+//
+// 实时模式下源要等第一次 Subscribe（PLAY）才启动，所以单个客户端先 DESCRIBE
+// 时通常还是空的；等有客户端在播、参数集已缓存后，后来者的 DESCRIBE 才能拿到。
+func (s *H264Source) SPSPPSBase64() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur == nil || s.cur.sps == nil || s.cur.pps == nil {
+		return ""
+	}
+	return media.SPSPPSBase64(s.cur.sps.Data, s.cur.pps.Data)
+}
+
 // naluReader 统一文件解封装和实时流解封装的接口。
 type naluReader interface {
 	NextNALU() ([]byte, error)

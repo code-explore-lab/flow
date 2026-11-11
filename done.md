@@ -145,10 +145,11 @@
   - 每连接记录上一条 CSeq，拒绝 ≤ 旧值或跳号过大的请求（可配置开关，避免误伤并发请求）；
   - 验收：重放旧 CSeq 返回 `400`/忽略，正常 ffmpeg 推拉不受影响。
   - ✅ 已实现：新增 `internal/rtsp/cseq.go` 的 `cseqGuard`，每条 TCP 连接一份，记录 `last/seen`。规则：首条请求只要求带 CSeq 且非负（不要求从 1 开始）；之后必须严格大于上一条；`maxGap>0` 时额外拒绝跳号超过该值的请求；缺少 CSeq、负数、重放、回退都返回 `400 Bad Request` 并回显冲突的 CSeq，只丢弃这一条、不关连接，且被拒绝的请求不推进 `last`，避免一条异常请求卡死后续正常请求。校验放在 `handleConn` 中 `readRequest` 之后、鉴权与分发之前，因此 401 challenge 请求也会正常推进计数；不同连接各自计数，新连接从 1 开始不受影响。`Request` 的 CSeq 解析改为头名大小写不敏感（`headerValue`）。配置新增 `Server.SetCSeqCheck(enabled, maxGap)`（默认开启、maxGap=0 不限制跳号）和 main 参数 `-cseq-check` / `-cseq-max-gap`。测试新增 `internal/rtsp/cseq_test.go`：guard 单元表（首条任意值、严格递增、重放/回退、缺 CSeq、负数、跳号边界、关闭开关、拒绝不推进）以及完整 `handleConn` 流程（重放/回退/缺 CSeq 返回 400、小写 cseq 可识别、重放的 TEARDOWN 不进入分发且会话保留、每连接重置、关闭开关、maxGap 生效）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：真实 TCP 上 CSeq 1/2 正常，重放 2 与回退 1 返回 400，随后 CSeq 3 仍正常；ffprobe 拉流解出 h264+aac，ffmpeg RTSP 推流后另一路 ffprobe 拉流解出 h264，服务端仅记录 2 次预期内的 cseq rejected。注意：CSeq 校验用于协议健壮性，不是防重放安全机制（Digest response 不覆盖 CSeq，且未校验 nc 单调递增）。
-- [ ] **A-7 live/文件模式 DESCRIBE 参数集一致性（P2）**
+- [x] **A-7 live/文件模式 DESCRIBE 参数集一致性（P2）**
   - 现状 live 模式 DESCRIBE 不返回 `sprop-parameter-sets`，依赖带内参数集；
   - 源启动后缓存首个 SPS/PPS，DESCRIBE 时若已就绪则带上；未就绪保持现状；
   - 验收：`ffprobe` 能直接读出 SDP 参数集，带内回退仍可用。
+  - ✅ 已实现：`internal/media/spa_pps.go` 抽出 `SPSPPSBase64(sps, pps []byte) string` 公共格式化函数，`GetSPSPPSBase64`（文件模式读文件）复用它。`internal/source/h264.go` 的 `H264Source` 新增 `SPSPPSBase64()`，从 run 已缓存的 SPS/PPS 直接编码，未启动或未读到参数集时返回空串（源结束 `finish` 后 cur 置空同样返回空）。`internal/rtsp/handler.go` 的 `buildSDP` live 分支改为：先尝试 `s.video.SPSPPSBase64()`，非空则拼上 `; sprop-parameter-sets=...`，否则维持现状省略（单个客户端 DESCRIBE 先于 PLAY、参数集还没缓存时仍是带内初始化）。测试新增 `internal/source/source_test.go` 的 `TestH264SourceSPSPPSBase64`（io.Pipe 实时源，启动前为空、写到 SPS/PPS/IDR 后能取到 base64；用三个 NALU 是因为流式 demux 要读到下一个起始码才吐出上一个 NALU）与 `internal/rtsp/describe_test.go` 的 `TestBuildSDPLiveParamSets`（源未就绪时 SDP 无 sprop、参数集缓存后 SDP 含 sprop）。`go test ./...`、`go test -race ./internal/source/ ./internal/rtsp/ ./internal/media/` 通过。
 
 ## H / D / G — 传输与播放控制
 

@@ -233,9 +233,16 @@ func (s *Server) buildSDP(uri string) (string, error) {
 		"m=video 0 RTP/AVP 96\r\n" +
 		"a=rtpmap:96 H264/90000\r\n"
 	if s.live {
-		// 实时模式下源还没启动（第一次 Subscribe 在 PLAY），DESCRIBE 时拿不到
-		// SPS/PPS，只能省略 sprop-parameter-sets，让客户端从带内参数集初始化。
-		sdp += "a=fmtp:96 packetization-mode=1\r\n"
+		// 实时模式下源要等 PLAY 才启动，单个客户端的 DESCRIBE 先于 PLAY，
+		// 此时参数集还没缓存，只能省略 sprop-parameter-sets，让客户端从带内
+		// 参数集初始化；若已有客户端在播、参数集已缓存，则补上供后来者用。
+		sdp += "a=fmtp:96 packetization-mode=1"
+		if s.video != nil {
+			if spspps := s.video.SPSPPSBase64(); spspps != "" {
+				sdp += "; sprop-parameter-sets=" + spspps
+			}
+		}
+		sdp += "\r\n"
 	} else {
 		spspps, err := media.GetSPSPPSBase64(s.videoPath)
 		if err != nil {

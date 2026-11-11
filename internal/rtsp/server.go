@@ -47,6 +47,10 @@ type Server struct {
 	cseqCheck  bool
 	cseqMaxGap int
 
+	// redirectURI 非空时服务器进入重定向模式：OPTIONS/DESCRIBE 回
+	// 302 Found + Location，不建会话、不推流。只在 Serve 前配置。
+	redirectURI string
+
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
@@ -141,6 +145,13 @@ func (s *Server) SetCSeqCheck(enabled bool, maxGap int) {
 	}
 	s.cseqCheck = enabled
 	s.cseqMaxGap = maxGap
+}
+
+// SetRedirect 让服务器只做重定向：对 OPTIONS/DESCRIBE 回 302 Found 和
+// Location: uri，由客户端自己连到真正的流媒体服务器。空串表示正常服务。
+// 必须在 Serve 之前调用；重定向响应在鉴权之前发出。
+func (s *Server) SetRedirect(uri string) {
+	s.redirectURI = uri
 }
 
 // authEnabled 报告是否配置了鉴权用户。

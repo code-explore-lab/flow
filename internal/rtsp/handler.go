@@ -93,6 +93,21 @@ func (s *Server) handleConn(conn *Conn) {
 			continue
 		}
 
+		// 重定向模式：不提供媒体，只把 OPTIONS/DESCRIBE 指到配置的地址。
+		// FFmpeg 的拉流端在 OPTIONS 或 DESCRIBE 收到 3xx 后会读 Location
+		// 并整条重连（rtsp_read_header 的 fail 分支），不需要迁移会话。
+		// 放在鉴权之前：重定向器本身没有内容需要保护。
+		if s.redirectURI != "" && (req.Method == "OPTIONS" || req.Method == "DESCRIBE") {
+			fmt.Printf("redirect: %s %s -> %s\n", req.Method, req.URI, s.redirectURI)
+			hd["Location"] = s.redirectURI
+			hd["Content-Length"] = "0"
+			if err := writeResponse(conn, "302 Found", hd, nil); err != nil {
+				fmt.Println("write resp err:", err)
+				return
+			}
+			continue
+		}
+
 		// OPTIONS 用于探测服务端能力，放行不鉴权；其余方法在启用鉴权时
 		// 必须带有效凭据。Digest nonce 过期时 challenge 带 stale=true，
 		// 客户端会自动换 nonce 重试。401 不泄露请求细节。

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -33,6 +34,7 @@ import (
 //	       -f h264 pipe:1 | ./flow -live
 func main() {
 	live := flag.Bool("live", false, "read Annex-B H.264 from stdin (e.g. ffmpeg camera pipe); audio disabled")
+	redirect := flag.String("redirect", "", "answer OPTIONS/DESCRIBE with 302 + this Location instead of serving streams")
 	user := flag.String("user", "", "RTSP auth username (also FLOW_RTSP_USER; empty with -pass disables auth)")
 	pass := flag.String("pass", "", "RTSP auth password (also FLOW_RTSP_PASS)")
 	authFile := flag.String("auth-file", "", "credential file, username:password per line (also FLOW_RTSP_AUTH_FILE)")
@@ -46,6 +48,10 @@ func main() {
 	}
 	if *cseqMaxGap < 0 {
 		fmt.Fprintln(os.Stderr, "invalid -cseq-max-gap (must be >= 0)")
+		os.Exit(2)
+	}
+	if *redirect != "" && !strings.HasPrefix(*redirect, "rtsp://") && !strings.HasPrefix(*redirect, "rtsps://") {
+		fmt.Fprintf(os.Stderr, "invalid -redirect %q (want rtsp://host:port/path)\n", *redirect)
 		os.Exit(2)
 	}
 
@@ -99,6 +105,7 @@ func main() {
 	rtspSrv.SetRegistry(reg)
 	rtspSrv.SetUsers(users)
 	rtspSrv.SetCSeqCheck(*cseqCheck, *cseqMaxGap)
+	rtspSrv.SetRedirect(*redirect)
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
 	}

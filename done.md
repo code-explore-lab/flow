@@ -158,9 +158,9 @@
   - 上行（POST）流式 base64 解码后复用完整 RTSP 协议栈，下行（GET）明文（与 FFmpeg/LIVE555 一致，只有 POST 是 base64）；
   - 隧道内 SETUP 强制 `RTP/AVP/TCP;interleaved`；
   - 验收：`ffmpeg -rtsp_transport http -i rtsp://127.0.0.1:8554/live -t 3 -f null -` 拉流成功。
-- [ ] **D-1 Redirect（3xx）**
-  - 开关 `-redirect rtsp://host:port/live`，响应 `302 Found` + `Location`；
-  - 验收：ffprobe 跟随跳转成功。
+- [x] **D-1 Redirect（3xx）**
+  - 开关 `-redirect rtsp://host:port/live`，对 OPTIONS/DESCRIBE 回 `302 Found` + `Location`（鉴权之前，不建会话）；
+  - 验收：`ffprobe rtsp://127.0.0.1:8554/live` 打印 `Status 302: Redirecting to ...` 并成功列出目标服务器的流，`-rtsp_transport http` 隧道模式同样生效。
 - [ ] **D-2 Multicast 发送**
   - SDP 增加 `a=destination` / `a=ttl`，SETUP 支持 `Transport: RTP/AVP;multicast;...`；
   - 服务端向组播地址发送，不维护每客户端 UDP 连接；

@@ -33,8 +33,9 @@ import (
 //	       -f h264 pipe:1 | ./flow -live
 func main() {
 	live := flag.Bool("live", false, "read Annex-B H.264 from stdin (e.g. ffmpeg camera pipe); audio disabled")
-	user := flag.String("user", "", "RTSP auth username (empty with -pass disables auth)")
-	pass := flag.String("pass", "", "RTSP auth password")
+	user := flag.String("user", "", "RTSP auth username (also FLOW_RTSP_USER; empty with -pass disables auth)")
+	pass := flag.String("pass", "", "RTSP auth password (also FLOW_RTSP_PASS)")
+	authFile := flag.String("auth-file", "", "credential file, username:password per line (also FLOW_RTSP_AUTH_FILE)")
 	authMode := flag.String("auth-mode", "basic", "RTSP auth scheme: basic or digest")
 	flag.Parse()
 	if *authMode != "basic" && *authMode != "digest" {
@@ -42,6 +43,39 @@ func main() {
 		os.Exit(2)
 	}
 
+	// 凭据优先级：文件 < 环境变量 < 命令行参数。
+	// 文件里可以放多个账号；环境变量/命令行用来覆盖或追加单个账号。
+	authUser := *user
+	if authUser == "" {
+		authUser = os.Getenv("FLOW_RTSP_USER")
+	}
+	authPass := *pass
+	if authPass == "" {
+		authPass = os.Getenv("FLOW_RTSP_PASS")
+	}
+	authFilePath := *authFile
+	if authFilePath == "" {
+		authFilePath = os.Getenv("FLOW_RTSP_AUTH_FILE")
+	}
+	if authUser == "" && authPass != "" {
+		fmt.Fprintln(os.Stderr, "auth: username is empty but password is set (use -user or FLOW_RTSP_USER)")
+		os.Exit(2)
+	}
+
+	users := map[string]string{}
+	if authFilePath != "" {
+		loaded, err := rtsp.LoadAuthFile(authFilePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load auth file: %v\n", err)
+			os.Exit(1)
+		}
+		users = loaded
+		fmt.Printf("auth: loaded %d credential(s) from %s\n", len(users), authFilePath)
+	}
+	if authUser != "" {
+		users[authUser] = authPass
+	}
+	// 媒体源构造
 	video := source.NewH264Source("testdata/test.h264")
 	audio := source.NewAACSource("testdata/test.aac")
 	if *live {
@@ -57,7 +91,7 @@ func main() {
 	reg := stream.NewRegistry()
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
-	rtspSrv.SetAuth(*user, *pass)
+	rtspSrv.SetUsers(users)
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
 	}

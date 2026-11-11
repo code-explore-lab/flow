@@ -54,23 +54,26 @@ func newAuthSecret() [32]byte {
 	return secret
 }
 
+// dummyPassword 用于用户不存在时的等长摘要计算，避免靠响应时间枚举用户名。
+const dummyPassword = "\x00invalid-password"
+
 // checkRequestAuth 校验请求的 Authorization 头。
 //
 // 未配置鉴权时恒为 true；配置后按 scheme 走 Basic 或 Digest。
 // OPTIONS 由 handleConn 单独放行，不经过这里。
 func (s *Server) checkRequestAuth(req *Request) authResult {
-	s.authMu.RLock()
-	user, pass, scheme := s.authUser, s.authPass, s.authScheme
-	s.authMu.RUnlock()
-	if user == "" && pass == "" {
+	if !s.authEnabled() {
 		return authResult{ok: true}
 	}
+	s.authMu.RLock()
+	scheme := s.authScheme
+	s.authMu.RUnlock()
 
 	header := headerValue(req, "Authorization")
 	if scheme == AuthDigest {
-		return s.checkDigestAuth(req, header, user, pass)
+		return s.checkDigestAuth(req, header)
 	}
-	return authResult{ok: checkBasicAuth(header, user, pass)}
+	return authResult{ok: s.checkBasicAuth(header)}
 }
 
 // authChallenge 生成 401 响应的 WWW-Authenticate 值。
@@ -91,7 +94,7 @@ func (s *Server) authChallenge(stale bool) string {
 }
 
 // checkBasicAuth 校验 Authorization: Basic base64(user:pass)。
-func checkBasicAuth(header, user, pass string) bool {
+func (s *Server) checkBasicAuth(header string) bool {
 	const scheme = "Basic "
 	if len(header) <= len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
 		return false
@@ -105,8 +108,12 @@ func checkBasicAuth(header, user, pass string) bool {
 	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(gotUser), []byte(user)) == 1 &&
-		subtle.ConstantTimeCompare([]byte(gotPass), []byte(pass)) == 1
+	password, found := s.passwordFor(gotUser)
+	if !found {
+		subtle.ConstantTimeCompare([]byte(gotPass), []byte(dummyPassword))
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(gotPass), []byte(password)) == 1
 }
 
 // checkDigestAuth 校验 RFC 2617 Digest（algorithm=MD5，qop=auth）。
@@ -116,7 +123,7 @@ func checkBasicAuth(header, user, pass string) bool {
 //	response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
 //
 // 客户端没带 qop 时兼容旧式 MD5(HA1:nonce:HA2)。
-func (s *Server) checkDigestAuth(req *Request, header, user, pass string) authResult {
+func (s *Server) checkDigestAuth(req *Request, header string) authResult {
 	const scheme = "Digest "
 	if len(header) <= len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
 		return authResult{}
@@ -143,9 +150,6 @@ func (s *Server) checkDigestAuth(req *Request, header, user, pass string) authRe
 	if algorithm != "" && !strings.EqualFold(algorithm, "MD5") {
 		return authResult{}
 	}
-	if subtle.ConstantTimeCompare([]byte(username), []byte(user)) != 1 {
-		return authResult{}
-	}
 
 	nonceValid, nonceStale := s.digestNonceStatus(nonce)
 	if !nonceValid {
@@ -155,7 +159,12 @@ func (s *Server) checkDigestAuth(req *Request, header, user, pass string) authRe
 		return authResult{stale: true}
 	}
 
-	ha1 := md5Hex(username + ":" + realm + ":" + pass)
+	password, found := s.passwordFor(username)
+	if !found {
+		password = dummyPassword
+	}
+
+	ha1 := md5Hex(username + ":" + realm + ":" + password)
 	ha2 := md5Hex(req.Method + ":" + uri)
 	var want string
 	if qop == "" {
@@ -166,7 +175,7 @@ func (s *Server) checkDigestAuth(req *Request, header, user, pass string) authRe
 		}
 		want = md5Hex(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2)
 	}
-	if subtle.ConstantTimeCompare([]byte(want), []byte(response)) != 1 {
+	if !found || subtle.ConstantTimeCompare([]byte(want), []byte(response)) != 1 {
 		return authResult{}
 	}
 	return authResult{ok: true}

@@ -126,17 +126,20 @@
   - 支持 `stale=true` 让客户端重新认证；
   - 验收：ffmpeg 带 Digest 凭据可拉流；错误 nonce 返回 401。
   - ✅ 已实现：新增 `-auth-mode basic|digest`（默认 basic），`Server.SetAuthScheme(rtsp.AuthDigest)` 切换 challenge 方案。`internal/rtsp/auth.go` 实现 RFC 2617 MD5：`HA1=MD5(user:realm:pass)`、`HA2=MD5(method:uri)`、`response=MD5(HA1:nonce:nc:cnonce:qop:HA2)`，兼容无 qop 的 RFC 2069 旧式摘要；校验 realm、digest-uri 与请求 URI 一致、algorithm=MD5、qop=auth、8 位十六进制 nc，摘要用 `subtle.ConstantTimeCompare` 比较。nonce 采用「8 字节时间戳 + 16 字节随机数 + 16 字节 HMAC-SHA256 截断」的无状态格式，服务端只持有进程内随机密钥，不维护 nonce 表；有效期 10 分钟，签名有效但过期时返回 `401` + `WWW-Authenticate: Digest ..., stale=true`，伪造/未来时间戳的 nonce 直接 401。`auth_test.go` 覆盖合法摘要、错误密码/方法/URI/qop/algorithm/realm、伪造/过期/未来 nonce、无 qop 兼容、参数解析（引号内逗号与转义），以及完整 handleConn 流程（OPTIONS 200 → 无凭据 401 Digest challenge → 伪造 nonce 401 不建会话 → 过期 nonce 401+stale=true → 正确摘要 ANNOUNCE 200）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：`flow-server -user alice -pass secret -auth-mode digest`，ffprobe 无凭据/错误密码均 401，`rtsp://alice:secret@127.0.0.1:8554/live` 解出 h264+aac；日志确认 DESCRIBE 返回 Digest challenge，后续 SETUP/PLAY 携带摘要通过。
-- [ ] **A-3 鉴权接入所有方法**
+- [x] **A-3 鉴权接入所有方法**
   - OPTIONS 放行，其余方法要求认证；
   - 凭据从文件/环境变量读取，不硬编码；
   - 验收：未认证 DESCRIBE/SETUP/PLAY 全部 401。
-- [ ] **A-4 GET_PARAMETER / SET_PARAMETER**
+  - ✅ 已实现：鉴权校验位于 `handleConn` 的 `switch req.Method` 之前，只对 OPTIONS 放行，因此 DESCRIBE/SETUP/PLAY/PAUSE/RECORD/TEARDOWN/ANNOUNCE/GET_PARAMETER/SET_PARAMETER 全部在分发前要求凭据。`Server` 的凭据存储从单账号改为 `map[username]password`，新增 `SetUsers`（`SetAuth` 保留为单账号兼容包装）与 `passwordFor`；Basic/Digest 都按用户名取各自密码，未知用户走 dummy 密码 + 常量时间比较，避免用户名枚举。新增 `internal/rtsp/auth_file.go`：`ParseAuthFile` 解析 `username:password`（忽略空行/`#` 注释，按第一个冒号切分以支持密码含冒号，拒绝空用户名/缺冒号/重复用户名/空文件），`LoadAuthFile` 读取并给错误带上路径。main 新增 `-auth-file`，并支持 `FLOW_RTSP_AUTH_FILE` / `FLOW_RTSP_USER` / `FLOW_RTSP_PASS`；优先级为文件 < 环境变量 < 命令行参数，文件多账号、环境变量/命令行为单个覆盖账号，用户名空但密码非空时启动报错。测试新增 `auth_file_test.go`（正常/注释/多账号/密码含冒号/各类错误/临时文件加载）与 `auth_methods_test.go`（多用户 Basic、多用户 Digest、九个非 OPTIONS 方法未认证全部 401 且不建会话；OPTIONS 仍 200）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：`-auth-file` 载入 alice/bob（bob 密码 `p@ss:word`），无凭据与错误密码 401，alice 与 URL 编码后的 bob 均解出 h264+aac；`FLOW_RTSP_USER`/`FLOW_RTSP_PASS` + `-auth-mode digest` 同样 401 → 认证成功，日志只打印方案与失败方法，不泄露凭据。
+- [x] **A-4 GET_PARAMETER / SET_PARAMETER**
   - 实现为 keepalive：`GET_PARAMETER` 无 body 时返回 `200` 并 `TouchRTSP()`；
   - 验收：长时间拉流不会被 60s 超时误杀。
-- [ ] **A-5 更新 OPTIONS 的 Public 头**
+  - ✅ 已实现：`handleConn` 的 `switch req.Method` 新增 `GET_PARAMETER` / `SET_PARAMETER` 分支，统一走 `handleKeepalive`（`internal/rtsp/handler.go`）。本服务没有可读写参数，因此不解析 body：带 `Session` 头时查会话、`TouchRTSP()` 并在响应里回显 `Session`，会话不存在返回 `454 Session Not Found`；没有 `Session` 头按服务级查询直接 `200`；带 body 也回 `200` 忽略，兼容把 SET_PARAMETER 当保活的客户端。鉴权和 CSeq 沿用统一入口，不需要额外处理。测试新增 `internal/rtsp/keepalive_test.go`：直接调用 handler 覆盖有效会话 200 + `LastActivity` 前进、未知会话 454、无 Session 头 200；另把 Manager 超时/扫描周期压缩为 200ms/20ms，走真实 `Sweep` 路径每 50ms 发一次 GET_PARAMETER 持续 600ms，验证会话不会被回收，停止保活后仍会被兜底回收。`go test ./...`、`go test -race ./internal/rtsp/ ./internal/session/` 通过。e2e 用裸 RTSP 客户端实测：SETUP 建会话后 GET_PARAMETER / 带 body 的 SET_PARAMETER 均 200，未知会话 454，无 Session 头 200；OPTIONS 的 `Public` 头尚未同步列出这两个方法（A-5）。
+- [x] **A-5 更新 OPTIONS 的 Public 头**
   - 现状 `Public` 只列到 `TEARDOWN`，缺 `GET_PARAMETER`/`SET_PARAMETER`；
   - 按实际实现列出 `ANNOUNCE, RECORD, GET_PARAMETER, SET_PARAMETER` 等；
   - 验收：OPTIONS 响应与已实现方法一致。
+  - ✅ 已实现：`internal/rtsp/handler.go` 新增包级常量 `publicMethods`，内容为 `OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN, GET_PARAMETER, SET_PARAMETER`，OPTIONS 分支直接引用，注释说明必须与 `handleConn` 的 switch 分支同步维护。新增 `internal/rtsp/options_test.go`，走完整 `handleConn` 发 OPTIONS，解析 `Public` 头后同时做正向（十个方法一个不少）和反向（不能出现未实现方法）校验，防止以后新增分支漏更新或声明了未实现的方法。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测 OPTIONS 响应头为 `Public: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN, GET_PARAMETER, SET_PARAMETER`。
 - [ ] **A-6 CSeq 顺序 / 重放校验（P1）**
   - 现在只解析 CSeq，不校验单调递增；同一 CSeq 重放或跳号仍会被处理；
   - 每连接记录上一条 CSeq，拒绝 ≤ 旧值或跳号过大的请求（可配置开关，避免误伤并发请求）；

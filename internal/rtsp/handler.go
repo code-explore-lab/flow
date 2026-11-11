@@ -14,6 +14,10 @@ import (
 	"flow/internal/stream"
 )
 
+// publicMethods 是 OPTIONS 响应 Public 头列出的方法，必须与 handleConn
+// 里实际分发的 switch 分支保持一致。新增/删除方法时两边一起改。
+const publicMethods = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN, GET_PARAMETER, SET_PARAMETER"
+
 // handleConn 处理一条 RTSP TCP 连接直到关闭。
 func (s *Server) handleConn(conn *Conn) {
 	s.registerConn(conn)
@@ -85,7 +89,7 @@ func (s *Server) handleConn(conn *Conn) {
 		var respErr error
 		switch req.Method {
 		case "OPTIONS":
-			hd["Public"] = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN"
+			hd["Public"] = publicMethods
 			respErr = writeResponse(conn, "200 OK", hd, nil)
 		case "DESCRIBE":
 			hd["Content-Type"] = "application/sdp"
@@ -113,6 +117,8 @@ func (s *Server) handleConn(conn *Conn) {
 			respErr = s.handleRecord(conn, req, hd)
 		case "TEARDOWN":
 			respErr = s.handleTeardown(conn, req, hd)
+		case "GET_PARAMETER", "SET_PARAMETER":
+			respErr = s.handleKeepalive(conn, req, hd)
 		default:
 			respErr = writeResponse(conn, "501 Not Implemented", hd, nil)
 		}
@@ -664,6 +670,28 @@ func (s *Server) handleRecord(conn *Conn, req *Request, hd map[string]string) er
 	sess.SetState(session.StateRecording)
 	hd["Session"] = s.sessionHeaderValue(sess)
 	fmt.Printf("RECORD session %s: %d track(s) ready to receive\n", sess.ID, rtspSess.trackCount())
+	return writeResponse(conn, "200 OK", hd, nil)
+}
+
+// handleKeepalive 处理 GET_PARAMETER / SET_PARAMETER。
+//
+// 本服务没有可读写的参数，RFC 2326 推荐用这两个方法做会话保活：D
+// 客户端定时发一条无 body 的请求，服务端回 200 即表示会话还活着。
+// 因此这里不解析参数，只刷新会话活跃时间，让不发 RTCP 的客户端
+// 不会被 60s 超时误回收。带 body 也按兼容性回 200 忽略。
+//
+//	200 OK                无 Session 头（服务级查询）或会话有效
+//	454 Session Not Found 带了 Session 头但会话不存在
+func (s *Server) handleKeepalive(conn *Conn, req *Request, hd map[string]string) error {
+	if sessHeader, ok := req.Headers["Session"]; ok {
+		sessID := strings.Split(sessHeader, ";")[0]
+		sess, found := s.sessions.Get(sessID)
+		if !found {
+			return writeResponse(conn, "454 Session Not Found", hd, nil)
+		}
+		sess.TouchRTSP()
+		hd["Session"] = s.sessionHeaderValue(sess)
+	}
 	return writeResponse(conn, "200 OK", hd, nil)
 }
 

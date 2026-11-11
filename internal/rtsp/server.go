@@ -33,11 +33,10 @@ type Server struct {
 	// main 可以用 SetRegistry 注入共享实例。
 	registry *stream.Registry
 
-	// Basic / Digest 鉴权配置。user 与 pass 都为空表示不鉴权（默认）。
+	// Basic / Digest 鉴权配置。空用户表表示不鉴权（默认）。
 	// 只在 Serve 前配置，读取时加读锁以兼容测试并发。
 	authMu     sync.RWMutex
-	authUser   string
-	authPass   string
+	authUsers  map[string]string // username -> password
 	authScheme AuthScheme
 	// authSecret 用于给 Digest nonce 签名；进程内随机生成，不持久化。
 	authSecret [32]byte
@@ -72,13 +71,40 @@ func (s *Server) SetRegistry(reg *stream.Registry) {
 	}
 }
 
-// SetAuth 启用 RTSP 鉴权。user 与 pass 都为空表示关闭鉴权（默认）。
-// 认证方案由 SetAuthScheme 选择，默认 Basic。
+// SetAuth 启用单用户 RTSP 鉴权。user 与 pass 都为空表示关闭鉴权（默认）。
+// 多用户请用 SetUsers。认证方案由 SetAuthScheme 选择，默认 Basic。
 // 必须在 Serve 之前调用；运行期修改不会让已建立的连接重新认证。
 func (s *Server) SetAuth(user, pass string) {
+	if user == "" && pass == "" {
+		s.SetUsers(nil)
+		return
+	}
+	s.SetUsers(map[string]string{user: pass})
+}
+
+// SetUsers 整体替换鉴权用户表；nil 或空表表示关闭鉴权。
+// 用户名为空的条目会被忽略。
+func (s *Server) SetUsers(users map[string]string) {
+	cp := make(map[string]string, len(users))
+	for user, pass := range users {
+		if user != "" {
+			cp[user] = pass
+		}
+	}
+	if len(cp) == 0 {
+		cp = nil
+	}
 	s.authMu.Lock()
-	s.authUser, s.authPass = user, pass
+	s.authUsers = cp
 	s.authMu.Unlock()
+}
+
+// passwordFor 返回用户名对应的密码；用户不存在时 ok=false。
+func (s *Server) passwordFor(user string) (string, bool) {
+	s.authMu.RLock()
+	pass, ok := s.authUsers[user]
+	s.authMu.RUnlock()
+	return pass, ok
 }
 
 // SetAuthScheme 选择 401 challenge 的方案（AuthBasic / AuthDigest）。
@@ -92,11 +118,11 @@ func (s *Server) SetAuthScheme(scheme AuthScheme) {
 	s.authMu.Unlock()
 }
 
-// authEnabled 报告是否配置了 Basic 鉴权。
+// authEnabled 报告是否配置了鉴权用户。
 func (s *Server) authEnabled() bool {
 	s.authMu.RLock()
 	defer s.authMu.RUnlock()
-	return s.authUser != "" || s.authPass != ""
+	return len(s.authUsers) > 0
 }
 
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
@@ -120,7 +146,10 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		fmt.Println("input: testdata/test.h264 + testdata/test.aac")
 	}
 	if s.authEnabled() {
-		fmt.Println("auth: basic (realm=flow)")
+		s.authMu.RLock()
+		scheme := s.authScheme
+		s.authMu.RUnlock()
+		fmt.Printf("auth: %s (realm=flow)\n", scheme)
 	}
 
 	// 收到退出信号后关掉 listener，让下面阻塞的 Accept 立即返回。

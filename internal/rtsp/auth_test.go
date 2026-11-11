@@ -2,7 +2,9 @@ package rtsp
 
 import (
 	"bufio"
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
@@ -57,8 +59,8 @@ func TestCheckRequestAuth(t *testing.T) {
 				headers[name] = tt.header
 			}
 			req := &Request{Method: "DESCRIBE", Headers: headers}
-			if got := s.checkRequestAuth(req); got != tt.want {
-				t.Fatalf("checkRequestAuth() = %v, want %v", got, tt.want)
+			if got := s.checkRequestAuth(req).ok; got != tt.want {
+				t.Fatalf("checkRequestAuth().ok = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -120,6 +122,209 @@ func TestHandleConnBasicAuth(t *testing.T) {
 	if n := s.sessions.Len(); n != 1 {
 		t.Fatalf("sessions after authenticated ANNOUNCE = %d, want 1", n)
 	}
+}
+
+const digestTestURI = "rtsp://127.0.0.1:8554/live"
+
+func testMD5(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// digestHeader 按 RFC 2617（qop=auth）构造客户端会发来的 Digest 头。
+func digestHeader(user, pass, nonce, method, uri, nc, cnonce string) string {
+	ha1 := testMD5(user + ":" + basicRealm + ":" + pass)
+	ha2 := testMD5(method + ":" + uri)
+	response := testMD5(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":auth:" + ha2)
+	return fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", qop=auth, nc=%s, cnonce="%s", algorithm=MD5`,
+		user, basicRealm, nonce, uri, response, nc, cnonce)
+}
+
+// digestHeaderNoQop 构造 RFC 2069 旧式摘要（不带 qop/nc/cnonce）。
+func digestHeaderNoQop(user, pass, nonce, method, uri string) string {
+	ha1 := testMD5(user + ":" + basicRealm + ":" + pass)
+	ha2 := testMD5(method + ":" + uri)
+	response := testMD5(ha1 + ":" + nonce + ":" + ha2)
+	return fmt.Sprintf(`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
+		user, basicRealm, nonce, uri, response)
+}
+
+func TestParseAuthParams(t *testing.T) {
+	got := parseAuthParams(`username="ali,ce", realm="flow", nonce=abc, cnonce="x\"y", qop=auth`)
+	if got["username"] != "ali,ce" || got["realm"] != "flow" || got["nonce"] != "abc" ||
+		got["cnonce"] != `x"y` || got["qop"] != "auth" {
+		t.Fatalf("parseAuthParams() = %#v", got)
+	}
+}
+
+func TestDigestAuth(t *testing.T) {
+	s := New(nil, nil, false)
+	s.SetAuth("alice", "secret")
+	s.SetAuthScheme(AuthDigest)
+
+	challenge := s.authChallenge(false)
+	if !strings.HasPrefix(challenge, "Digest ") {
+		t.Fatalf("challenge = %q, want Digest", challenge)
+	}
+	for _, want := range []string{`realm="flow"`, `qop="auth"`, "algorithm=MD5"} {
+		if !strings.Contains(challenge, want) {
+			t.Fatalf("challenge = %q, missing %q", challenge, want)
+		}
+	}
+	if strings.Contains(challenge, "stale=true") {
+		t.Fatalf("fresh challenge must not be stale: %q", challenge)
+	}
+	nonce := parseAuthParams(strings.TrimPrefix(challenge, "Digest "))["nonce"]
+	if nonce == "" {
+		t.Fatalf("challenge missing nonce: %q", challenge)
+	}
+
+	check := func(method, uri, header string) authResult {
+		return s.checkRequestAuth(&Request{
+			Method:  method,
+			URI:     uri,
+			Headers: map[string]string{"Authorization": header},
+		})
+	}
+
+	valid := digestHeader("alice", "secret", nonce, "DESCRIBE", digestTestURI, "00000001", "cnonce1")
+	if res := check("DESCRIBE", digestTestURI, valid); !res.ok || res.stale {
+		t.Fatalf("valid digest rejected: %+v", res)
+	}
+
+	invalid := []struct {
+		name   string
+		method string
+		uri    string
+		header string
+	}{
+		{"错误密码", "DESCRIBE", digestTestURI, digestHeader("alice", "wrong", nonce, "DESCRIBE", digestTestURI, "00000001", "cnonce1")},
+		{"方法不匹配", "SETUP", digestTestURI, valid},
+		{"URI 不匹配", "DESCRIBE", "rtsp://127.0.0.1:8554/other", valid},
+		{"伪造 nonce", "DESCRIBE", digestTestURI, digestHeader("alice", "secret", "forged", "DESCRIBE", digestTestURI, "00000001", "cnonce1")},
+		{"错误 qop", "DESCRIBE", digestTestURI, strings.Replace(valid, "qop=auth", "qop=auth-int", 1)},
+		{"不支持的算法", "DESCRIBE", digestTestURI, strings.Replace(valid, "algorithm=MD5", "algorithm=MD5-sess", 1)},
+		{"realm 不匹配", "DESCRIBE", digestTestURI, strings.Replace(valid, `realm="flow"`, `realm="other"`, 1)},
+		{"缺少 response", "DESCRIBE", digestTestURI, `Digest username="alice", realm="flow", nonce="` + nonce + `", uri="` + digestTestURI + `"`},
+		{"Basic 头", "DESCRIBE", digestTestURI, basicAuthHeader("alice", "secret")},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			if res := check(tt.method, tt.uri, tt.header); res.ok {
+				t.Fatalf("invalid digest accepted: %+v", res)
+			}
+		})
+	}
+
+	// RFC 2069 兼容路径：不带 qop 时按 MD5(HA1:nonce:HA2) 校验。
+	if res := check("DESCRIBE", digestTestURI, digestHeaderNoQop("alice", "secret", nonce, "DESCRIBE", digestTestURI)); !res.ok {
+		t.Fatalf("legacy digest rejected: %+v", res)
+	}
+
+	// 签名有效但超过有效期 → stale=true，客户端换 nonce 重试即可。
+	expired := s.newNonceAt(time.Now().Add(-digestNonceLifetime - time.Minute))
+	res := check("DESCRIBE", digestTestURI, digestHeader("alice", "secret", expired, "DESCRIBE", digestTestURI, "00000001", "c1"))
+	if res.ok || !res.stale {
+		t.Fatalf("expired nonce result = %+v, want stale", res)
+	}
+
+	// 时间戳来自未来（超出 1 分钟容差）按伪造处理。
+	future := s.newNonceAt(time.Now().Add(2 * time.Minute))
+	if res := check("DESCRIBE", digestTestURI, digestHeader("alice", "secret", future, "DESCRIBE", digestTestURI, "00000001", "c1")); res.ok || res.stale {
+		t.Fatalf("future nonce result = %+v, want invalid", res)
+	}
+}
+
+// TestHandleConnDigestAuth 走完整 handleConn 流程：Digest challenge、
+// 伪造 nonce、过期 stale 重试和成功 ANNOUNCE。
+func TestHandleConnDigestAuth(t *testing.T) {
+	s := New(nil, nil, false)
+	s.SetAuth("alice", "secret")
+	s.SetAuthScheme(AuthDigest)
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		s.handleConn(&Conn{Conn: serverConn})
+		close(done)
+	}()
+	defer func() {
+		clientConn.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("handleConn did not exit after client close")
+		}
+	}()
+
+	br := bufio.NewReader(clientConn)
+	bw := bufio.NewWriter(clientConn)
+
+	resp := sendRTSP(t, br, bw, "OPTIONS rtsp://127.0.0.1:8554/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+	if !strings.HasPrefix(resp, "RTSP/1.0 200 OK\r\n") {
+		t.Fatalf("OPTIONS response = %q", firstLine(resp))
+	}
+
+	// 未认证 → Digest challenge。
+	resp = sendRTSP(t, br, bw, announceRequest(2, ""))
+	if !strings.HasPrefix(resp, "RTSP/1.0 401 Unauthorized\r\n") {
+		t.Fatalf("unauthenticated ANNOUNCE response = %q", firstLine(resp))
+	}
+	nonce := challengeNonce(t, resp)
+
+	// 伪造 nonce → 401，且不建会话。
+	bad := digestHeader("alice", "secret", "forged", "ANNOUNCE", digestTestURI, "00000001", "c1")
+	resp = sendRTSP(t, br, bw, announceRequest(3, bad))
+	if !strings.HasPrefix(resp, "RTSP/1.0 401 Unauthorized\r\n") {
+		t.Fatalf("forged-nonce ANNOUNCE response = %q", firstLine(resp))
+	}
+	if n := s.sessions.Len(); n != 0 {
+		t.Fatalf("sessions after forged nonce = %d, want 0", n)
+	}
+
+	// nonce 过期 → 401 + stale=true，客户端应自动换 nonce。
+	expired := s.newNonceAt(time.Now().Add(-digestNonceLifetime - time.Minute))
+	expiredHeader := digestHeader("alice", "secret", expired, "ANNOUNCE", digestTestURI, "00000001", "c1")
+	resp = sendRTSP(t, br, bw, announceRequest(4, expiredHeader))
+	if !strings.Contains(resp, "stale=true") {
+		t.Fatalf("expired nonce response missing stale=true: %q", resp)
+	}
+	if n := s.sessions.Len(); n != 0 {
+		t.Fatalf("sessions after stale nonce = %d, want 0", n)
+	}
+
+	// 正确凭据 → 200，创建会话。
+	good := digestHeader("alice", "secret", nonce, "ANNOUNCE", digestTestURI, "00000001", "c1")
+	resp = sendRTSP(t, br, bw, announceRequest(5, good))
+	if !strings.HasPrefix(resp, "RTSP/1.0 200 OK\r\n") {
+		t.Fatalf("authenticated ANNOUNCE response = %q (header %q)", firstLine(resp), good)
+	}
+	if n := s.sessions.Len(); n != 1 {
+		t.Fatalf("sessions after authenticated ANNOUNCE = %d, want 1", n)
+	}
+}
+
+// challengeNonce 从 401 响应里取出 Digest nonce。
+func challengeNonce(t *testing.T, resp string) string {
+	t.Helper()
+	value := responseHeader(resp, "WWW-Authenticate")
+	if !strings.HasPrefix(value, "Digest ") {
+		t.Fatalf("WWW-Authenticate = %q, want Digest", value)
+	}
+	nonce := parseAuthParams(strings.TrimPrefix(value, "Digest "))["nonce"]
+	if nonce == "" {
+		t.Fatalf("challenge missing nonce: %q", value)
+	}
+	return nonce
+}
+
+func responseHeader(resp, name string) string {
+	for _, line := range strings.Split(resp, "\r\n") {
+		if len(line) > len(name) && strings.EqualFold(line[:len(name)], name) && line[len(name)] == ':' {
+			return strings.TrimSpace(line[len(name)+1:])
+		}
+	}
+	return ""
 }
 
 func announceRequest(cseq int, auth string) string {

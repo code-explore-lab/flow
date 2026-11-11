@@ -33,11 +33,14 @@ type Server struct {
 	// main 可以用 SetRegistry 注入共享实例。
 	registry *stream.Registry
 
-	// Basic 鉴权配置。user 与 pass 都为空表示不鉴权（默认）。
+	// Basic / Digest 鉴权配置。user 与 pass 都为空表示不鉴权（默认）。
 	// 只在 Serve 前配置，读取时加读锁以兼容测试并发。
-	authMu   sync.RWMutex
-	authUser string
-	authPass string
+	authMu     sync.RWMutex
+	authUser   string
+	authPass   string
+	authScheme AuthScheme
+	// authSecret 用于给 Digest nonce 签名；进程内随机生成，不持久化。
+	authSecret [32]byte
 
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
@@ -48,14 +51,16 @@ type Server struct {
 // audio 传 nil 表示只有视频轨（实时模式就是这么用）。
 func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 	return &Server{
-		video:     video,
-		audio:     audio,
-		live:      live,
-		videoPath: "testdata/test.h264",
-		audioPath: "testdata/test.aac",
-		sessions:  session.NewManager(session.DefaultTimeout),
-		registry:  stream.NewRegistry(),
-		conns:     make(map[*Conn]struct{}),
+		video:      video,
+		audio:      audio,
+		live:       live,
+		videoPath:  "testdata/test.h264",
+		audioPath:  "testdata/test.aac",
+		sessions:   session.NewManager(session.DefaultTimeout),
+		registry:   stream.NewRegistry(),
+		conns:      make(map[*Conn]struct{}),
+		authScheme: AuthBasic,
+		authSecret: newAuthSecret(),
 	}
 }
 
@@ -67,11 +72,23 @@ func (s *Server) SetRegistry(reg *stream.Registry) {
 	}
 }
 
-// SetAuth 启用 RTSP Basic 鉴权。user 与 pass 都为空表示关闭鉴权（默认）。
+// SetAuth 启用 RTSP 鉴权。user 与 pass 都为空表示关闭鉴权（默认）。
+// 认证方案由 SetAuthScheme 选择，默认 Basic。
 // 必须在 Serve 之前调用；运行期修改不会让已建立的连接重新认证。
 func (s *Server) SetAuth(user, pass string) {
 	s.authMu.Lock()
 	s.authUser, s.authPass = user, pass
+	s.authMu.Unlock()
+}
+
+// SetAuthScheme 选择 401 challenge 的方案（AuthBasic / AuthDigest）。
+// 其他值按 AuthBasic 处理。必须在 Serve 之前调用。
+func (s *Server) SetAuthScheme(scheme AuthScheme) {
+	if scheme != AuthDigest {
+		scheme = AuthBasic
+	}
+	s.authMu.Lock()
+	s.authScheme = scheme
 	s.authMu.Unlock()
 }
 

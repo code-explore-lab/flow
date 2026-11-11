@@ -121,10 +121,11 @@
   - 支持 `-user` / `-pass`；未带 `Authorization` 时返回 `401` + `WWW-Authenticate: Basic realm="flow"`；
   - 验收：`ffplay rtsp://user:pass@127.0.0.1:8554/live` 成功，错误密码 401。
   - ✅ 已实现：`Server.SetAuth(user, pass)`（`internal/rtsp/server.go`），main 新增 `-user` / `-pass`；`internal/rtsp/auth.go` 解析 `Authorization: Basic base64(user:pass)`，头名/方案大小写不敏感，用户名密码用 `subtle.ConstantTimeCompare` 比较。`handleConn` 在方法分发前校验，失败返回 `401 Unauthorized` + `WWW-Authenticate: Basic realm="flow"` + `Content-Length: 0`，日志只打印 `auth failed: <method> <uri>`（不含凭据）。OPTIONS 按 A-3 约定放行；user/pass 都为空时保持原行为。`auth_test.go` 覆盖未配置/缺头/错误方案/非法 base64/缺冒号/错误用户名密码/大小写不敏感/空密码/密码含冒号，以及完整 handleConn 流程（OPTIONS 200 → 无凭据 DESCRIBE 401 → 错误密码 ANNOUNCE 401 且不建会话 → 正确凭据 ANNOUNCE 200）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：`flow-server -user alice -pass secret`，ffprobe 无凭据/错误密码均返回 401，`rtsp://alice:secret@127.0.0.1:8554/live` 解出 h264+aac，TEARDOWN 正常。
-- [ ] **A-2 Digest 鉴权（MD5，qop=auth）**
+- [x] **A-2 Digest 鉴权（MD5，qop=auth）**
   - 生成 nonce，校验 `response = MD5(HA1:nonce:nc:cnonce:qop:HA2)`；
   - 支持 `stale=true` 让客户端重新认证；
   - 验收：ffmpeg 带 Digest 凭据可拉流；错误 nonce 返回 401。
+  - ✅ 已实现：新增 `-auth-mode basic|digest`（默认 basic），`Server.SetAuthScheme(rtsp.AuthDigest)` 切换 challenge 方案。`internal/rtsp/auth.go` 实现 RFC 2617 MD5：`HA1=MD5(user:realm:pass)`、`HA2=MD5(method:uri)`、`response=MD5(HA1:nonce:nc:cnonce:qop:HA2)`，兼容无 qop 的 RFC 2069 旧式摘要；校验 realm、digest-uri 与请求 URI 一致、algorithm=MD5、qop=auth、8 位十六进制 nc，摘要用 `subtle.ConstantTimeCompare` 比较。nonce 采用「8 字节时间戳 + 16 字节随机数 + 16 字节 HMAC-SHA256 截断」的无状态格式，服务端只持有进程内随机密钥，不维护 nonce 表；有效期 10 分钟，签名有效但过期时返回 `401` + `WWW-Authenticate: Digest ..., stale=true`，伪造/未来时间戳的 nonce 直接 401。`auth_test.go` 覆盖合法摘要、错误密码/方法/URI/qop/algorithm/realm、伪造/过期/未来 nonce、无 qop 兼容、参数解析（引号内逗号与转义），以及完整 handleConn 流程（OPTIONS 200 → 无凭据 401 Digest challenge → 伪造 nonce 401 不建会话 → 过期 nonce 401+stale=true → 正确摘要 ANNOUNCE 200）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：`flow-server -user alice -pass secret -auth-mode digest`，ffprobe 无凭据/错误密码均 401，`rtsp://alice:secret@127.0.0.1:8554/live` 解出 h264+aac；日志确认 DESCRIBE 返回 Digest challenge，后续 SETUP/PLAY 携带摘要通过。
 - [ ] **A-3 鉴权接入所有方法**
   - OPTIONS 放行，其余方法要求认证；
   - 凭据从文件/环境变量读取，不硬编码；

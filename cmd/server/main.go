@@ -37,9 +37,15 @@ func main() {
 	pass := flag.String("pass", "", "RTSP auth password (also FLOW_RTSP_PASS)")
 	authFile := flag.String("auth-file", "", "credential file, username:password per line (also FLOW_RTSP_AUTH_FILE)")
 	authMode := flag.String("auth-mode", "basic", "RTSP auth scheme: basic or digest")
+	cseqCheck := flag.Bool("cseq-check", true, "reject replayed or out-of-order CSeq on RTSP connections")
+	cseqMaxGap := flag.Int("cseq-max-gap", 0, "reject CSeq jumps larger than this (0 = unlimited)")
 	flag.Parse()
 	if *authMode != "basic" && *authMode != "digest" {
 		fmt.Fprintf(os.Stderr, "invalid -auth-mode %q (want basic or digest)\n", *authMode)
+		os.Exit(2)
+	}
+	if *cseqMaxGap < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -cseq-max-gap (must be >= 0)")
 		os.Exit(2)
 	}
 
@@ -92,6 +98,7 @@ func main() {
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
 	rtspSrv.SetUsers(users)
+	rtspSrv.SetCSeqCheck(*cseqCheck, *cseqMaxGap)
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
 	}

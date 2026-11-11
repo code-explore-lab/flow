@@ -41,6 +41,12 @@ type Server struct {
 	// authSecret 用于给 Digest nonce 签名；进程内随机生成，不持久化。
 	authSecret [32]byte
 
+	// cseqCheck 控制每条连接上的 CSeq 是否必须严格递增。
+	// cseqMaxGap > 0 时额外拒绝跳号超过该值的请求；0 表示不限制。
+	// 只在 Serve 前配置。
+	cseqCheck  bool
+	cseqMaxGap int
+
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
@@ -60,6 +66,7 @@ func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 		conns:      make(map[*Conn]struct{}),
 		authScheme: AuthBasic,
 		authSecret: newAuthSecret(),
+		cseqCheck:  true,
 	}
 }
 
@@ -116,6 +123,18 @@ func (s *Server) SetAuthScheme(scheme AuthScheme) {
 	s.authMu.Lock()
 	s.authScheme = scheme
 	s.authMu.Unlock()
+}
+
+// SetCSeqCheck 配置每条连接上的 CSeq 校验。
+// enabled=false 完全关闭；maxGap>0 时额外拒绝比上一条大超过 maxGap 的
+// 请求，0 表示只要求严格递增、不限制跳号。负数按 0 处理。
+// 必须在 Serve 之前调用。
+func (s *Server) SetCSeqCheck(enabled bool, maxGap int) {
+	if maxGap < 0 {
+		maxGap = 0
+	}
+	s.cseqCheck = enabled
+	s.cseqMaxGap = maxGap
 }
 
 // authEnabled 报告是否配置了鉴权用户。

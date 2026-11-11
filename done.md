@@ -140,10 +140,11 @@
   - 按实际实现列出 `ANNOUNCE, RECORD, GET_PARAMETER, SET_PARAMETER` 等；
   - 验收：OPTIONS 响应与已实现方法一致。
   - ✅ 已实现：`internal/rtsp/handler.go` 新增包级常量 `publicMethods`，内容为 `OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN, GET_PARAMETER, SET_PARAMETER`，OPTIONS 分支直接引用，注释说明必须与 `handleConn` 的 switch 分支同步维护。新增 `internal/rtsp/options_test.go`，走完整 `handleConn` 发 OPTIONS，解析 `Public` 头后同时做正向（十个方法一个不少）和反向（不能出现未实现方法）校验，防止以后新增分支漏更新或声明了未实现的方法。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测 OPTIONS 响应头为 `Public: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, TEARDOWN, GET_PARAMETER, SET_PARAMETER`。
-- [ ] **A-6 CSeq 顺序 / 重放校验（P1）**
+- [x] **A-6 CSeq 顺序 / 重放校验（P1）**
   - 现在只解析 CSeq，不校验单调递增；同一 CSeq 重放或跳号仍会被处理；
   - 每连接记录上一条 CSeq，拒绝 ≤ 旧值或跳号过大的请求（可配置开关，避免误伤并发请求）；
   - 验收：重放旧 CSeq 返回 `400`/忽略，正常 ffmpeg 推拉不受影响。
+  - ✅ 已实现：新增 `internal/rtsp/cseq.go` 的 `cseqGuard`，每条 TCP 连接一份，记录 `last/seen`。规则：首条请求只要求带 CSeq 且非负（不要求从 1 开始）；之后必须严格大于上一条；`maxGap>0` 时额外拒绝跳号超过该值的请求；缺少 CSeq、负数、重放、回退都返回 `400 Bad Request` 并回显冲突的 CSeq，只丢弃这一条、不关连接，且被拒绝的请求不推进 `last`，避免一条异常请求卡死后续正常请求。校验放在 `handleConn` 中 `readRequest` 之后、鉴权与分发之前，因此 401 challenge 请求也会正常推进计数；不同连接各自计数，新连接从 1 开始不受影响。`Request` 的 CSeq 解析改为头名大小写不敏感（`headerValue`）。配置新增 `Server.SetCSeqCheck(enabled, maxGap)`（默认开启、maxGap=0 不限制跳号）和 main 参数 `-cseq-check` / `-cseq-max-gap`。测试新增 `internal/rtsp/cseq_test.go`：guard 单元表（首条任意值、严格递增、重放/回退、缺 CSeq、负数、跳号边界、关闭开关、拒绝不推进）以及完整 `handleConn` 流程（重放/回退/缺 CSeq 返回 400、小写 cseq 可识别、重放的 TEARDOWN 不进入分发且会话保留、每连接重置、关闭开关、maxGap 生效）。`go test ./...`、`go test -race ./internal/rtsp/` 通过。e2e 实测：真实 TCP 上 CSeq 1/2 正常，重放 2 与回退 1 返回 400，随后 CSeq 3 仍正常；ffprobe 拉流解出 h264+aac，ffmpeg RTSP 推流后另一路 ffprobe 拉流解出 h264，服务端仅记录 2 次预期内的 cseq rejected。注意：CSeq 校验用于协议健壮性，不是防重放安全机制（Digest response 不覆盖 CSeq，且未校验 nc 单调递增）。
 - [ ] **A-7 live/文件模式 DESCRIBE 参数集一致性（P2）**
   - 现状 live 模式 DESCRIBE 不返回 `sprop-parameter-sets`，依赖带内参数集；
   - 源启动后缓存首个 SPS/PPS，DESCRIBE 时若已就绪则带上；未就绪保持现状；

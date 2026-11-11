@@ -37,6 +37,8 @@ func (s *Server) handleConn(conn *Conn) {
 
 	// 整个连接共用一个 reader，RTSP 文本和 $ 二进制帧都从它读。
 	br := bufio.NewReader(conn)
+	// CSeq 状态是每条连接独立的，不同客户端互不影响。
+	cseq := newCSeqGuard(s.cseqCheck, s.cseqMaxGap)
 	for {
 		// 控制连接静默超过「会话超时 + 一次扫描周期」才算连接异常：
 		// 会话回收由 session.Manager 负责，这里只是兜底，防止对端半开时 goroutine 永久挂住。
@@ -65,6 +67,21 @@ func (s *Server) handleConn(conn *Conn) {
 		}
 		fmt.Printf("recv: %s %s, CSeq=%d\n", req.Method, req.URI, req.CSeq)
 		hd := map[string]string{"CSeq": strconv.Itoa(req.CSeq)}
+
+		// 同一条连接上的 CSeq 必须严格递增（RFC 2326）。重放、乱序、
+		// 缺 CSeq 的请求只回 400 并丢弃这一条，不关连接、不进分发，
+		// 避免重复 TEARDOWN/PLAY 之类的状态错乱。校验放在鉴权之前，
+		// 这样 401 challenge 请求也会正常推进计数。
+		if !cseq.allow(req.CSeq, headerValue(req, "CSeq") != "") {
+			fmt.Printf("cseq rejected: %s %s CSeq=%d last=%d\n",
+				req.Method, req.URI, req.CSeq, cseq.last)
+			hd["Content-Length"] = "0"
+			if err := writeResponse(conn, "400 Bad Request", hd, nil); err != nil {
+				fmt.Println("write resp err:", err)
+				return
+			}
+			continue
+		}
 
 		// OPTIONS 用于探测服务端能力，放行不鉴权；其余方法在启用鉴权时
 		// 必须带有效凭据。Digest nonce 过期时 challenge 带 stale=true，

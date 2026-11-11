@@ -49,7 +49,8 @@ func parseHeaderBlock(block string) (*Request, error) {
 		}
 		req.Headers[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 	}
-	if cseq, ok := req.Headers["CSeq"]; ok {
+	// 头名大小写不敏感：客户端写法并不统一。
+	if cseq := headerValue(req, "CSeq"); cseq != "" {
 		c, err := strconv.Atoi(cseq)
 		if err != nil {
 			return nil, fmt.Errorf("invalid CSeq value: %s", cseq)

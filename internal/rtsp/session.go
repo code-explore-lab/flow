@@ -29,6 +29,9 @@ type mediaTrack struct {
 	rtcpConn        *net.UDPConn // 服务端 RTCP socket（用来收发）
 	clientAddr      *net.UDPAddr // 客户端 RTP 目标地址 ip:port
 	clientRTCPAddr  *net.UDPAddr // 客户端 RTCP 目标地址 ip:port（= client_port+1）
+	isMulticast     bool         // 组播：RTP/RTCP 发到固定组地址，不按客户端开 socket
+	mcAddr          *net.UDPAddr // 组播 RTP 目标地址
+	mcRTCPAddr      *net.UDPAddr // 组播 RTCP 目标地址（= RTP 端口 +1）
 	serverRtpPort   int          // 偶数
 	serverRtcpPort  int          // 奇数 = RTP+1
 
@@ -131,21 +134,32 @@ func (t *mediaTrack) recordSent(rtpTS uint32, payloadLen int) {
 }
 
 // writeRTP 按这条轨的传输方式发送一个已经序列化好的 RTP 包：
-// UDP 模式直接 WriteToUDP，TCP 模式套上 $ 帧再写。
+// TCP 模式套上 $ 帧，UDP unicast 发给客户端地址，组播发到固定组地址。
 func (t *mediaTrack) writeRTP(pkt []byte) error {
 	if t.isInterleaved {
 		return t.writeInterleavedChannel(t.interleavedRTP, pkt)
+	}
+	if t.isMulticast {
+		_, err := t.rtpConn.WriteToUDP(pkt, t.mcAddr)
+		return err
 	}
 	_, err := t.rtpConn.WriteToUDP(pkt, t.clientAddr)
 	return err
 }
 
 // writeRTCP 按这条轨的传输方式发送 RTCP 包：
-// UDP 模式发给客户端的 RTCP 端口（client_port+1），
-// TCP 模式走协商出来的 RTCP channel（ffmpeg 下视频=1、音频=3）。
+// TCP 模式走协商出来的 RTCP channel（ffmpeg 下视频=1、音频=3），
+// UDP unicast 发给客户端 RTCP 端口（client_port+1），组播发到组 RTCP 端口。
 func (t *mediaTrack) writeRTCP(pkt []byte) error {
 	if t.isInterleaved {
 		return t.writeInterleavedChannel(t.interleavedRTCP, pkt)
+	}
+	if t.isMulticast {
+		if t.rtpConn == nil || t.mcRTCPAddr == nil {
+			return fmt.Errorf("rtcp transport is not configured")
+		}
+		_, err := t.rtpConn.WriteToUDP(pkt, t.mcRTCPAddr)
+		return err
 	}
 	if t.rtcpConn == nil || t.clientRTCPAddr == nil {
 		return fmt.Errorf("rtcp transport is not configured")

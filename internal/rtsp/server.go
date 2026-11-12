@@ -51,6 +51,11 @@ type Server struct {
 	// 302 Found + Location，不建会话、不推流。只在 Serve 前配置。
 	redirectURI string
 
+	// multicastAddr / multicastTTL 组播发送配置。addr 为空表示关闭组播，
+	// 默认启用 239.255.0.1 / TTL 1。只在 Serve 前配置。
+	multicastAddr string
+	multicastTTL  int
+
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
@@ -65,18 +70,20 @@ type Server struct {
 // audio 传 nil 表示只有视频轨（实时模式就是这么用）。
 func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 	return &Server{
-		video:      video,
-		audio:      audio,
-		live:       live,
-		videoPath:  "testdata/test.h264",
-		audioPath:  "testdata/test.aac",
-		sessions:   session.NewManager(session.DefaultTimeout),
-		registry:   stream.NewRegistry(),
-		conns:      make(map[*Conn]struct{}),
-		tunnels:    make(map[string]*httpTunnel),
-		authScheme: AuthBasic,
-		authSecret: newAuthSecret(),
-		cseqCheck:  true,
+		video:         video,
+		audio:         audio,
+		live:          live,
+		videoPath:     "testdata/test.h264",
+		audioPath:     "testdata/test.aac",
+		sessions:      session.NewManager(session.DefaultTimeout),
+		registry:      stream.NewRegistry(),
+		conns:         make(map[*Conn]struct{}),
+		tunnels:       make(map[string]*httpTunnel),
+		authScheme:    AuthBasic,
+		authSecret:    newAuthSecret(),
+		cseqCheck:     true,
+		multicastAddr: defaultMulticastAddr,
+		multicastTTL:  defaultMulticastTTL,
 	}
 }
 
@@ -152,6 +159,19 @@ func (s *Server) SetCSeqCheck(enabled bool, maxGap int) {
 // 必须在 Serve 之前调用；重定向响应在鉴权之前发出。
 func (s *Server) SetRedirect(uri string) {
 	s.redirectURI = uri
+}
+
+// SetMulticast 配置组播发送的地址与 TTL。addr 为空关闭组播；ttl 越界时
+// 夹到 1~255。必须在 Serve 之前调用。
+func (s *Server) SetMulticast(addr string, ttl int) {
+	if ttl <= 0 {
+		ttl = defaultMulticastTTL
+	}
+	if ttl > 255 {
+		ttl = 255
+	}
+	s.multicastAddr = addr
+	s.multicastTTL = ttl
 }
 
 // authEnabled 报告是否配置了鉴权用户。

@@ -190,6 +190,9 @@ func describeTransport(t *mediaTrack) string {
 	if t.isInterleaved {
 		return fmt.Sprintf("tcp ch=%d", t.interleavedRTCP)
 	}
+	if t.isMulticast {
+		return fmt.Sprintf("multicast %s", t.mcRTCPAddr)
+	}
 	return fmt.Sprintf("udp %s", t.clientRTCPAddr)
 }
 

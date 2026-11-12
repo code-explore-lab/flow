@@ -142,6 +142,18 @@ func extractTransportInfo(transportStr string) (isInterleaved bool, interStr, cl
 	return isInterleaved, interStr, clientPort, nil
 }
 
+// hasMulticastTransport 判断 Transport 头是否请求组播。
+// ffmpeg/ffplay 的 udp_multicast 只写 Transport: RTP/AVP;multicast，不带
+// destination/port，具体参数由 SETUP 响应回填。
+func hasMulticastTransport(transportStr string) bool {
+	for _, p := range strings.Split(transportStr, ";") {
+		if strings.EqualFold(strings.TrimSpace(p), "multicast") {
+			return true
+		}
+	}
+	return false
+}
+
 // parseInterleaved 解析 Transport 里的 interleaved=0-1，返回 RTP / RTCP 两个 channel 号。
 // 推流时要把 channel 号写进 $ 帧头，所以这里先解析并存好。
 func parseInterleaved(s string) (rtpCh, rtcpCh int, err error) {

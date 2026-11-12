@@ -247,7 +247,7 @@ func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
 // 没有已发布流时退回本地文件/实时源的原有逻辑。
 func (s *Server) buildSDP(uri string) (string, error) {
 	if pub := s.publishedFromURI(uri); pub != nil {
-		return publishedSDP(pub), nil
+		return publishedSDP(pub, s.multicastAddr, s.multicastTTL), nil
 	}
 
 	sdp := "v=0\r\n" +
@@ -275,7 +275,7 @@ func (s *Server) buildSDP(uri string) (string, error) {
 		}
 		sdp += "a=fmtp:96 packetization-mode=1; sprop-parameter-sets=" + spspps + "\r\n"
 	}
-	sdp += "a=control:trackID=0\r\n"
+	sdp += "a=control:trackID=0\r\n" + multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
 
 	if s.audio != nil {
 		aacInfo, err := media.GetAACInfo(s.audioPath)
@@ -283,7 +283,7 @@ func (s *Server) buildSDP(uri string) (string, error) {
 			return "", err
 		}
 		sdp += aacInfo.MediaDescription(media.AACPT) +
-			"a=control:trackID=1\r\n"
+			"a=control:trackID=1\r\n" + multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
 	}
 	return sdp, nil
 }
@@ -365,6 +365,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		return writeResponse(conn, "400 Bad Request", hd, nil)
 	}
 	isInter, interStr, clientPortStr, errPort := extractTransportInfo(transReq)
+	isMulticast := hasMulticastTransport(transReq)
 	switch {
 	case conn.tunnel:
 		// 隧道里只有 GET 通道这一条双向字节流，没有可用的 UDP 通道。
@@ -374,6 +375,8 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			isInter = true
 			interStr = "0-1"
 		}
+	case isMulticast:
+		// 组播不需要 client_port / interleaved，下面单独建组播发送通道。
 	case errPort != nil:
 		return writeResponse(conn, "400 Bad Request", hd, nil)
 	}
@@ -528,6 +531,25 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		if push {
 			respTransport += ";mode=record"
 		}
+	} else if isMulticast {
+		// 组播：所有订阅同一流的客户端共享固定的组地址:端口，不按客户端
+		// 开 UDP socket。RTP/RTCP 都从同一个发送 socket 发出去。
+		groupIP := net.ParseIP(s.multicastAddr)
+		if groupIP == nil || !groupIP.IsMulticast() {
+			return writeResponse(conn, "461 Unsupported Transport", hd, nil)
+		}
+		sock, errMC := openMulticastSender(s.multicastTTL)
+		if errMC != nil {
+			fmt.Printf("open multicast sender: %v\n", errMC)
+			return writeResponse(conn, "500 Internal Server Error", hd, nil)
+		}
+		rtpPort, rtcpPort := multicastPortsFor(kind)
+		t.rtpConn = sock
+		t.isMulticast = true
+		t.mcAddr = &net.UDPAddr{IP: groupIP, Port: rtpPort}
+		t.mcRTCPAddr = &net.UDPAddr{IP: groupIP, Port: rtcpPort}
+		respTransport = fmt.Sprintf("RTP/AVP;multicast;destination=%s;port=%d-%d;ttl=%d",
+			s.multicastAddr, rtpPort, rtcpPort, s.multicastTTL)
 	} else {
 		rtpConn, rtcpConn, errUDP := openUDPPortPair()
 		if errUDP != nil {

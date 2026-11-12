@@ -201,7 +201,8 @@ func trackByControl(p *stream.Stream, uri string) (announcedTrack, bool) {
 
 // publishedSDP 用流的编码参数生成拉流端 DESCRIBE 的 SDP。
 // control 统一下发 trackID=<下标>，与现有 trackKindFromURI 的映射一致。
-func publishedSDP(p *stream.Stream) string {
+// mcAddr 非空时每条轨补上组播属性 a=destination / a=ttl。
+func publishedSDP(p *stream.Stream, mcAddr string, mcTTL int) string {
 	var b strings.Builder
 	b.WriteString("v=0\r\n")
 	b.WriteString("o=- 0 0 IN IP4 127.0.0.1\r\n")
@@ -220,6 +221,7 @@ func publishedSDP(p *stream.Stream) string {
 			fmt.Fprintf(&b, "a=fmtp:%d %s\r\n", t.PayloadType, t.FMTP)
 		}
 		fmt.Fprintf(&b, "a=control:trackID=%d\r\n", i)
+		b.WriteString(multicastSDPAttrs(mcAddr, mcTTL))
 	}
 	return b.String()
 }

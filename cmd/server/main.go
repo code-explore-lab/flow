@@ -35,6 +35,8 @@ import (
 func main() {
 	live := flag.Bool("live", false, "read Annex-B H.264 from stdin (e.g. ffmpeg camera pipe); audio disabled")
 	redirect := flag.String("redirect", "", "answer OPTIONS/DESCRIBE with 302 + this Location instead of serving streams")
+	multicastAddr := flag.String("multicast-addr", "239.255.0.1", "UDP multicast group address (empty disables multicast)")
+	multicastTTL := flag.Int("multicast-ttl", 1, "UDP multicast TTL (1 = loopback/本网段)")
 	user := flag.String("user", "", "RTSP auth username (also FLOW_RTSP_USER; empty with -pass disables auth)")
 	pass := flag.String("pass", "", "RTSP auth password (also FLOW_RTSP_PASS)")
 	authFile := flag.String("auth-file", "", "credential file, username:password per line (also FLOW_RTSP_AUTH_FILE)")
@@ -106,6 +108,7 @@ func main() {
 	rtspSrv.SetUsers(users)
 	rtspSrv.SetCSeqCheck(*cseqCheck, *cseqMaxGap)
 	rtspSrv.SetRedirect(*redirect)
+	rtspSrv.SetMulticast(*multicastAddr, *multicastTTL)
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
 	}

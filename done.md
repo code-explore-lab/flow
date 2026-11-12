@@ -161,10 +161,11 @@
 - [x] **D-1 Redirect（3xx）**
   - 开关 `-redirect rtsp://host:port/live`，对 OPTIONS/DESCRIBE 回 `302 Found` + `Location`（鉴权之前，不建会话）；
   - 验收：`ffprobe rtsp://127.0.0.1:8554/live` 打印 `Status 302: Redirecting to ...` 并成功列出目标服务器的流，`-rtsp_transport http` 隧道模式同样生效。
-- [ ] **D-2 Multicast 发送**
-  - SDP 增加 `a=destination` / `a=ttl`，SETUP 支持 `Transport: RTP/AVP;multicast;...`；
-  - 服务端向组播地址发送，不维护每客户端 UDP 连接；
-  - 验收：本机 `239.255.0.1` 回环组播，ffplay 能收到；记录 Windows 防火墙限制。
+- [x] **D-2 Multicast 发送**
+  - SDP 每条轨带 `a=destination` / `a=ttl`；SETUP 支持 `Transport: RTP/AVP;multicast`，回 `destination`/`port`/`ttl`；
+  - 组播用固定组地址（默认 `239.255.0.1`，视频 5000-5001、音频 5002-5003），只开一个发送 socket（TTL + 回环），不按客户端开 UDP 端口对；
+  - 验收：`ffmpeg -rtsp_transport udp_multicast` 本机回环拉流成功（54 帧视频 + 音频）；
+  - Windows 防火墙限制：默认不放行来自网卡的组播入站流量，本机回环不受影响；跨主机组播需 `-multicast-ttl>1` 并放行防火墙规则。
 - [ ] **G-1 Range 解析**
   - 解析 `Range: npt=...`；live 模式只接受 `npt=0-`，其他返回 `457 Invalid Range`；
   - 文件模式记录起始位置；

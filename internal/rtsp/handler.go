@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"flow/internal/media"
+	"flow/internal/rtp"
 	"flow/internal/session"
 	"flow/internal/stream"
 )
@@ -579,6 +580,12 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 				fmt.Printf("RTCP recv %d bytes (%s, session=%s)\n", n, kind, sess.ID)
 			}
 		}(kind, rtcpConn, sess)
+	}
+
+	// R-1：单播拉流轨保留最近发送的 RTP 包，供 R-7 按 NACK 重传。
+	// 推流轨（服务端只收不发）和组播轨（没有按客户端重传的语义）不占这份内存。
+	if !push && !isMulticast {
+		t.sendCache = rtp.NewSendCache(rtp.DefaultSendCachePackets, rtp.DefaultSendCacheBytes)
 	}
 
 	// 同一个 Session 下按轨登记；重复 SETUP 同一条轨时先关掉旧端口。

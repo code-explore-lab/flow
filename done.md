@@ -189,9 +189,11 @@
 
 ## R — RTP 数据面与接收侧
 
-- [ ] **R-1 发送缓存（重传的基础）**
-  - 每客户端/每轨保存最近 N 个已发送 RTP 包（seq → bytes），限制总内存；
-  - 验收：单测环形覆盖、淘汰顺序、并发安全。
+- [x] **R-1 发送缓存（重传的基础）**
+  - `internal/rtp/send_cache.go` 新增 `SendCache`：固定长度环形数组按 seq 存完整 RTP 包（含头），同时受包数（默认 512）和字节数（默认 1 MiB）限制，超限时从最旧开始淘汰；单包超过字节预算不缓存，重复 seq 原地替换，seq 回绕（65535→0）按精确值查找；内部 mutex 保证发送/重传查询并发安全；
+  - `mediaTrack` 增加 `sendCache`，SETUP 时只为单播拉流轨创建（推流轨只收不发、组播轨没有按客户端重传语义，保持 nil）；`streamH264`/`streamAAC` 在 `writeRTP` 成功后调用 `cacheSent`，只缓存成功发送的包；`cachedPacket(seq)` 供 R-7 取包重传；
+  - 验收：`internal/rtp/send_cache_test.go` 覆盖环形覆盖与淘汰顺序、字节预算、单包超预算、seq 回绕、重复 seq、空缓存、默认容量、并发 Add/Get（`go test -race` 通过）；`internal/rtsp/send_cache_test.go` 验证发送循环确实把包写入缓存；`ffprobe`/`ffmpeg` 与 `Scale: 2.0` 回归正常。
+  - 说明：缓存只占内存、不改变线上行为；NACK 解析与限速重传在 R-7 实现。
 - [ ] **R-2 STAP-A 聚合**
   - 把 SPS+PPS（以及能塞进 MTU 的小 NALU）聚合成一个 STAP-A；
   - 不跨帧聚合，超过 MTU 退回单 NALU；

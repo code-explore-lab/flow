@@ -110,6 +110,8 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			}
 			// 给 SR 累计包数/字节数，并记下最后一个时间戳。
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
+			// 保留最近的包，NACK 重传（R-7）按 seq 取回。
+			track.cacheSent(p.Header.Seq, data)
 		}
 	}
 }
@@ -180,6 +182,7 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 				return false
 			}
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
+			track.cacheSent(p.Header.Seq, data)
 		}
 	}
 }

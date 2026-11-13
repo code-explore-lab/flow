@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"flow/internal/rtcp"
+	"flow/internal/rtp"
 	"flow/internal/session"
 	"flow/internal/source"
 	"flow/internal/stream"
@@ -40,6 +41,11 @@ type mediaTrack struct {
 	// SR goroutine 每 5s 读一次。
 	clockRate uint32
 	stats     trackStats
+
+	// R-1 发送缓存：拉流单播轨保留最近成功发送的 RTP 包，R-7 收到
+	// 客户端 NACK 时按 seq 重传。推流轨只收不发、组播轨没有按客户端
+	// 重传的语义，SETUP 时不会创建（保持 nil）。
+	sendCache *rtp.SendCache
 
 	// 推流（ANNOUNCE/RECORD）方向：客户端把 RTP 发到服务端，服务端只接收。
 	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
@@ -131,6 +137,22 @@ func (t *mediaTrack) recordSent(rtpTS uint32, payloadLen int) {
 	t.stats.lastRTP = rtpTS
 	t.stats.lastSent = time.Now()
 	t.stats.mu.Unlock()
+}
+
+// cacheSent 把刚发送成功的完整 RTP 包存入发送缓存（R-1）。
+// 没有缓存的轨（推流/组播）直接跳过。
+func (t *mediaTrack) cacheSent(seq uint16, pkt []byte) {
+	if t.sendCache != nil {
+		t.sendCache.Add(seq, pkt)
+	}
+}
+
+// cachedPacket 按 seq 取回已发送的包，供 NACK 重传使用（R-7）。
+func (t *mediaTrack) cachedPacket(seq uint16) ([]byte, bool) {
+	if t.sendCache == nil {
+		return nil, false
+	}
+	return t.sendCache.Get(seq)
 }
 
 // writeRTP 按这条轨的传输方式发送一个已经序列化好的 RTP 包：

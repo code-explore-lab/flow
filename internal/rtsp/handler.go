@@ -622,8 +622,28 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 		return writeResponse(conn, "455 Method Not Valid In This State", hd, nil)
 	}
 
-	sess.SetState(session.StatePlaying)
 	rtspSess := sess.Data.(*Session)
+
+	// G-1 Range：解析并校验播放区间。
+	// live（stdin 实时源 / ANNOUNCE 推来的流）没有可定位的文件，只接受
+	// npt=0-；其他区间回 457，客户端会把参数错误暴露出来，而不是静默从头播。
+	// 文件模式只记录起点/终点，真正定位由 G-2 的 seek 完成。
+	// 必须在 SetState(Playing) 之前返回，457 不能改变会话状态。
+	if rawRange := headerValue(req, "Range"); rawRange != "" {
+		r, err := parseNPTRange(rawRange)
+		live := s.live || rtspSess.published() != nil
+		if err != nil || (live && !r.validForLive()) {
+			fmt.Printf("session %s PLAY rejected: Range %q (live=%v, err=%v)\n",
+				sess.ID, rawRange, live, err)
+			return writeResponse(conn, "457 Invalid Range", hd, nil)
+		}
+		rtspSess.setPlayRange(r)
+		hd["Range"] = rawRange
+		fmt.Printf("session %s PLAY range %q (start=%s end=%s hasEnd=%v)\n",
+			sess.ID, rawRange, r.start, r.end, r.hasEnd)
+	}
+
+	sess.SetState(session.StatePlaying)
 	conn.bindSession(sess.ID)
 
 	hd["Session"] = s.sessionHeaderValue(sess)

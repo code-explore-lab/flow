@@ -254,6 +254,13 @@ type Session struct {
 	// endOnce 保证「推流源结束 → 回收拉流会话」只执行一次。
 	// 视频/音频两条转发的 goroutine 可能同时看到源关闭。
 	endOnce sync.Once
+
+	// playRange 最近一次 PLAY 的 Range 起点/终点（G-1）。
+	// live 模式只放行 npt=0-，起点恒为 0；文件模式记录位置，
+	// 供 G-2 的 seek 从对应帧序号/最近 IDR 开始发送。
+	rangeStart  time.Duration
+	rangeEnd    time.Duration
+	rangeHasEnd bool
 }
 
 func newSession() *Session {
@@ -312,6 +319,24 @@ func (s *Session) setPublished(pub *stream.Stream, cleanup func()) {
 	if cleanup != nil {
 		s.pubCleanup = cleanup
 	}
+}
+
+// setPlayRange 记录本次 PLAY 的 Range 区间（G-1）。重复 PLAY 覆盖上一次，
+// 与 RFC 2326「Playing 状态下的 PLAY 是更新播放参数」一致。
+func (s *Session) setPlayRange(r nptRange) {
+	s.mu.Lock()
+	s.rangeStart = r.start
+	s.rangeEnd = r.end
+	s.rangeHasEnd = r.hasEnd
+	s.mu.Unlock()
+}
+
+// playRange 返回最近一次 PLAY 记录的区间。没有 Range 头或从未 PLAY 时
+// 返回 (0, false)，G-2 据此按默认从头播放。
+func (s *Session) playRange() (start, end time.Duration, hasEnd bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rangeStart, s.rangeEnd, s.rangeHasEnd
 }
 
 // markEnded 标记「源结束回收」已经执行过，返回本次是否是第一次调用。

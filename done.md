@@ -166,10 +166,11 @@
   - 组播用固定组地址（默认 `239.255.0.1`，视频 5000-5001、音频 5002-5003），只开一个发送 socket（TTL + 回环），不按客户端开 UDP 端口对；
   - 验收：`ffmpeg -rtsp_transport udp_multicast` 本机回环拉流成功（54 帧视频 + 音频）；
   - Windows 防火墙限制：默认不放行来自网卡的组播入站流量，本机回环不受影响；跨主机组播需 `-multicast-ttl>1` 并放行防火墙规则。
-- [ ] **G-1 Range 解析**
-  - 解析 `Range: npt=...`；live 模式只接受 `npt=0-`，其他返回 `457 Invalid Range`；
-  - 文件模式记录起始位置；
-  - 验收：`ffprobe` 不报错，非法 Range 返回 457。
+- [x] **G-1 Range 解析**
+  - `internal/rtsp/range.go` 解析 `Range: npt=...`（秒数、`mm:ss`、`hh:mm:ss`、`now-`，起止可省略）；
+  - live 模式（`-live` 或 ANNOUNCE 推来的流）只接受从 0 开始的开放区间，`npt=0-` / `npt=0.000-` 放行，其他返回 `457 Invalid Range` 且不改会话状态；
+  - 文件模式把起点/终点记录在 `Session` 上（`setPlayRange`/`playRange`），供 G-2 seek；200 响应回显 `Range`；
+  - 验收：`ffprobe` 文件/live 模式均正常（它默认发 `Range: npt=0.000-`）；裸 RTSP 发 `npt=5-` / `npt=0-10` 返回 457，`npt=0-` 返回 200。
 - [ ] **G-2 文件模式 seek**
   - 按 NALU 索引或字节偏移实现定位；由于 Annex-B 没有 PTS，按帧序号近似；
   - 定位后从最近 IDR 开始发；

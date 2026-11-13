@@ -3,6 +3,7 @@ package source
 import (
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 
@@ -111,19 +112,21 @@ func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
 // 与 Subscribe 不同，seek 不能复用共享 ring buffer（它只追加、不能回退），
 // 所以这里为这次播放单独开一个 run：从 IDR 的字节偏移重新读文件，
 // 时间戳从该帧的档位时间开始，多个客户端互不影响。
-func (s *H264Source) SubscribeFrom(start time.Duration) (*Reader[Frame], func(), error) {
+func (s *H264Source) SubscribeFrom(start time.Duration, scale float64) (*Reader[Frame], func(), error) {
 	if s.reader != nil {
 		return nil, nil, fmt.Errorf("h264 source: live stream is not seekable")
 	}
-	if err := s.buildSeekIndex(); err != nil {
-		return nil, nil, err
-	}
 
-	sp, ok := s.seekPointAt(start)
-	if !ok {
-		// 整个文件没有 IDR：退回从头播，客户端至少还能收到参数集。
-		rd, cancel := s.Subscribe()
-		return rd, cancel, nil
+	// start <= 0 时不建索引，直接从文件头播（零值 seek point -> offset 0/ts 0）。
+	sp := h264SeekPoint{}
+	if start > 0 {
+		if err := s.buildSeekIndex(); err != nil {
+			return nil, nil, err
+		}
+		// 整个文件没有 IDR 时保持零值：退回从头播，客户端至少还能收到参数集。
+		if p, ok := s.seekPointAt(start); ok {
+			sp = p
+		}
 	}
 
 	ring := NewRingBuffer[Frame](videoRingCapacity)
@@ -137,8 +140,21 @@ func (s *H264Source) SubscribeFrom(start time.Duration) (*Reader[Frame], func(),
 		})
 		rd.Close()
 	}
-	go s.runFrom(ring, done, sp)
+	go s.runFrom(ring, done, sp, scaledInterval(videoFrameInterval, scale))
 	return rd, cancel, nil
+}
+
+// scaledInterval 把基准发送间隔按倍率缩放：2x 播放 -> 间隔减半。
+// 非法倍率按 1 处理；间隔下限 1ms，避免极端倍率下空转。
+func scaledInterval(base time.Duration, scale float64) time.Duration {
+	if scale <= 0 || math.IsNaN(scale) || math.IsInf(scale, 0) {
+		return base
+	}
+	d := time.Duration(float64(base) / scale)
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
 }
 
 // buildSeekIndex 扫描整个文件，记录每个 IDR 的字节偏移、帧序号和参数集。
@@ -208,7 +224,7 @@ func (s *H264Source) seekPointAt(start time.Duration) (h264SeekPoint, bool) {
 // runFrom 是一次 seek 播放的源 goroutine：从 IDR 偏移开始读文件，
 // 先补该 IDR 之前的 SPS/PPS，再按 25fps 节奏发帧。
 // 时间戳从 sp.ts 起，与文件时间轴一致（npt = ts / 90000）。
-func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h264SeekPoint) {
+func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h264SeekPoint, interval time.Duration) {
 	defer ring.Close()
 
 	demux, err := media.NewH264DemuxAt(s.path, sp.offset)
@@ -216,8 +232,8 @@ func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h
 		fmt.Printf("h264 source: seek open %s@%d: %v\n", s.path, sp.offset, err)
 		return
 	}
-	fmt.Printf("h264 seek source: start at frame %d (ts=%d, offset=%d)\n",
-		sp.frameIdx, sp.ts, sp.offset)
+	fmt.Printf("h264 seek source: start at frame %d (ts=%d, offset=%d, interval=%s)\n",
+		sp.frameIdx, sp.ts, sp.offset, interval)
 
 	if len(sp.sps) > 0 {
 		ring.Write(Frame{Data: sp.sps, Timestamp: sp.ts})
@@ -226,7 +242,7 @@ func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h
 		ring.Write(Frame{Data: sp.pps, Timestamp: sp.ts})
 	}
 
-	ticker := time.NewTicker(videoFrameInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	ts := sp.ts

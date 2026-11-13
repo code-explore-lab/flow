@@ -114,9 +114,9 @@ func (s *ExternalSource) Subscribe() (*Reader[Frame], func()) {
 	return rd, rd.Close
 }
 
-// SubscribeFrom 实时推流源没有可定位的文件，不支持 seek。
-// RTSP 层在 live/推流模式已经用 457 拒掉非零 Range，这里只做兜底。
-func (s *ExternalSource) SubscribeFrom(time.Duration) (*Reader[Frame], func(), error) {
+// SubscribeFrom 实时推流源没有可定位/调速的文件，不支持 seek 和 Scale。
+// RTSP 层在 live/推流模式已经用 457/551 拒掉对应请求，这里只做兜底。
+func (s *ExternalSource) SubscribeFrom(time.Duration, float64) (*Reader[Frame], func(), error) {
 	return nil, nil, errors.New("external source: live stream is not seekable")
 }
 

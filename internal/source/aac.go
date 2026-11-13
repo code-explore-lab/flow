@@ -79,7 +79,7 @@ func (s *AACSource) Subscribe() (*Reader[Frame], func()) {
 // SubscribeFrom 从 start 对应的 AU 开始播放，返回独立的 Reader。
 // 音频没有关键帧概念，按「每帧 1024 采样」把时间换成 AU 序号即可，
 // 这样音视频 seek 到同一时间点后仍能保持内容同步。
-func (s *AACSource) SubscribeFrom(start time.Duration) (*Reader[Frame], func(), error) {
+func (s *AACSource) SubscribeFrom(start time.Duration, scale float64) (*Reader[Frame], func(), error) {
 	if err := s.buildSeekIndex(); err != nil {
 		return nil, nil, err
 	}
@@ -90,12 +90,12 @@ func (s *AACSource) SubscribeFrom(start time.Duration) (*Reader[Frame], func(), 
 
 	freq := s.indexRate
 	frameDur := time.Duration(float64(time.Second) * float64(rtp.AACFrameSamples) / float64(freq))
-	target := int(start / frameDur)
-	if target < 0 {
-		target = 0
-	}
-	if target >= len(s.auOffsets) {
-		target = len(s.auOffsets) - 1
+	target := 0
+	if start > 0 {
+		target = int(start / frameDur)
+		if target >= len(s.auOffsets) {
+			target = len(s.auOffsets) - 1
+		}
 	}
 
 	ring := NewRingBuffer[Frame](aacRingCapacity)
@@ -109,7 +109,8 @@ func (s *AACSource) SubscribeFrom(start time.Duration) (*Reader[Frame], func(), 
 		})
 		rd.Close()
 	}
-	go s.runFrom(ring, done, s.auOffsets[target], uint32(target)*rtp.AACFrameSamples, frameDur)
+	go s.runFrom(ring, done, s.auOffsets[target], uint32(target)*rtp.AACFrameSamples,
+		scaledInterval(frameDur, scale))
 	return rd, cancel, nil
 }
 
@@ -147,9 +148,9 @@ func (s *AACSource) buildSeekIndex() error {
 	return s.indexErr
 }
 
-// runFrom 是一次 seek 播放的音频源 goroutine：从指定 AU 偏移开始读，
-// 时间戳从 ts 起每帧 +1024，节奏与普通 run 相同。
-func (s *AACSource) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, offset int, ts uint32, frameDur time.Duration) {
+// runFrom 是一次 seek/调速播放的音频源 goroutine：从指定 AU 偏移开始读，
+// 时间戳从 ts 起每帧 +1024，ticker 间隔按倍率缩放。
+func (s *AACSource) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, offset int, ts uint32, interval time.Duration) {
 	defer ring.Close()
 
 	demux, err := media.NewAACDemuxAt(s.path, offset)
@@ -157,9 +158,9 @@ func (s *AACSource) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, offse
 		fmt.Printf("aac source: seek open %s@%d: %v\n", s.path, offset, err)
 		return
 	}
-	fmt.Printf("aac seek source: start at offset %d (ts=%d)\n", offset, ts)
+	fmt.Printf("aac seek source: start at offset %d (ts=%d, interval=%s)\n", offset, ts, interval)
 
-	ticker := time.NewTicker(frameDur)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	first := true

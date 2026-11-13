@@ -178,9 +178,12 @@
   - RTSP 层 `streamH264`/`streamAAC` 接收本次 PLAY 的起点，`start>0` 走 `SubscribeFrom`；live/推流源在 G-1 已被 457 拦截，`ExternalSource.SubscribeFrom` 只做兜底报错；
   - 验收：裸 RTSP `Range: npt=3-` 首个 RTP 包 `ts=270000`（3.000s），NAL 顺序 SPS/PPS/IDR；`ffmpeg -ss 3 -t 2` exit 0，日志 `h264 seek source: start at frame 75 (ts=270000)`、`aac seek source: start at offset ... (ts=...)`；
   - 说明：Range 的终点仍只记录不执行；Playing 状态下重复 PLAY 改 Range 不会重启推流（ffmpeg 的 seek 走 PAUSE + PLAY，不影响验收）。
-- [ ] **G-3 Scale / Rate**
-  - 文件模式支持 `Scale: 2.0` 调速（改 ticker 间隔）；live 模式拒绝并返回 `551 Option Not Supported`；
-  - 验收：2x 播放时长减半，timestamp 仍单调。
+- [x] **G-3 Scale / Rate**
+  - `internal/rtsp/scale.go` 解析 `Scale` 头（正浮点数，`NaN`/`Inf`/`0`/负数/非数字返回 400）；
+  - live 模式（`-live` 或 ANNOUNCE 推来的流）非 1 倍速一律 `551 Option Not Supported`，不改会话状态；文件模式记录倍率并回显 `Scale`；
+  - 调速不改时间戳，只改发送节奏：`H264Source`/`AACSource` 的 `SubscribeFrom` 把 `scale` 传给 `scaledInterval(base, scale)`（`base/scale`，下限 1ms）作为 ticker 间隔，所以 `start=0, scale!=1` 也走每会话独立 run；`streamH264`/`streamAAC` 用 `start>0 || scale!=1` 判断是否走 `SubscribeFrom`；
+  - 验收：裸 RTSP `Scale: 2.0` 时 2s 窗口内 RTP 时间戳推进 4.000s（media/wall≈2.02x），`Scale: 0.5` 时 3.04s 窗口推进 1.520s（≈0.50x），时间戳始终单调；`npt=3-` + `Scale: 2.0` 从 `ts=270000` 起同样 2x；live 模式 `Scale: 2.0`/`0.5` 返回 551，`1.0` 返回 200；`ffprobe`/`ffmpeg` 回归正常；
+  - 说明：已在 Playing 状态下重复 PLAY 改倍率不会重启推流（与 Range 一致）。
 
 ---
 

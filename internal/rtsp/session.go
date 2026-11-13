@@ -261,6 +261,10 @@ type Session struct {
 	rangeStart  time.Duration
 	rangeEnd    time.Duration
 	rangeHasEnd bool
+
+	// playRate 最近一次 PLAY 的播放倍率（G-3）。0 表示还没设置过，按 1 处理。
+	// 只对文件模式生效；live/推流源在 handlePlay 已经拒绝非 1 倍速。
+	playRate float64
 }
 
 func newSession() *Session {
@@ -337,6 +341,26 @@ func (s *Session) playRange() (start, end time.Duration, hasEnd bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.rangeStart, s.rangeEnd, s.rangeHasEnd
+}
+
+// setPlayScale 记录本次 PLAY 的播放倍率（G-3）。非正数按 1 处理。
+func (s *Session) setPlayScale(scale float64) {
+	s.mu.Lock()
+	if scale <= 0 {
+		scale = 1
+	}
+	s.playRate = scale
+	s.mu.Unlock()
+}
+
+// playbackScale 返回最近一次 PLAY 记录的倍率；从未设置时返回 1。
+func (s *Session) playbackScale() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.playRate <= 0 {
+		return 1
+	}
+	return s.playRate
 }
 
 // markEnded 标记「源结束回收」已经执行过，返回本次是否是第一次调用。

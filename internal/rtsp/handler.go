@@ -643,6 +643,24 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 			sess.ID, rawRange, r.start, r.end, r.hasEnd)
 	}
 
+	// G-3 Scale：文件模式按倍率调速；live/推流源没有可调速的文件，
+	// 非 1 倍速回 551（1.0 视为无操作）。与 Range 一样，必须在
+	// SetState(Playing) 之前返回，拒绝时不能改变会话状态。
+	if rawScale := headerValue(req, "Scale"); rawScale != "" {
+		v, err := parseScale(rawScale)
+		if err != nil {
+			fmt.Printf("session %s PLAY rejected: Scale %q\n", sess.ID, rawScale)
+			return writeResponse(conn, "400 Bad Request", hd, nil)
+		}
+		if (s.live || rtspSess.published() != nil) && v != 1 {
+			fmt.Printf("session %s PLAY rejected: Scale %q on live stream\n", sess.ID, rawScale)
+			return writeResponse(conn, "551 Option Not Supported", hd, nil)
+		}
+		rtspSess.setPlayScale(v)
+		hd["Scale"] = rawScale
+		fmt.Printf("session %s PLAY scale %q\n", sess.ID, rawScale)
+	}
+
 	sess.SetState(session.StatePlaying)
 	conn.bindSession(sess.ID)
 
@@ -660,8 +678,9 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 	}
 	video := rtspSess.track("video")
 	audio := rtspSess.track("audio")
-	// 本次 PLAY 的起点：live 恒为 0；文件模式是 Range 记录的位置（G-2）。
+	// 本次 PLAY 的起点和倍率：live 恒为 0/1；文件模式取 Range/Scale（G-2/G-3）。
 	start, _, _ := rtspSess.playRange()
+	scale := rtspSess.playbackScale()
 	// 已发布流的轨用 track.external（推流端解包后写入的源），
 	// 本地文件/live 模式退回 Server 上的全局源。
 	// 源结束（推流端断开）时回收本拉流会话，让客户端立即收到 EOF；
@@ -669,7 +688,7 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 	if video != nil {
 		if src := s.videoSourceFor(video); src != nil {
 			go func() {
-				if s.streamH264(video, src, playDone, start) {
+				if s.streamH264(video, src, playDone, start, scale) {
 					s.endPullSession(sess, conn, rtspSess)
 				}
 			}()
@@ -678,7 +697,7 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 	if audio != nil {
 		if src := s.audioSourceFor(audio); src != nil {
 			go func() {
-				if s.streamAAC(audio, src, playDone, start) {
+				if s.streamAAC(audio, src, playDone, start, scale) {
 					s.endPullSession(sess, conn, rtspSess)
 				}
 			}()

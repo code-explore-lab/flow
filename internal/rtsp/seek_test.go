@@ -14,6 +14,7 @@ type fakeSeekSource struct {
 	plainCalled bool
 	fromCalled  bool
 	fromStart   time.Duration
+	fromScale   float64
 }
 
 func closedFrameReader(f source.Frame) *source.Reader[source.Frame] {
@@ -29,22 +30,26 @@ func (f *fakeSeekSource) Subscribe() (*source.Reader[source.Frame], func()) {
 	return rd, rd.Close
 }
 
-func (f *fakeSeekSource) SubscribeFrom(start time.Duration) (*source.Reader[source.Frame], func(), error) {
+func (f *fakeSeekSource) SubscribeFrom(start time.Duration, scale float64) (*source.Reader[source.Frame], func(), error) {
 	f.fromCalled = true
 	f.fromStart = start
+	f.fromScale = scale
 	rd := closedFrameReader(source.Frame{Data: []byte{0x65, 0x88, 0x84, 0x00}, Keyframe: true})
 	return rd, rd.Close, nil
 }
 
-// TestStreamH264UsesSubscribeFromForSeek start>0 时必须走 SubscribeFrom，
-// start=0 时维持共享源的普通订阅。
-func TestStreamH264UsesSubscribeFromForSeek(t *testing.T) {
+// TestStreamH264UsesSubscribeFrom start>0（seek）或 scale!=1（调速）时必须走
+// SubscribeFrom，两者都不需要时维持共享源的普通订阅。
+func TestStreamH264UsesSubscribeFrom(t *testing.T) {
 	cases := []struct {
 		name  string
 		start time.Duration
+		scale float64
 	}{
-		{"seek", 3 * time.Second},
-		{"no seek", 0},
+		{"seek", 3 * time.Second, 1},
+		{"scale", 0, 2},
+		{"seek and scale", 3 * time.Second, 0.5},
+		{"no seek", 0, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -65,20 +70,21 @@ func TestStreamH264UsesSubscribeFromForSeek(t *testing.T) {
 			done := make(chan struct{})
 			defer close(done)
 
-			s.streamH264(track, src, done, tc.start)
+			s.streamH264(track, src, done, tc.start, tc.scale)
 
-			if tc.start > 0 {
+			if tc.start > 0 || tc.scale != 1 {
 				if !src.fromCalled || src.plainCalled {
-					t.Fatalf("start=%s: fromCalled=%v plainCalled=%v, want SubscribeFrom only",
-						tc.start, src.fromCalled, src.plainCalled)
+					t.Fatalf("start=%s scale=%v: fromCalled=%v plainCalled=%v, want SubscribeFrom only",
+						tc.start, tc.scale, src.fromCalled, src.plainCalled)
 				}
-				if src.fromStart != tc.start {
-					t.Fatalf("SubscribeFrom start = %s, want %s", src.fromStart, tc.start)
+				if src.fromStart != tc.start || src.fromScale != tc.scale {
+					t.Fatalf("SubscribeFrom(%s, %v), want (%s, %v)",
+						src.fromStart, src.fromScale, tc.start, tc.scale)
 				}
 				return
 			}
 			if !src.plainCalled || src.fromCalled {
-				t.Fatalf("start=0: fromCalled=%v plainCalled=%v, want Subscribe only",
+				t.Fatalf("start=0 scale=1: fromCalled=%v plainCalled=%v, want Subscribe only",
 					src.fromCalled, src.plainCalled)
 			}
 		})

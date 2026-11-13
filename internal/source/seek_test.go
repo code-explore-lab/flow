@@ -43,7 +43,7 @@ func buildSeekH264(t *testing.T) string {
 // 应回退到帧 31 的 IDR，并先补 SPS/PPS；时间戳按文件时间轴从 31*3600 开始。
 func TestH264SubscribeFromStartsAtNearestIDR(t *testing.T) {
 	src := NewH264Source(buildSeekH264(t))
-	rd, cancel, err := src.SubscribeFrom(1500 * time.Millisecond)
+	rd, cancel, err := src.SubscribeFrom(1500*time.Millisecond, 1)
 	if err != nil {
 		t.Fatalf("SubscribeFrom: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestH264SubscribeFromStartsAtNearestIDR(t *testing.T) {
 // TestH264SubscribeFromPastEOF 目标超出文件末尾时用最后一个 IDR。
 func TestH264SubscribeFromPastEOF(t *testing.T) {
 	src := NewH264Source(buildSeekH264(t))
-	rd, cancel, err := src.SubscribeFrom(time.Hour)
+	rd, cancel, err := src.SubscribeFrom(time.Hour, 1)
 	if err != nil {
 		t.Fatalf("SubscribeFrom: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestH264SubscribeFromPastEOF(t *testing.T) {
 // TestH264SubscribeFromLiveRejected 实时源没有文件可定位。
 func TestH264SubscribeFromLiveRejected(t *testing.T) {
 	src := NewH264SourceFromReader(bytes.NewReader(nil))
-	if _, _, err := src.SubscribeFrom(time.Second); err == nil {
+	if _, _, err := src.SubscribeFrom(time.Second, 1); err == nil {
 		t.Fatal("SubscribeFrom on live source should fail")
 	}
 }
@@ -130,8 +130,8 @@ func TestAACSubscribeFrom(t *testing.T) {
 	}
 
 	src := NewAACSource(path)
-	frameDur := time.Second * 1024 / 44100                 // 44100Hz 下每 AU 的时长（整数纳秒）
-	rd, cancel, err := src.SubscribeFrom(frameDur * 5 / 2) // 目标 AU = 2
+	frameDur := time.Second * 1024 / 44100                // 44100Hz 下每 AU 的时长（整数纳秒）
+	rd, cancel, err := src.SubscribeFrom(frameDur*5/2, 1) // 目标 AU = 2
 	if err != nil {
 		t.Fatalf("SubscribeFrom: %v", err)
 	}

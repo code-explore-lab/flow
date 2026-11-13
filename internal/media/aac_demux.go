@@ -129,31 +129,55 @@ func NewAACDemux(filePath string) (*AACDemux, error) {
 	return &AACDemux{buf: buf, off: 0}, nil
 }
 
+// NewAACDemuxAt 与 NewAACDemux 相同，但从文件内的字节偏移 off 开始读。
+// off 通常是某个 ADTS 帧的 syncword 位置。
+func NewAACDemuxAt(filePath string, off int) (*AACDemux, error) {
+	d, err := NewAACDemux(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if off < 0 {
+		off = 0
+	}
+	if off > len(d.buf) {
+		off = len(d.buf)
+	}
+	d.off = off
+	return d, nil
+}
+
 // NextAU 读取下一个 AU（Access Unit），返回去掉 ADTS 头之后的裸 AAC 帧。
 // 没有更多数据时返回 io.EOF。
 func (d *AACDemux) NextAU() ([]byte, error) {
+	au, _, err := d.NextAUWithOffset()
+	return au, err
+}
+
+// NextAUWithOffset 读取下一个 AU，同时返回该 ADTS 帧在文件里的偏移。
+// 文件模式 seek 用它建「AU 序号 → 字节偏移」索引。
+func (d *AACDemux) NextAUWithOffset() ([]byte, int, error) {
 	n := len(d.buf)
 	if d.off >= n {
-		return nil, io.EOF
+		return nil, 0, io.EOF
 	}
 
 	start := d.findSyncWord(d.off)
 	if start == -1 {
-		return nil, io.EOF
+		return nil, 0, io.EOF
 	}
 
 	hdr, err := ParseADTSHeader(d.buf[start:])
 	if err != nil || hdr.FrameLength < hdr.HeaderLength {
 		// 非法头：跳过当前字节继续找
 		d.off = start + 1
-		return d.NextAU()
+		return d.NextAUWithOffset()
 	}
 
 	end := start + hdr.FrameLength
 	if end > n {
 		// 文件被截断，剩余部分直接丢弃
 		d.off = n
-		return nil, io.EOF
+		return nil, 0, io.EOF
 	}
 
 	if d.First == nil {
@@ -163,9 +187,9 @@ func (d *AACDemux) NextAU() ([]byte, error) {
 	au := d.buf[start+hdr.HeaderLength : end]
 	d.off = end
 	if len(au) == 0 {
-		return d.NextAU()
+		return d.NextAUWithOffset()
 	}
-	return au, nil
+	return au, start, nil
 }
 
 // findSyncWord 从 offset 起找 ADTS syncword（0xFFF + layer==00），找不到返回 -1。

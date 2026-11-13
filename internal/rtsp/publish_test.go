@@ -205,7 +205,7 @@ func TestStreamH264ForwardsPublishedFrames(t *testing.T) {
 	}
 	done := make(chan struct{})
 	defer close(done)
-	go s.streamH264(track, src, done)
+	go s.streamH264(track, src, done, 0)
 
 	br := bufio.NewReader(clientConn)
 	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))

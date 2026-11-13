@@ -1,7 +1,9 @@
 package source
 
 import (
+	"errors"
 	"sync"
+	"time"
 
 	"flow/internal/media"
 	"flow/internal/rtp"
@@ -110,6 +112,12 @@ func (s *ExternalSource) Subscribe() (*Reader[Frame], func()) {
 	}
 	rd := s.ring.Subscribe(preload...)
 	return rd, rd.Close
+}
+
+// SubscribeFrom 实时推流源没有可定位的文件，不支持 seek。
+// RTSP 层在 live/推流模式已经用 457 拒掉非零 Range，这里只做兜底。
+func (s *ExternalSource) SubscribeFrom(time.Duration) (*Reader[Frame], func(), error) {
+	return nil, nil, errors.New("external source: live stream is not seekable")
 }
 
 // Close 结束这个源：唤醒所有读者，让它们把剩余帧读完再退出。

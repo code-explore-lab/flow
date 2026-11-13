@@ -171,10 +171,13 @@
   - live 模式（`-live` 或 ANNOUNCE 推来的流）只接受从 0 开始的开放区间，`npt=0-` / `npt=0.000-` 放行，其他返回 `457 Invalid Range` 且不改会话状态；
   - 文件模式把起点/终点记录在 `Session` 上（`setPlayRange`/`playRange`），供 G-2 seek；200 响应回显 `Range`；
   - 验收：`ffprobe` 文件/live 模式均正常（它默认发 `Range: npt=0.000-`）；裸 RTSP 发 `npt=5-` / `npt=0-10` 返回 457，`npt=0-` 返回 200。
-- [ ] **G-2 文件模式 seek**
-  - 按 NALU 索引或字节偏移实现定位；由于 Annex-B 没有 PTS，按帧序号近似；
-  - 定位后从最近 IDR 开始发；
-  - 验收：指定 `Range: npt=3-` 时从约第 3 秒的 IDR 开始。
+- [x] **G-2 文件模式 seek**
+  - `H264Demux`/`AACDemux` 增加带偏移的读取（`NextNALUWithOffset` / `NextAUWithOffset`）和 `New...At` 从指定偏移打开；
+  - `H264Source.SubscribeFrom` 首次调用时扫描文件建索引：只记 IDR 的字节偏移、帧序号（25fps 下 `npt/40ms`）、时间戳和参数集，取不超过目标的最后一个 IDR；seek 不复用共享 ring buffer，而是为这次播放单独起一条 run，时间戳从 `frameIdx*3600` 开始；
+  - `AACSource.SubscribeFrom` 按「每 AU 1024 采样」算目标序号，从对应 ADTS 帧偏移开始，时间戳 `auIdx*1024`，保持音视频内容对齐；
+  - RTSP 层 `streamH264`/`streamAAC` 接收本次 PLAY 的起点，`start>0` 走 `SubscribeFrom`；live/推流源在 G-1 已被 457 拦截，`ExternalSource.SubscribeFrom` 只做兜底报错；
+  - 验收：裸 RTSP `Range: npt=3-` 首个 RTP 包 `ts=270000`（3.000s），NAL 顺序 SPS/PPS/IDR；`ffmpeg -ss 3 -t 2` exit 0，日志 `h264 seek source: start at frame 75 (ts=270000)`、`aac seek source: start at offset ... (ts=...)`；
+  - 说明：Range 的终点仍只记录不执行；Playing 状态下重复 PLAY 改 Range 不会重启推流（ffmpeg 的 seek 走 PAUSE + PLAY，不影响验收）。
 - [ ] **G-3 Scale / Rate**
   - 文件模式支持 `Scale: 2.0` 调速（改 ticker 间隔）；live 模式拒绝并返回 `551 Option Not Supported`；
   - 验收：2x 播放时长减半，timestamp 仍单调。

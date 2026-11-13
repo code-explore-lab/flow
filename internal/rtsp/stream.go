@@ -11,8 +11,12 @@ import (
 // videoFrameSource 拉流端订阅的帧源抽象。
 // 本地文件/live 模式的 *source.H264Source 和推流场景的 *source.ExternalSource
 // 都满足这个接口，streamH264 不需要区分数据从哪来。
+//
+// SubscribeFrom 由 G-2 的文件 seek 使用：只有文件源能定位，live/推流源
+// 返回错误（RTSP 层在 G-1 已经用 457 挡掉了非零 Range）。
 type videoFrameSource interface {
 	Subscribe() (*source.Reader[source.Frame], func())
+	SubscribeFrom(start time.Duration) (*source.Reader[source.Frame], func(), error)
 }
 
 // audioFrameSource 音频帧源额外提供采样率，用来设置 RTCP SR 的 RTP 时钟。
@@ -49,12 +53,20 @@ func (s *Server) audioSourceFor(t *mediaTrack) audioFrameSource {
 // 源只读一次，多个客户端各自从自己的 Reader 取同一批 NALU；
 // seq/SSRC 仍然每个客户端独立，时间戳由源统一打好，保证多路一致。
 //
+// start > 0 表示文件模式 seek：从该 npt 位置最近的前置 IDR 开始发，
+// 时间戳也切换到对应档位。live/推流源在 G-1 已经拒绝了非零 Range。
+//
 // 返回 true 表示帧源已经结束（推流端断开 / 文件读完），false 表示是
 // done 关闭或写连接失败导致的退出。调用方据此决定是否回收拉流会话。
-func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan struct{}) bool {
+func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan struct{}, start time.Duration) bool {
 	// 每个客户端拿一个独立的 Reader，按自己的 seq 从共享 ring buffer 读。
 	// 客户端慢只会让自己的游标落后、被新帧覆盖，不会阻塞源和其他客户端。
-	reader, cancel := src.Subscribe()
+	// seek 时由源内部为这次播放单独开一条 run。
+	reader, cancel, err := subscribeVideo(src, start)
+	if err != nil {
+		fmt.Printf("video seek: %v\n", err)
+		return false
+	}
 	defer cancel()
 
 	packer := rtp.NewH264Packer(1400)
@@ -101,11 +113,26 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 	}
 }
 
+// subscribeVideo 按是否 seek 选择订阅方式：start > 0 用 SubscribeFrom，
+// 否则沿用共享源的实时订阅。
+func subscribeVideo(src videoFrameSource, start time.Duration) (*source.Reader[source.Frame], func(), error) {
+	if start > 0 {
+		return src.SubscribeFrom(start)
+	}
+	rd, cancel := src.Subscribe()
+	return rd, cancel, nil
+}
+
 // streamAAC 每个客户端一条订阅 goroutine：从共享音频源拿 AU → RFC 3640 封包 → 发送。
 // 音频时间戳（采样数，每个 AU +1024）由源统一维护，客户端只负责封包和 seq/SSRC。
+// start 语义同 streamH264：文件模式 seek 到同一时间点，保持音视频内容对齐。
 // 返回值语义同 streamH264：true 表示音频源结束。
-func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan struct{}) bool {
-	reader, cancel := src.Subscribe()
+func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan struct{}, start time.Duration) bool {
+	reader, cancel, err := subscribeVideo(src, start)
+	if err != nil {
+		fmt.Printf("audio seek: %v\n", err)
+		return false
+	}
 	defer cancel()
 
 	packer := rtp.NewAACPacker()

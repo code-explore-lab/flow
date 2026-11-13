@@ -36,6 +36,21 @@ type H264Source struct {
 
 	mu  sync.Mutex
 	cur *h264Run
+
+	// 文件模式的 seek 索引：第一次 SubscribeFrom 时扫描整个文件建一次。
+	// 只记录 IDR 的位置（连同它之前的 SPS/PPS），用来把 npt 时间近似成
+	// 帧序号后定位到最近的前置关键帧。实时源没有索引。
+	indexOnce  sync.Once
+	seekPoints []h264SeekPoint
+	indexErr   error
+}
+
+// h264SeekPoint 文件里一个可跳转的 IDR 位置。
+type h264SeekPoint struct {
+	offset   int    // IDR 起始码在文件内的字节偏移
+	frameIdx int    // 第几个 VCL 帧（从 0 数）
+	ts       uint32 // 该帧的 RTP 时间戳（frameIdx * 3600）
+	sps, pps []byte // 该 IDR 之前最近的参数集
 }
 
 // h264Run 一次「从文件头念到尾」的运行实例。
@@ -88,6 +103,163 @@ func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
 	rd := run.ring.Subscribe(preload...)
 	s.mu.Unlock()
 	return rd, rd.Close
+}
+
+// SubscribeFrom 从 start 附近最近的前置 IDR 开始播放，返回独立的 Reader。
+// 只有文件模式支持；实时流返回错误。
+//
+// 与 Subscribe 不同，seek 不能复用共享 ring buffer（它只追加、不能回退），
+// 所以这里为这次播放单独开一个 run：从 IDR 的字节偏移重新读文件，
+// 时间戳从该帧的档位时间开始，多个客户端互不影响。
+func (s *H264Source) SubscribeFrom(start time.Duration) (*Reader[Frame], func(), error) {
+	if s.reader != nil {
+		return nil, nil, fmt.Errorf("h264 source: live stream is not seekable")
+	}
+	if err := s.buildSeekIndex(); err != nil {
+		return nil, nil, err
+	}
+
+	sp, ok := s.seekPointAt(start)
+	if !ok {
+		// 整个文件没有 IDR：退回从头播，客户端至少还能收到参数集。
+		rd, cancel := s.Subscribe()
+		return rd, cancel, nil
+	}
+
+	ring := NewRingBuffer[Frame](videoRingCapacity)
+	rd := ring.Subscribe()
+	done := make(chan struct{})
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			close(done)
+			ring.Close()
+		})
+		rd.Close()
+	}
+	go s.runFrom(ring, done, sp)
+	return rd, cancel, nil
+}
+
+// buildSeekIndex 扫描整个文件，记录每个 IDR 的字节偏移、帧序号和参数集。
+// 结果用 sync.Once 缓存；实时源不应调用。
+func (s *H264Source) buildSeekIndex() error {
+	s.indexOnce.Do(func() {
+		demux, err := media.NewH264Demux(s.path)
+		if err != nil {
+			s.indexErr = fmt.Errorf("h264 source: seek index: %w", err)
+			return
+		}
+		var lastSPS, lastPPS []byte
+		frameIdx := 0
+		for {
+			nalu, off, err := demux.NextNALUWithOffset()
+			if err != nil {
+				if err != io.EOF {
+					s.indexErr = fmt.Errorf("h264 source: seek index: %w", err)
+				}
+				return
+			}
+			typ, err := media.NALType(nalu)
+			if err != nil {
+				continue
+			}
+			switch typ {
+			case rtp.NALUTypeSPS:
+				lastSPS = append([]byte(nil), nalu...)
+			case rtp.NALUTypePPS:
+				lastPPS = append([]byte(nil), nalu...)
+			}
+			if typ < rtp.NALUTypeNonIDR || typ > rtp.NALUTypeIDR {
+				continue
+			}
+			if typ == rtp.NALUTypeIDR {
+				s.seekPoints = append(s.seekPoints, h264SeekPoint{
+					offset:   off,
+					frameIdx: frameIdx,
+					ts:       uint32(frameIdx) * videoTimestampStep,
+					sps:      lastSPS,
+					pps:      lastPPS,
+				})
+			}
+			frameIdx++
+		}
+	})
+	return s.indexErr
+}
+
+// seekPointAt 把 npt 起点近似成帧序号（25fps），再选不超过它的最后一个 IDR。
+// 目标早于第一个 IDR 时从第一个 IDR 开始；没有 IDR 时 ok=false。
+func (s *H264Source) seekPointAt(start time.Duration) (h264SeekPoint, bool) {
+	if len(s.seekPoints) == 0 {
+		return h264SeekPoint{}, false
+	}
+	target := int(start / videoFrameInterval)
+	chosen := s.seekPoints[0]
+	for _, sp := range s.seekPoints {
+		if sp.frameIdx > target {
+			break
+		}
+		chosen = sp
+	}
+	return chosen, true
+}
+
+// runFrom 是一次 seek 播放的源 goroutine：从 IDR 偏移开始读文件，
+// 先补该 IDR 之前的 SPS/PPS，再按 25fps 节奏发帧。
+// 时间戳从 sp.ts 起，与文件时间轴一致（npt = ts / 90000）。
+func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h264SeekPoint) {
+	defer ring.Close()
+
+	demux, err := media.NewH264DemuxAt(s.path, sp.offset)
+	if err != nil {
+		fmt.Printf("h264 source: seek open %s@%d: %v\n", s.path, sp.offset, err)
+		return
+	}
+	fmt.Printf("h264 seek source: start at frame %d (ts=%d, offset=%d)\n",
+		sp.frameIdx, sp.ts, sp.offset)
+
+	if len(sp.sps) > 0 {
+		ring.Write(Frame{Data: sp.sps, Timestamp: sp.ts})
+	}
+	if len(sp.pps) > 0 {
+		ring.Write(Frame{Data: sp.pps, Timestamp: sp.ts})
+	}
+
+	ticker := time.NewTicker(videoFrameInterval)
+	defer ticker.Stop()
+
+	ts := sp.ts
+	firstVCL := true
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		nalu, err := demux.NextNALU()
+		if err != nil {
+			fmt.Printf("h264 seek source: %v\n", err)
+			return
+		}
+		typ, err := media.NALType(nalu)
+		if err != nil {
+			continue
+		}
+		isVCL := typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR
+		if isVCL && !firstVCL {
+			select {
+			case <-ticker.C:
+			case <-done:
+				return
+			}
+		}
+		ring.Write(Frame{Data: nalu, Timestamp: ts, Keyframe: typ == rtp.NALUTypeIDR})
+		if isVCL {
+			ts += videoTimestampStep
+			firstVCL = false
+		}
+	}
 }
 
 // SPSPPSBase64 返回已缓存参数集的 "base64(SPS),base64(PPS)"，供 SDP 的

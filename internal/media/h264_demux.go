@@ -30,22 +30,47 @@ func NewH264Demux(filePath string) (*H264Demux, error) {
 	}, nil
 }
 
+// NewH264DemuxAt 与 NewH264Demux 相同，但从文件内的字节偏移 off 开始解。
+// off 必须指向一个起始码（seek 索引里记录的就是这个位置），否则会从
+// off 之后找到的第一个起始码开始。
+func NewH264DemuxAt(filePath string, off int) (*H264Demux, error) {
+	d, err := NewH264Demux(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if off < 0 {
+		off = 0
+	}
+	if off > len(d.buf) {
+		off = len(d.buf)
+	}
+	d.off = off
+	return d, nil
+}
+
 // NextNALU 读取下一个NALU
 func (d *H264Demux) NextNALU() ([]byte, error) {
+	nalu, _, err := d.NextNALUWithOffset()
+	return nalu, err
+}
+
+// NextNALUWithOffset 读取下一个 NALU，同时返回它的起始码在文件里的偏移。
+// 文件模式的 seek 用它建「帧序号 → 字节偏移」索引。
+func (d *H264Demux) NextNALUWithOffset() ([]byte, int, error) {
 	n := len(d.buf)
 	if d.off >= n {
-		return nil, io.EOF
+		return nil, 0, io.EOF
 	}
 	startPos := d.findStartCode(d.off)
 	if startPos == -1 {
-		return nil, io.EOF
+		return nil, 0, io.EOF
 	}
 	// skip code, find NALU data start address
 	nalStart := d.skipStartCode(startPos)
 	if nalStart == -1 {
 		// 以后一下递归调用
 		d.off = startPos + 1
-		return d.NextNALU()
+		return d.NextNALUWithOffset()
 	}
 	// find startCode, as NALU end edge
 	nextStart := d.findStartCode(nalStart)
@@ -59,9 +84,9 @@ func (d *H264Demux) NextNALU() ([]byte, error) {
 		d.off = nextStart
 	}
 	if len(nalu) == 0 {
-		return d.NextNALU()
+		return d.NextNALUWithOffset()
 	}
-	return nalu, nil
+	return nalu, startPos, nil
 }
 
 // 00 00 01

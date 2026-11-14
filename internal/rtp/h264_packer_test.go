@@ -342,3 +342,104 @@ func TestPackFrameSkipsEmptyNALU(t *testing.T) {
 		t.Fatalf("STAP-A contains %d NALUs, want 2", len(got))
 	}
 }
+
+// TestPackFUAExactDivision 分片数据正好整除每片容量时，不能多出空尾片。
+func TestPackFUAExactDivision(t *testing.T) {
+	p := NewH264Packer(5) // FU-A 每片最多 3 字节数据
+	data6 := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
+	nalu6 := append([]byte{0x65}, data6...)
+
+	pkts, err := p.Pack(nalu6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkts) != 2 {
+		t.Fatalf("6 data bytes should split into 2 fragments, got %d", len(pkts))
+	}
+	checkPackets(t, pkts, p.MTU, len(nalu6))
+	if got := reassemblePack(t, pkts); !bytes.Equal(got, nalu6) {
+		t.Fatalf("reassembled % x, want % x", got, nalu6)
+	}
+
+	// 多 1 字节才需要第 3 片，且尾片带 marker。
+	nalu7 := append([]byte{0x65}, append(data6, 0x11)...)
+	pkts, err = p.Pack(nalu7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkts) != 3 {
+		t.Fatalf("7 data bytes should split into 3 fragments, got %d", len(pkts))
+	}
+	checkPackets(t, pkts, p.MTU, len(nalu7))
+	if got := reassemblePack(t, pkts); !bytes.Equal(got, nalu7) {
+		t.Fatalf("reassembled % x, want % x", got, nalu7)
+	}
+}
+
+// TestPackTinyMTU 极小 MTU 下要么正常产出合法包，要么返回错误，
+// 不能 panic 或死循环。
+func TestPackTinyMTU(t *testing.T) {
+	cases := []struct {
+		name     string
+		mtu      int
+		naluLen  int
+		wantPkts int
+		wantErr  bool
+	}{
+		{"mtu1-single", 1, 1, 1, false},
+		{"mtu1-too-big", 1, 2, 0, true},
+		{"mtu2-single", 2, 2, 1, false},
+		{"mtu2-too-big", 2, 3, 0, true},
+		{"mtu3-single", 3, 3, 1, false},
+		{"mtu3-maxdata1", 3, 4, 3, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewH264Packer(tc.mtu)
+			nalu := bytes.Repeat([]byte{0x41}, tc.naluLen)
+			pkts, err := p.Pack(nalu)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("mtu=%d nalu=%d: want error, got %d packets", tc.mtu, tc.naluLen, len(pkts))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("mtu=%d nalu=%d: %v", tc.mtu, tc.naluLen, err)
+			}
+			if len(pkts) != tc.wantPkts {
+				t.Fatalf("mtu=%d nalu=%d: got %d packets, want %d",
+					tc.mtu, tc.naluLen, len(pkts), tc.wantPkts)
+			}
+			checkPackets(t, pkts, tc.mtu, tc.naluLen)
+			if got := reassemblePack(t, pkts); !bytes.Equal(got, nalu) {
+				t.Fatalf("reassembled % x, want % x", got, nalu)
+			}
+		})
+	}
+}
+
+// TestPackFrameTinyMTU MTU 小到无法分片时 PackFrame 返回错误；
+// 单字节 NALU 仍能各自成包。
+func TestPackFrameTinyMTU(t *testing.T) {
+	p := NewH264Packer(2)
+	big := make([]byte, 10)
+	big[0] = 0x65
+	if _, err := p.PackFrame([][]byte{big}); err == nil {
+		t.Fatal("PackFrame with mtu=2 and a 10-byte NALU should error")
+	}
+
+	pkts, err := p.PackFrame([][]byte{{0x41}, {0x41}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkts) != 2 {
+		t.Fatalf("want 2 packets, got %d", len(pkts))
+	}
+	for i, pkt := range pkts {
+		if len(pkt.Payload) != 1 {
+			t.Fatalf("packet %d payload = %d bytes, want 1", i, len(pkt.Payload))
+		}
+	}
+	checkPackets(t, pkts, p.MTU, 2)
+}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"flow/internal/rtp"
+	"flow/internal/rtpbuf"
 	"flow/internal/session"
 )
 
@@ -190,6 +191,12 @@ func TestHandleInterleavedRoutesPushRTP(t *testing.T) {
 	}
 	callAndRead(t, func() error { return s.handleSetup(conn, req, hd) }, finish)
 	track := sess.Data.(*Session).track("video")
+	// 本用例验证通道路由，不做重排/延迟；关闭 playout 延迟让统计同步更新。
+	rx, err := track.ensurePushReceiver()
+	if err != nil {
+		t.Fatalf("ensurePushReceiver: %v", err)
+	}
+	rx.jbuf = rtpbuf.New(0)
 
 	header := rtp.RTPHeader{Version: 2, PT: 96, Seq: 100, Timestamp: 9000, SSRC: 0xaabbccdd, Marker: true}
 	pkt, err := header.Marshal([]byte{0x41, 0x9a, 0x00})

@@ -200,19 +200,33 @@
   - 发送路径（seq/timestamp/SSRC/`recordSent`/R-1 发送缓存）统一走 `sendFrame`，STAP-A 包同样可被 NACK 重传；
   - 验收：`internal/rtp/h264_packer_test.go` 覆盖聚合、NRI、MTU 边界、放不下退回单包、大 NALU 回退 FU-A、marker、空 NALU；`internal/rtsp/stap_test.go` 验证 PLAY 侧聚合、不跨帧、marker 只在尾包；裸 RTSP 探针首包为 `nal=24`，STAP-A 内为 SEI(6)/SPS(7)/PPS(8)；`ffprobe`/`ffmpeg -t 3` exit 0，`Scale: 2.0` 回归 2.00x；`go test -race` 通过。
   - 说明：聚合按 RTP 时间戳判定同一访问单元；源的每个 NALU 仍单独入 ring buffer，未改动 Frame 语义。
-- [ ] **R-3 分片边界测试**
-  - 覆盖 NALU 大小正好等于/略超 MTU、空 NALU、多片 FU-A、marker 只在尾包；
-  - 加 fuzz 测试，禁止越界和死循环；
-  - 验收：`go test -race` 稳定通过。
-- [ ] **R-4 接收侧 jitter buffer**
-  - 新增 `internal/rtpbuf`：按 seq 重排、固定 playout 延迟、重复包丢弃、缺口超时跳过；
-  - 验收：单测乱序、重复、长缺口、延迟抖动。
-- [ ] **R-5 丢包隐藏（PLC）**
-  - 视频缺帧时重复上一帧或请求关键帧；音频缺包时静音填充；
-  - 验收：模拟 5% 丢包，播放不断流、无明显卡死。
-- [ ] **R-6 接收侧缺口检测 → 生成 NACK**
-  - jitter buffer 发现 seq 缺口时发送 `PT=205, FMT=1`（PID/BLP），超时未补齐则放弃；
-  - 验收：模拟丢包，抓包看到 NACK，重传到达后按序播放。
+- [x] **R-3 分片边界测试**
+  - `internal/rtp/h264_packer_test.go` 补齐确定性边界：`TestPackFUAExactDivision`（数据正好整除以每片容量时不多出空尾片，多 1 字节才加片）、`TestPackTinyMTU`（MTU=1/2/3 的表驱动用例，要么合法产出要么报错）、`TestPackFrameTinyMTU`（极小 MTU 下聚合回退后仍能报错/单字节 NALU 正常成包）；原有 MTU/MTU+1、空 NALU、多片 FU-A、marker 用例保留；
+  - 新增 `internal/rtp/packer_fuzz_test.go`：`FuzzPack` 与 `FuzzPackFrame`，共同校验载荷不超过 MTU、Version/PT、marker 有且仅在尾包、包数有上界（防死循环式产出），并分别用 `reassemblePack` 还原单 NALU、用 `flattenPackets` 还原 STAP-A/FU-A 后的 NALU 列表；fuzz 输入的 NALU 首字节规范成 type 1，避免随机类型与测试侧解析歧义；
+  - 验收：`go test -race ./internal/rtp/ ./internal/rtsp/` 稳定通过；`FuzzPack` 约 247 万次、`FuzzPackFrame` 约 72 万次执行无崩溃/越界；`-race` 下 fuzz 短跑 6.5 万次通过；fuzz 未发现需要修改生产代码的问题。
+- [x] **R-4 接收侧 jitter buffer**
+  - 新增 `internal/rtpbuf/buffer.go`：`Buffer.Push(seq, ts, payload, now)` 拷贝载荷入队，`Pop(now)` 按 seq 顺序返回已到期的包；seq 用 `int16(seq - highestSeq)` 扩展成 64 位，65535→0 回绕不影响排序，向后超过 32767 或超出容量窗口的跳变丢弃；
+  - playout 延迟固定为 `arrival + delay`；第一个包输出前 `next` 跟随队列最小 seq，避免先到的乱序包把后到的更小 seq 误判为过期；开始输出（或跳过缺口）后游标固定，重复包、已播放包、迟到补缺口包全部拒绝；
+  - 缺口处理：`next` 缺失时，等缺口之后最早的包也满一个 delay 就跳过缺口继续输出，不会无限等待；容量满时淘汰最小 seq；内部互斥锁保证接收 goroutine 与播放/NACK goroutine 并发安全；时间全部由调用方传入，单测不 sleep；
+  - 目前仅作为独立组件，尚未接入 `internal/rtsp/record.go` 的接收路径（留给 R-5/R-6）；
+  - 验收：`internal/rtpbuf/buffer_test.go` 覆盖延迟边界（差 1ms 不输出、到点输出）、乱序重排、输出前/后重复包、长缺口超时跳过与迟到包拒绝、缺口在超时前补齐、到达抖动保持顺序与时间戳、seq 回绕、容量淘汰、空缓冲、零延迟、默认参数回退、并发 Push/Pop 计数一致；`gofmt`/`go vet`/`go test ./...` 通过，`go test -race ./internal/rtpbuf/ ./internal/rtp/ ./internal/rtsp/` 通过。
+- [x] **R-5 丢包隐藏（PLC）**
+  - 新增 `internal/plc/`：`PLI()`/`ParsePLI()` 生成/解析 RTCP PSFB PLI（PT=206、FMT=1、12 字节）；`Video` 缓存最近一个完整 AU，`Conceal()` 在连续重复上限（`DefaultMaxRepeat=5`）内返回上一帧；`SilenceAU()` 提供 AAC-LC 单/立体声静音 AU（`01 18 20 07` / `21 10 04 60 8c 1c`），`AACLCChannels()` 从 AudioSpecificConfig 解析声道；`MissingAUs()` 按 1024 采样步长计算缺失 AU 数并封顶；
+  - `internal/rtsp/record.go` 视频改为按 AU 攒齐再发布（marker 或时间戳变化结算）：seq 缺口落在 AU 内、解包器丢弃不完整 FU-A、或 AU 首包前已有缺口时，整帧丢弃、用上一帧占住该时间戳，并按 500ms 限频向上游发 PLI 请求关键帧；完整 AU 才写入缓存作为后续重复源；
+  - 音频按时间戳缺口补 AAC-LC 静音 AU（每个 1024 采样），非 AAC-LC/未知声道不补，避免写入非法 AU；迟到/重复包按扩展时间戳差丢弃；
+  - 关键取舍：H.264 有 B 帧时 RTP 时间戳是 PTS，到达顺序不单调（编码顺序 I/P 先到、B 后到），因此 AU 边界只按“时间戳相等”分组、丢包只信 seq 缺口，不做基于时间戳步长的缺帧推断；否则正常流会被误判为缺帧并丢弃 B 帧。SSRC 变化时清空半成品和 PLC 缓存；
+  - 验收：单测覆盖 PLI 往返/截断、静音 AU 与声道解析、缺失 AU 计算与封顶、重复上限/深拷贝/Reset，以及推流路径的损坏 AU 隐藏、PLI 限频、B 帧乱序时间戳不触发 PLC、视频/音频各 100 个 AU 每 20 包丢 1 包的 5% 丢包时间轴连续性；
+  - 真实 e2e：`testdata/with_audio.mp4`（10s，含 B 帧）经 TCP 代理每 20 个 RTP 包丢 1 个（实测 509 包丢 25，约 4.9%），推流 10s、拉流 `ffmpeg -t 3 -f null -` exit 0 不断流；服务端 video packets=349 gaps=19 → plc_drop=19/repeat=19/PLI=11，audio packets=135 gaps=6 → silence=12；无丢包对照 gaps=0、plc_repeat=0、PLI=0；解码器对丢弃参考帧有 `Missing reference picture` 告警属预期，后续帧继续解码；
+  - `gofmt -l .`/`go vet ./...`/`go test ./...` 通过，`go test -race ./internal/plc/ ./internal/rtsp/` 通过。
+- [x] **R-6 接收侧缺口检测 → 生成 NACK**
+  - 新增 `internal/rtcp/nack.go`：`NACK()`/`ParseNACK()` 生成/解析 RTCP Generic NACK（PT=205、FMT=1、12 字节头 + 4 字节 FCI）；seq 去重排序后用 PID/BLP 合并（BLP 第 i 位表示 PID+i+1 也缺失），处理 65535→0 回绕，单包最多 16 个 FCI；
+  - 新增 `internal/rtcp/nack_tracker.go`：`Observe(seq)` 用带符号差值跟踪 `highest`，只在向前跳变时登记缺口；乱序/重传到达的包（差值 < 0）从缺口集合删除，SSRC 变化清空重来；`Pending(now)` 先过宽限期（`DefaultNACKDelay=20ms`，避免把乱序当丢包），再按全局最小间隔（20ms）限速，每个 seq 最多请求 3 次，超限直接放弃，单包最多 32 个 seq，最多跟踪 256 个缺口；
+  - `internal/rtsp/record.go` 接入：`handlePushedRTP` 先 `Observe`，再入 jitter buffer，然后立即 `sendNACK`；NACK 走 `track.writeRTCP`（TCP 交织 channel 或 UDP `client_port+1`），媒体 SSRC 取推流端 SSRC、发送 SSRC 取本端；
+  - 定时器：`scheduleDrainLocked` 为每轨维护一个 `time.AfterFunc`，唤醒时间取 `min(jitter buffer 到期, NACK 宽限期)`；出现待重传缺口时把定时器提前，保证 NACK 在 jitter buffer 跳过缺口之前发出；`drainAt`/`drainGen` 代次号防止 `Stop` 失败后旧回调清掉新定时器；缓冲为空但仍有待重传 seq 时也会继续调度；
+  - `internal/rtpbuf/buffer.go` 补充 `Delay()`、`Drain()`、`Reset()`：`Drain` 按扩展 seq 顺序取走全部包并复位，用于接收端关闭时把尾部数据按序冲刷出去；
+  - 验收：单测覆盖 NACK 往返、BLP 合并、回绕、非法包拒绝、FCI 上限，以及 tracker 的缺口登记、宽限期、乱序不误报、重传取消、限速与 3 次放弃、SSRC 切换、重复包/缺口上限、单包条数上限；`TestPushNACKRetransmitKeepsOrder` 丢 1 个包后读到含该 seq 的 NACK，注入重传包后 AU 按 `0x0A,0x0B,0x0C` 顺序恢复，`plc_drop=0`；
+  - 真实 e2e：本地代理缓存转发的 RTP 并按 `PT=205/FMT=1` 的 PID/BLP 回灌原包；`testdata/with_audio.mp4` 每 20 包丢 1 包（509 包丢 25），服务端发出 25 个 NACK（video 20、audio 5），代理全部命中缓存重传 25 次；最终 video `packets=364 gaps=0 plc_drop=0 plc_repeat=0 pli=0`、audio `packets=137 gaps=0`，拉流 `ffmpeg -t 3 -f null -` exit 0，重传后无缺口、按序播放；
+  - `gofmt -l .`/`go vet ./...`/`go test ./...` 通过，`go test -race ./internal/rtcp/ ./internal/rtpbuf/ ./internal/rtsp/` 通过。
 - [ ] **R-7 解析客户端 NACK 并重传**
   - 解析 `PT=205, FMT=1`（RTPFB/NACK）的 PID/BLP；
   - 从 R-1 缓存重发原包（同 seq）；限制重传速率防放大；

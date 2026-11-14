@@ -11,7 +11,7 @@ const (
 	NALUTypeIDR    = 5  // IDR图像slice（IDR帧，特殊I帧，解码时清空参考帧）
 	NALUTypeSPS    = 7  // 序列参数集
 	NALUTypePPS    = 8  // 图像参数集
-	NALUTypeSTAPA  = 24 // STAP-A 聚合RTP包（本阶段不用）
+	NALUTypeSTAPA  = 24 // STAP-A 聚合RTP包（PackFrame 使用）
 	NALUTypeFUA    = 28 // FU-A RTP分片单元
 )
 
@@ -52,6 +52,109 @@ func (p *H264Packer) Pack(nalu []byte) ([]*RTPPacket, error) {
 
 	// FU-A 分片
 	return p.packFUA(nalu)
+}
+
+// PackFrame 把一个访问单元（同一 RTP 时间戳）里的多个 NALU 封装成 RTP 包。
+//
+// 相邻的小 NALU 会贪心聚合成 STAP-A（RFC 6184 §5.7.1），前提是整个
+// STAP-A 载荷不超过 MTU；放不下的批次先 flush，单个 NALU 继续走
+// Pack 的单包 / FU-A 逻辑。所以 SPS+PPS+大 IDR 会输出
+// STAP-A(SPS,PPS) + FU-A(IDR)，而不是把参数集拆成两个单包。
+//
+// 返回包的 Marker 只在整帧最后一个包上置位；STAP-A 头里的 NRI 取
+// 所有被聚合 NALU 的最大值。
+func (p *H264Packer) PackFrame(nalus [][]byte) ([]*RTPPacket, error) {
+	if p.MTU <= 0 {
+		p.MTU = 1400
+	}
+	if p.PT == 0 {
+		p.PT = 96
+	}
+
+	var (
+		pkts  []*RTPPacket
+		batch [][]byte // 待聚合的同一批次 NALU
+		size  = 1      // STAP-A 头（1 字节）
+	)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if len(batch) == 1 {
+			ps, err := p.Pack(batch[0])
+			if err != nil {
+				return err
+			}
+			pkts = append(pkts, ps...)
+		} else {
+			pkts = append(pkts, newPacket(p.PT, packSTAPA(batch), true))
+		}
+		batch = nil
+		size = 1
+		return nil
+	}
+
+	sawNALU := false
+	for _, nalu := range nalus {
+		if len(nalu) == 0 {
+			continue
+		}
+		sawNALU = true
+		// 单个 NALU 连 STAP-A 头 + 长度字段都放不下：先结算当前批次，
+		// 再按单 NALU / FU-A 发。
+		if 1+2+len(nalu) > p.MTU {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			ps, err := p.Pack(nalu)
+			if err != nil {
+				return nil, err
+			}
+			pkts = append(pkts, ps...)
+			continue
+		}
+		if len(batch) > 0 && size+2+len(nalu) > p.MTU {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		batch = append(batch, nalu)
+		size += 2 + len(nalu)
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	if !sawNALU {
+		return nil, errors.New("empty nalu")
+	}
+
+	// 整帧只有一个 marker：封包器内部每个 NALU 的尾包都会置 marker，
+	// 聚合后必须收回到最后一个包。
+	for i, pkt := range pkts {
+		pkt.Header.Marker = i == len(pkts)-1
+	}
+	return pkts, nil
+}
+
+// packSTAPA 按 RFC 6184 §5.7.1 组装 STAP-A 载荷：
+//
+//	STAP-A header | 2B len + NALU | 2B len + NALU ...
+//
+// header 的 NRI 取所有 NALU 的最大 NRI，F 置 0。
+func packSTAPA(nalus [][]byte) []byte {
+	nri := byte(0)
+	total := 1
+	for _, nalu := range nalus {
+		nri = max(nri, nalu[0]&0x60)
+		total += 2 + len(nalu)
+	}
+	buf := make([]byte, 1, total)
+	buf[0] = nri | NALUTypeSTAPA
+	for _, nalu := range nalus {
+		buf = append(buf, byte(len(nalu)>>8), byte(len(nalu)))
+		buf = append(buf, nalu...)
+	}
+	return buf
 }
 
 // packFUA 按 RFC 6184 把大 NALU 拆成多个 FU-A 包。

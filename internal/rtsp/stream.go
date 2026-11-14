@@ -78,27 +78,23 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 	var dropped uint64
 	// SSRC 和 seq 从 track 取，跨 PAUSE/PLAY 连续。
 	ssrc := track.ensureSSRC()
-	for {
-		f, ok := reader.Next(done)
-		if !ok {
-			if isDone(done) {
-				fmt.Println("video stream stopped")
-				return false
-			}
-			fmt.Println("video source ended")
-			return true
-		}
-		if d := reader.Dropped(); d != dropped {
-			fmt.Printf("video stream: dropped %d old frames (slow consumer)\n", d-dropped)
-			dropped = d
-		}
-		pkts, err := packer.Pack(f.Data)
+
+	// R-2：同一帧（时间戳相同）的 NALU 先攒在一起再封包，SPS/PPS 这类
+	// 小 NALU 就能和同帧数据一起进 STAP-A。批次在时间戳变化、超过 MTU
+	// 或流结束时结算，不跨帧聚合。
+	var (
+		pending     [][]byte
+		pendingTS   uint32
+		pendingSize int // 1 字节 STAP-A 头 + 每个 NALU 的 2 字节长度
+	)
+	sendFrame := func(nalus [][]byte, ts uint32) bool {
+		pkts, err := packer.PackFrame(nalus)
 		if err != nil {
-			continue
+			return true
 		}
 		for _, p := range pkts {
 			p.Header.Seq = uint16(track.nextSeq())
-			p.Header.Timestamp = f.Timestamp
+			p.Header.Timestamp = ts
 			p.Header.SSRC = ssrc
 			data, err := p.Header.Marshal(p.Payload)
 			if err != nil {
@@ -112,6 +108,72 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
 			// 保留最近的包，NACK 重传（R-7）按 seq 取回。
 			track.cacheSent(p.Header.Seq, data)
+		}
+		return true
+	}
+	flush := func() bool {
+		if len(pending) == 0 {
+			return true
+		}
+		ok := sendFrame(pending, pendingTS)
+		pending, pendingSize = nil, 0
+		return ok
+	}
+
+	for {
+		f, ok := reader.Next(done)
+		if !ok {
+			if isDone(done) {
+				fmt.Println("video stream stopped")
+				return false
+			}
+			if !flush() {
+				return false
+			}
+			fmt.Println("video source ended")
+			return true
+		}
+		if d := reader.Dropped(); d != dropped {
+			fmt.Printf("video stream: dropped %d old frames (slow consumer)\n", d-dropped)
+			dropped = d
+		}
+		if len(f.Data) == 0 {
+			continue
+		}
+
+		typ := f.Data[0] & 0x1F
+		isVCL := typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR
+		if !isVCL {
+			// 先攒着等同一帧的 slice；时间戳变了或批次放不下就立即发出。
+			if len(pending) > 0 && (f.Timestamp != pendingTS || pendingSize+2+len(f.Data) > packer.MTU) {
+				if !flush() {
+					return false
+				}
+			}
+			if len(pending) == 0 {
+				pendingTS = f.Timestamp
+				pendingSize = 1
+			}
+			pending = append(pending, f.Data)
+			pendingSize += 2 + len(f.Data)
+			continue
+		}
+
+		if len(pending) > 0 && f.Timestamp == pendingTS {
+			batch := append(pending, f.Data)
+			ts := pendingTS
+			pending, pendingSize = nil, 0
+			if !sendFrame(batch, ts) {
+				return false
+			}
+			continue
+		}
+		// 时间戳不同：pending 属于前一帧，先单独结算，当前 slice 再单独发。
+		if !flush() {
+			return false
+		}
+		if !sendFrame([][]byte{f.Data}, f.Timestamp) {
+			return false
 		}
 	}
 }

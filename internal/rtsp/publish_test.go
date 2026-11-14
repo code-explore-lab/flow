@@ -210,25 +210,38 @@ func TestStreamH264ForwardsPublishedFrames(t *testing.T) {
 	br := bufio.NewReader(clientConn)
 	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-	got := make([][]byte, 0, len(nalus))
-	for i := 0; i < 3; i++ {
-		got = append(got, readInterleavedPayload(t, br, 0))
+	// 预写的 SPS/PPS/IDR 时间戳相同（都是 0），聚合成一个 STAP-A。
+	pkt, err := rtp.Parse(readInterleavedPayload(t, br, 0))
+	if err != nil {
+		t.Fatalf("parse STAP-A: %v", err)
 	}
-	// 订阅已经建立，再写实时帧，验证它不会被漏掉。
-	src.Write(source.Frame{Data: nalus[3], Timestamp: 3600})
-	got = append(got, readInterleavedPayload(t, br, 0))
+	if pkt.Header.PT != 96 {
+		t.Fatalf("PT = %d, want 96", pkt.Header.PT)
+	}
+	if got := pkt.Payload[0] & 0x1F; got != rtp.NALUTypeSTAPA {
+		t.Fatalf("payload type = %d, want STAP-A(24)", got)
+	}
+	params := parseSTAPANALUs(t, pkt.Payload)
+	if len(params) != 3 {
+		t.Fatalf("STAP-A contains %d NALUs, want 3", len(params))
+	}
+	for i, want := range nalus[:3] {
+		if !bytes.Equal(params[i], want) {
+			t.Fatalf("NALU %d = % x, want % x", i, params[i], want)
+		}
+	}
 
-	for i, raw := range got {
-		pkt, err := rtp.Parse(raw)
-		if err != nil {
-			t.Fatalf("frame %d: parse RTP: %v", i, err)
-		}
-		if pkt.Header.PT != 96 {
-			t.Fatalf("frame %d: PT = %d, want 96", i, pkt.Header.PT)
-		}
-		if !bytes.Equal(pkt.Payload, nalus[i]) {
-			t.Fatalf("frame %d: payload = % x, want % x", i, pkt.Payload, nalus[i])
-		}
+	// 订阅已经建立，再写实时帧（时间戳不同），验证它不会被漏掉。
+	src.Write(source.Frame{Data: nalus[3], Timestamp: 3600})
+	pkt, err = rtp.Parse(readInterleavedPayload(t, br, 0))
+	if err != nil {
+		t.Fatalf("parse live frame: %v", err)
+	}
+	if pkt.Header.PT != 96 {
+		t.Fatalf("live frame PT = %d, want 96", pkt.Header.PT)
+	}
+	if !bytes.Equal(pkt.Payload, nalus[3]) {
+		t.Fatalf("live frame payload = % x, want % x", pkt.Payload, nalus[3])
 	}
 }
 

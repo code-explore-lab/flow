@@ -194,10 +194,12 @@
   - `mediaTrack` 增加 `sendCache`，SETUP 时只为单播拉流轨创建（推流轨只收不发、组播轨没有按客户端重传语义，保持 nil）；`streamH264`/`streamAAC` 在 `writeRTP` 成功后调用 `cacheSent`，只缓存成功发送的包；`cachedPacket(seq)` 供 R-7 取包重传；
   - 验收：`internal/rtp/send_cache_test.go` 覆盖环形覆盖与淘汰顺序、字节预算、单包超预算、seq 回绕、重复 seq、空缓存、默认容量、并发 Add/Get（`go test -race` 通过）；`internal/rtsp/send_cache_test.go` 验证发送循环确实把包写入缓存；`ffprobe`/`ffmpeg` 与 `Scale: 2.0` 回归正常。
   - 说明：缓存只占内存、不改变线上行为；NACK 解析与限速重传在 R-7 实现。
-- [ ] **R-2 STAP-A 聚合**
-  - 把 SPS+PPS（以及能塞进 MTU 的小 NALU）聚合成一个 STAP-A；
-  - 不跨帧聚合，超过 MTU 退回单 NALU；
-  - 验收：ffplay/VLC 正常播放，Wireshark 看到 type=24。
+- [x] **R-2 STAP-A 聚合**
+  - `internal/rtp/h264_packer.go` 新增 `PackFrame(nalus [][]byte)`：同一帧的 NALU 贪心聚合成 STAP-A（1 字节头 + 每个 NALU 2 字节长度 + 数据），头里 NRI 取所有被聚合 NALU 的最大值；批次放不下时先 flush，单个大 NALU 继续走原来的 single/FU-A；返回包的 marker 只在整帧最后一个包上置位；
+  - `internal/rtsp/stream.go` 的 `streamH264` 把非 VCL NALU（SPS/PPS/SEI 等）按时间戳攒成 pending，遇到同时间戳的 slice 一起交给 `PackFrame`；时间戳变化、累计超过 MTU 或源结束时立即结算，保证不跨帧聚合；实际输出形如 `STAP-A(SEI,SPS,PPS)` + FU-A(IDR)；
+  - 发送路径（seq/timestamp/SSRC/`recordSent`/R-1 发送缓存）统一走 `sendFrame`，STAP-A 包同样可被 NACK 重传；
+  - 验收：`internal/rtp/h264_packer_test.go` 覆盖聚合、NRI、MTU 边界、放不下退回单包、大 NALU 回退 FU-A、marker、空 NALU；`internal/rtsp/stap_test.go` 验证 PLAY 侧聚合、不跨帧、marker 只在尾包；裸 RTSP 探针首包为 `nal=24`，STAP-A 内为 SEI(6)/SPS(7)/PPS(8)；`ffprobe`/`ffmpeg -t 3` exit 0，`Scale: 2.0` 回归 2.00x；`go test -race` 通过。
+  - 说明：聚合按 RTP 时间戳判定同一访问单元；源的每个 NALU 仍单独入 ring buffer，未改动 Frame 语义。
 - [ ] **R-3 分片边界测试**
   - 覆盖 NALU 大小正好等于/略超 MTU、空 NALU、多片 FU-A、marker 只在尾包；
   - 加 fuzz 测试，禁止越界和死循环；

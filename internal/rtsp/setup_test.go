@@ -2,11 +2,13 @@ package rtsp
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"flow/internal/rtcp"
 	"flow/internal/rtp"
 	"flow/internal/rtpbuf"
 	"flow/internal/session"
@@ -174,6 +176,154 @@ func TestSetupPushUDPReceivesRTP(t *testing.T) {
 	}
 
 	sess.Close() // 关 UDP socket，读 goroutine 退出
+}
+
+// TestSetupPushRTCPMuxSinglePort 覆盖 R-12：client_port=A-A 时只开一个
+// UDP 端口，响应里 server_port 也是 P-P，同一个端口能同时收 RTP 和 RTCP。
+func TestSetupPushRTCPMuxSinglePort(t *testing.T) {
+	s, conn, finish := newTestPipe(t)
+	sess := newPushSession(t, s, conn)
+	// net.Pipe 没有对端地址，补一个，模拟真实 RTSP 连接的客户端 IP。
+	sess.RemoteIP = "127.0.0.1"
+
+	// 客户端只绑一个 UDP 端口，既发 RTP/RTCP 也收服务端的 RTCP。
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen UDP: %v", err)
+	}
+	defer client.Close()
+	clientPort := client.LocalAddr().(*net.UDPAddr).Port
+
+	hd := map[string]string{"CSeq": "3"}
+	req := &Request{
+		Method: "SETUP",
+		URI:    "rtsp://127.0.0.1:8554/live/streamid=0",
+		Headers: map[string]string{
+			"Transport": fmt.Sprintf("RTP/AVP;unicast;client_port=%d-%d", clientPort, clientPort),
+			"Session":   sess.ID,
+		},
+	}
+	resp := callAndRead(t, func() error { return s.handleSetup(conn, req, hd) }, finish)
+	if !strings.HasPrefix(resp, "RTSP/1.0 200 OK\r\n") {
+		t.Fatalf("status = %q", firstLine(resp))
+	}
+
+	track := sess.Data.(*Session).track("video")
+	if track == nil || !track.rtcpMux {
+		t.Fatalf("track = %+v, want rtcpMux video track", track)
+	}
+	if track.rtpConn == nil || track.rtcpConn != nil {
+		t.Fatalf("rtcp-mux must use one socket: rtp=%v rtcp=%v", track.rtpConn, track.rtcpConn)
+	}
+	if track.serverRtpPort == 0 || track.serverRtpPort != track.serverRtcpPort {
+		t.Fatalf("server ports = %d-%d, want P-P", track.serverRtpPort, track.serverRtcpPort)
+	}
+	if track.clientAddr.Port != clientPort || track.clientRTCPAddr.Port != clientPort {
+		t.Fatalf("client ports = %d/%d, want %d/%d",
+			track.clientAddr.Port, track.clientRTCPAddr.Port, clientPort, clientPort)
+	}
+	wantTransport := fmt.Sprintf("client_port=%d-%d;server_port=%d-%d",
+		clientPort, clientPort, track.serverRtpPort, track.serverRtpPort)
+	if !strings.Contains(hd["Transport"], wantTransport) || !strings.Contains(hd["Transport"], "mode=record") {
+		t.Fatalf("Transport = %q, want %q + mode=record", hd["Transport"], wantTransport)
+	}
+
+	serverAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: track.serverRtpPort}
+
+	// 1) 同一端口上的 RTP 照常进入解包路径。
+	header := rtp.RTPHeader{Version: 2, PT: 96, Seq: 7, Timestamp: 3600, SSRC: 0x11223344}
+	pkt, err := header.Marshal([]byte{0x65, 0x01, 0x02, 0x03})
+	if err != nil {
+		t.Fatalf("marshal RTP: %v", err)
+	}
+	if _, err := client.WriteToUDP(pkt, serverAddr); err != nil {
+		t.Fatalf("send RTP: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var baseline uint64
+	for {
+		if packets, _, _, _, _ := track.recvSnapshot(); packets >= 1 {
+			baseline = packets
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server did not receive RTP on the muxed port")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 2) 同一端口上的 RTCP 不算 RTP：recvPackets 不变，会话活跃时间刷新。
+	before := sess.LastRTCP()
+	sr := rtcp.SenderReport{SSRC: 0xAABBCCDD, NTP: rtcp.NTPTime(time.Now())}.Marshal()
+	if _, err := client.WriteToUDP(sr, serverAddr); err != nil {
+		t.Fatalf("send RTCP: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if sess.LastRTCP().After(before) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("RTCP on muxed port did not refresh session activity")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if packets, _, _, _, _ := track.recvSnapshot(); packets != baseline {
+		t.Fatalf("RTCP was counted as RTP: packets %d -> %d", baseline, packets)
+	}
+
+	// 3) 服务端写 RTCP 也必须走同一个 UDP 端口，客户端才能在 A 上收到。
+	rr := []byte{0x80, 201, 0, 1, 0, 0, 0, 1}
+	if err := track.writeRTCP(rr); err != nil {
+		t.Fatalf("writeRTCP: %v", err)
+	}
+	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	buf := make([]byte, 64)
+	n, src, err := client.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read RTCP from muxed server port: %v", err)
+	}
+	if !bytes.Equal(buf[:n], rr) {
+		t.Fatalf("RTCP payload = %x, want %x", buf[:n], rr)
+	}
+	if src.Port != track.serverRtpPort {
+		t.Fatalf("RTCP source port = %d, want %d (shared socket)", src.Port, track.serverRtpPort)
+	}
+
+	sess.Close()
+}
+
+// TestSetupRTCPMuxTransportParam 覆盖显式 rtcp-mux 参数：即使客户端
+// 写了 A-B 两个端口，服务端也应回 A-A 并只开一个端口。
+func TestSetupRTCPMuxTransportParam(t *testing.T) {
+	s, conn, finish := newTestPipe(t)
+	sess := newPushSession(t, s, conn)
+
+	hd := map[string]string{"CSeq": "3"}
+	req := &Request{
+		Method: "SETUP",
+		URI:    "rtsp://127.0.0.1:8554/live/streamid=0",
+		Headers: map[string]string{
+			"Transport": "RTP/AVP;unicast;client_port=9200-9201;rtcp-mux",
+			"Session":   sess.ID,
+		},
+	}
+	resp := callAndRead(t, func() error { return s.handleSetup(conn, req, hd) }, finish)
+	if !strings.HasPrefix(resp, "RTSP/1.0 200 OK\r\n") {
+		t.Fatalf("status = %q", firstLine(resp))
+	}
+
+	track := sess.Data.(*Session).track("video")
+	if track == nil || !track.rtcpMux || track.rtcpConn != nil {
+		t.Fatalf("track = %+v, want single-socket rtcp mux", track)
+	}
+	if !strings.Contains(hd["Transport"], "client_port=9200-9200") {
+		t.Fatalf("Transport = %q, want client_port=9200-9200", hd["Transport"])
+	}
+
+	sess.Close()
 }
 
 func TestHandleInterleavedRoutesPushRTP(t *testing.T) {

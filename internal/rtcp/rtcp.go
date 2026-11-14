@@ -9,6 +9,12 @@ import (
 )
 
 const (
+	// 迷你 RTCP 类型范围：第二字节落在 [192,223] 时按 RTCP 处理。
+	// RFC 5761 §4 规定 mux 时 RTP payload type 不能用 64~95，
+	// 否则 marker 位置位后（PT+128）会落进这个区间。
+	minPacketType = 192
+	maxPacketType = 223
+
 	// SenderReportType 是 SR 的 packet type（RFC 3550 §6.4.1）。
 	SenderReportType = 200
 
@@ -88,4 +94,25 @@ func ParseSenderReport(b []byte) (SenderReport, bool) {
 		PacketCount: binary.BigEndian.Uint32(b[20:24]),
 		OctetCount:  binary.BigEndian.Uint32(b[24:28]),
 	}, true
+}
+
+// IsRTCP 判断一个 UDP 报文是不是 RTCP，用于 rtcp-mux 单端口下区分
+// RTP（RFC 3550 §5.1）和 RTCP（RFC 3550 §6.1、RFC 5761 §4）。
+//
+// 判定依据（按顺序）：
+//   - 版本必须是 2（RTP/RTCP 共用同一版本字段，所以版本本身无法区分）；
+//   - 第二字节是 RTCP packet type，取值 192~223；
+//   - length 字段（32 位字减一）至少覆盖 RTCP 固定头，且不超过实际报文长度。
+//
+// 复合 RTCP 包的第一条子包长度通常小于总长度，因此用 <= 而不是 ==。
+func IsRTCP(b []byte) bool {
+	if len(b) < 8 || b[0]>>6 != 2 {
+		return false
+	}
+	pt := b[1]
+	if pt < minPacketType || pt > maxPacketType {
+		return false
+	}
+	n := (int(binary.BigEndian.Uint16(b[2:4])) + 1) * 4
+	return n >= 8 && n <= len(b)
 }

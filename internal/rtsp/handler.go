@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"flow/internal/media"
+	"flow/internal/rtcp"
 	"flow/internal/rtp"
 	"flow/internal/session"
 	"flow/internal/stream"
@@ -218,12 +219,9 @@ func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
 		}
 	}
 
-	if len(payload) < 2 {
-		return
-	}
-	// RTCP 包类型在第二个字节（第一字节是 V/P/RC），200~204 是 SR/RR/SDES/BYE/APP。
-	pt := payload[1]
-	if pt < 200 || pt > 204 {
+	// RTCP 与 rtcp-mux 的 UDP 路径共用同一个判定：第二个字节落在 RTCP
+	// packet type 区间（含 SR/RR/SDES/BYE/APP、RTPFB/NACK、PSFB/PLI）。
+	if !rtcp.IsRTCP(payload) {
 		fmt.Printf("interleaved recv: channel=%d len=%d (not rtcp)\n", channel, len(payload))
 		return
 	}
@@ -233,10 +231,8 @@ func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
 			continue
 		}
 		st := sess.Data.(*Session)
-		if st.hasRTCPChannel(int(channel)) {
-			sess.TouchRTCP()
-			fmt.Printf("RTCP recv: channel=%d len=%d pt=%d (session=%s)\n",
-				channel, len(payload), pt, id)
+		if track, ok := st.trackByRTCPChannel(int(channel)); ok {
+			s.handleIncomingRTCP(track, sess, payload)
 		}
 	}
 }
@@ -276,7 +272,12 @@ func (s *Server) buildSDP(uri string) (string, error) {
 		}
 		sdp += "a=fmtp:96 packetization-mode=1; sprop-parameter-sets=" + spspps + "\r\n"
 	}
-	sdp += "a=control:trackID=0\r\n" + multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
+	// R-12：宣告 RTP/RTCP 单端口复用能力。实际是否启用由 SETUP 的
+	// Transport 决定；组播和 TCP interleaved 会忽略这个属性（RFC 5761
+	// 明确不允许组播使用 rtcp-mux）。
+	sdp += "a=control:trackID=0\r\n" +
+		"a=rtcp-mux\r\n" +
+		multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
 
 	if s.audio != nil {
 		aacInfo, err := media.GetAACInfo(s.audioPath)
@@ -284,7 +285,9 @@ func (s *Server) buildSDP(uri string) (string, error) {
 			return "", err
 		}
 		sdp += aacInfo.MediaDescription(media.AACPT) +
-			"a=control:trackID=1\r\n" + multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
+			"a=control:trackID=1\r\n" +
+			"a=rtcp-mux\r\n" +
+			multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
 	}
 	return sdp, nil
 }
@@ -519,6 +522,16 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		t.external = pubForTrack.SourceFor(kind)
 	}
 
+	// R-12：客户端用 client_port=A-A（或显式 rtcp-mux 参数）接受单端口复用。
+	// TCP interleaved / 组播不走 mux；PT 64~95 必须排除，否则 marker 置位后
+	// 第二字节会和 RTCP 类型区间重叠（RFC 5761 §4）。
+	rtcpMux := !isInter && !isMulticast &&
+		(hasRTCPMuxTransport(transReq) || clientPortsMuxed(clientPortStr))
+	if rtcpMux && payloadType >= 64 && payloadType <= 95 {
+		fmt.Printf("SETUP %s: payload type %d cannot use rtcp-mux (RFC 5761)\n", kind, payloadType)
+		rtcpMux = false
+	}
+
 	var respTransport string
 	if isInter {
 		// TCP interleaved 模式：不开任何 UDP 端口，只记录 channel 对。
@@ -551,6 +564,26 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		t.mcRTCPAddr = &net.UDPAddr{IP: groupIP, Port: rtcpPort}
 		respTransport = fmt.Sprintf("RTP/AVP;multicast;destination=%s;port=%d-%d;ttl=%d",
 			s.multicastAddr, rtpPort, rtcpPort, s.multicastTTL)
+	} else if rtcpMux {
+		// 单端口：RTP 和 RTCP 都从同一个 socket 收发。即使客户端写了
+		// client_port=A-B，也统一回 A-A，RTCP 目标与 RTP 相同。
+		udpConn, errUDP := openUDPPort()
+		if errUDP != nil {
+			return writeResponse(conn, "500 Internal Server Error", hd, nil)
+		}
+		cRtpPort, _ := parseClientPorts(clientPortStr)
+		t.rtpConn = udpConn
+		t.rtcpMux = true
+		t.rtcpConn = nil
+		t.clientAddr = &net.UDPAddr{IP: net.ParseIP(sess.RemoteIP), Port: cRtpPort}
+		t.clientRTCPAddr = t.clientAddr
+		t.serverRtpPort = udpConn.LocalAddr().(*net.UDPAddr).Port
+		t.serverRtcpPort = t.serverRtpPort
+		respTransport = fmt.Sprintf("RTP/AVP;unicast;client_port=%d-%d;server_port=%d-%d",
+			cRtpPort, cRtpPort, t.serverRtpPort, t.serverRtpPort)
+		if push {
+			respTransport += ";mode=record"
+		}
 	} else {
 		rtpConn, rtcpConn, errUDP := openUDPPortPair()
 		if errUDP != nil {
@@ -568,18 +601,17 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		if push {
 			respTransport += ";mode=record"
 		}
-		// 收 RTCP：给会话打活跃点，超时回收靠它。
-		go func(kind string, rtcpConn *net.UDPConn, sess *session.Session) {
+		// 独立 RTCP 端口：给会话打活跃点，超时回收靠它。
+		go func(track *mediaTrack) {
 			buf := make([]byte, 2048)
 			for {
-				n, _, err := rtcpConn.ReadFromUDP(buf)
+				n, _, err := track.rtcpConn.ReadFromUDP(buf)
 				if err != nil {
 					return
 				}
-				sess.TouchRTCP()
-				fmt.Printf("RTCP recv %d bytes (%s, session=%s)\n", n, kind, sess.ID)
+				s.handleIncomingRTCP(track, sess, buf[:n])
 			}
-		}(kind, rtcpConn, sess)
+		}(t)
 	}
 
 	// R-1：单播拉流轨保留最近发送的 RTP 包，供 R-7 按 NACK 重传。
@@ -597,9 +629,14 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			old.rtcpConn.Close()
 		}
 	}
-	// 推流 UDP 模式：客户端把 RTP 发到 server_port，服务端必须有人读，
-	// 否则内核缓冲区满了以后丢包。TCP interleaved 由 handleConn 统一读。
-	if push && !isInter {
+	// UDP 收包：
+	//   - rtcp-mux：拉流/推流都只有一个 socket，由 serveUDPMux 按 PT 分派；
+	//   - 普通推流：客户端把 RTP 发到 server_port，必须有人读，否则内核
+	//     缓冲区满了以后丢包；
+	//   - TCP interleaved 由 handleConn 统一读，不在这里起 goroutine。
+	if rtcpMux {
+		go s.serveUDPMux(t, sess)
+	} else if push && !isInter {
 		go s.serveUDPRTP(t, sess)
 	}
 

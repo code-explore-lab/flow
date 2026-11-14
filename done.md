@@ -245,9 +245,15 @@
   - 发送 `transport-cc` 扩展头，解析 `PT=205, FMT=15` 反馈；
   - 做带宽估计与发送降级（丢非关键帧/降帧率），说明无编码器时的局限；
   - 验收：模拟带宽下降，发送速率随之下降。
-- [ ] **R-12 RTP/RTCP mux（RFC 5761）**
-  - SDP 增加 `a=rtcp-mux`，UDP 只开一个端口，按 PT 区分 RTP/RTCP；
-  - 验收：`ffplay -rtsp_transport udp` 正常；抓包只有一个 UDP 端口对。
+- [x] **R-12 RTP/RTCP mux（RFC 5761）**
+  - SDP 增加 `a=rtcp-mux`：本地文件/live 的 `buildSDP` 与推流 `publishedSDP` 的视频、音频段都宣告；
+  - `SETUP` 判定 mux：unicast 且（Transport 带 `rtcp-mux` 参数，或 `client_port=A-A`）；TCP interleaved 与组播不走 mux；payload type 64~95 按 RFC 5761 §4 拒绝 mux（marker 置位后第二字节会撞上 RTCP 类型区间）；
+  - mux 模式用 `openUDPPort` 只开一个 socket，响应回 `client_port=A-A;server_port=P-P`；`mediaTrack.rtcpMux` 标记后 `writeRTCP`（SR/PLI/NACK）全部走同一个 `rtpConn`；
+  - 收包由 `serveUDPMux` 单读协程处理：`rtcp.IsRTCP` 按第二字节 PT（192~223）分派，RTCP 交给 `handleIncomingRTCP`，推流 RTP 仍进 `handlePushedRTP`。一个 socket 只能有一个并发 `ReadFromUDP`，因此 mux 时不再启动独立 RTCP 读协程；
+  - `internal/rtcp.IsRTCP` 同时替换 TCP interleaved 原来的 200~204 判断，RTCP 类型范围扩到 192~223（含 SR/RR/SDES/BYE/APP、RTPFB/NACK、PSFB/PLI），校验 V=2 和 length 字段；三条传输路径的 RTCP 处理统一到 `handleIncomingRTCP`；
+  - 未协商 mux 的客户端（如 ffmpeg 8.0.1，SETUP 固定发 `client_port=X-X+1`）继续走原双端口路径，行为不变；
+  - 验收：单测覆盖 `client_port=A-A`、显式 `rtcp-mux`、单 socket 双向收发（客户端同一端口发 RTP/RTCP 给服务端，并收到服务端从 `server_port` 发回的 RTCP）、RTCP 不计入 RTP 统计、PT 冲突回退；e2e 用 `test.mp4` 循环推流 + 裸 RTSP 客户端 `client_port=31900-31900`，SETUP 回 `server_port=50000-50000`，7 秒内在同一 socket 收到 `rtp=294 rtcp=1`，不存在第二个 UDP 端口；`ffmpeg -rtsp_transport udp` 拉流 exit 0；
+  - `gofmt`/`go vet`/`go test ./...` 通过，`go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
 
 ---
 

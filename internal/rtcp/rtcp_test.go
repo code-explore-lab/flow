@@ -115,6 +115,43 @@ func TestParseSenderReportRejectsOtherPackets(t *testing.T) {
 	}
 }
 
+func TestIsRTCP(t *testing.T) {
+	// RTP：V=2，PT=96，marker 置位后第二字节 224，必须判成 RTP。
+	rtp := make([]byte, 12+4)
+	rtp[0] = 0x80
+	rtp[1] = 0x80 | 96
+	binary.BigEndian.PutUint16(rtp[2:4], 8)
+	binary.BigEndian.PutUint32(rtp[4:8], 1234)
+
+	sr := SenderReport{SSRC: 1, NTP: NTPTime(time.Unix(0, 0))}.Marshal()
+	rr := []byte{0x80, 201, 0, 1, 0, 0, 0, 1}
+	nack := NACK(1, 2, []uint16{7})
+	pli := []byte{0x80, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2}
+
+	cases := []struct {
+		name string
+		pkt  []byte
+		want bool
+	}{
+		{"RTP PT=96 with marker", rtp, false},
+		{"RTP PT=96 without marker", append([]byte{0x80, 96}, rtp[2:]...), false},
+		{"SR", sr, true},
+		{"RR", rr, true},
+		{"NACK RTPFB", nack, true},
+		{"PLI PSFB", pli, true},
+		{"truncated SR", sr[:7], false},
+		{"V=1", append([]byte{0x40}, sr[1:]...), false},
+		{"unknown PT 120", append([]byte{0x80, 120}, make([]byte, 10)...), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsRTCP(c.pkt); got != c.want {
+				t.Fatalf("IsRTCP(%x) = %v, want %v", c.pkt[:min(4, len(c.pkt))], got, c.want)
+			}
+		})
+	}
+}
+
 func TestSenderReportLengthFieldIgnoresReportBlocks(t *testing.T) {
 	// 带 1 个 report block 的 SR：长度 28+24=52 字节，length 字段应为 12。
 	sr := SenderReport{SSRC: 0x01020304, RTP: 1, PacketCount: 2, OctetCount: 3}

@@ -64,6 +64,7 @@ func TestAnnouncePublishesAndDescribeUsesCodecParams(t *testing.T) {
 		"a=rtpmap:97 MPEG4-GENERIC/44100/2",
 		"a=fmtp:97 profile-level-id=1; mode=AAC-hbr; sizelength=13; indexlength=3; indexdeltalength=3; config=1210",
 		"a=control:trackID=1",
+		"a=rtcp-mux",
 	}
 	for _, line := range want {
 		if !strings.Contains(sdp, line) {

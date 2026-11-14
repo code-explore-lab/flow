@@ -526,6 +526,48 @@ func (rx *pushReceiver) fillSilence(track *mediaTrack, from uint32, n int) {
 	}
 }
 
+// handleIncomingRTCP 处理客户端发来的 RTCP（UDP 独立端口、rtcp-mux 单端口、
+// TCP interleaved 三条路径共用）。当前只刷新会话活跃时间并记录类型；
+// R-7/R-8 的 NACK/PLI 解析后续接在这里，三条路径就自动同时生效。
+func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pkt []byte) {
+	if len(pkt) < 2 {
+		return
+	}
+	// RTCP 是保活证据：客户端可能不发 RTSP GET_PARAMETER。
+	sess.TouchRTCP()
+	fmt.Printf("RTCP recv %d bytes (%s, pt=%d, session=%s)\n",
+		len(pkt), track.kind, pkt[1], sess.ID)
+}
+
+// serveUDPMux 在 rtcp-mux 模式下从单个 UDP 端口收包：
+// 第二字节落在 RTCP 类型区间就交给 RTCP 处理，否则按 RTP 处理。
+// 推流方向消费 RTP；拉流方向客户端只应发 RTCP，收到的 RTP 直接忽略。
+//
+// 注意：一个 UDP socket 只能有一个并发的 ReadFromUDP 循环，所以 mux 时
+// 不能再起 handleSetup 里那个独立 RTCP 读协程。
+func (s *Server) serveUDPMux(track *mediaTrack, sess *session.Session) {
+	st := sess.Data.(*Session)
+	fmt.Printf("udp mux receiver started (%s, port=%d)\n", track.kind, track.serverRtpPort)
+	buf := make([]byte, 64*1024)
+	for {
+		n, _, err := track.rtpConn.ReadFromUDP(buf)
+		if err != nil {
+			fmt.Printf("udp mux receiver stopped (%s): %v\n", track.kind, err)
+			return
+		}
+		pkt := buf[:n]
+		if rtcp.IsRTCP(pkt) {
+			s.handleIncomingRTCP(track, sess, pkt)
+			continue
+		}
+		if !track.isPush {
+			continue
+		}
+		sess.TouchRTCP()
+		s.handlePushedRTP(st, track, pkt)
+	}
+}
+
 // serveUDPRTP 从 SETUP 分配的 UDP RTP 端口收推流数据。
 // 端口关闭（teardown / 会话回收 / 重复 SETUP 替换旧轨）时 ReadFromUDP 返回错误，
 // goroutine 随之退出。

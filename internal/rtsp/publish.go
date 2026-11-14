@@ -221,6 +221,8 @@ func publishedSDP(p *stream.Stream, mcAddr string, mcTTL int) string {
 			fmt.Fprintf(&b, "a=fmtp:%d %s\r\n", t.PayloadType, t.FMTP)
 		}
 		fmt.Fprintf(&b, "a=control:trackID=%d\r\n", i)
+		// R-12：宣告 RTCP mux 能力，客户端可在 SETUP 用 client_port=A-A 接受。
+		b.WriteString("a=rtcp-mux\r\n")
 		b.WriteString(multicastSDPAttrs(mcAddr, mcTTL))
 	}
 	return b.String()

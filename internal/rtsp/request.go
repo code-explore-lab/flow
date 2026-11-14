@@ -154,6 +154,30 @@ func hasMulticastTransport(transportStr string) bool {
 	return false
 }
 
+// hasRTCPMuxTransport 判断 Transport 头是否显式带 rtcp-mux 参数。
+// RFC 5761 在 RTSP 1.0 里主要以 client_port=A-A 表示要复用端口；
+// rtcp-mux 参数是 RTSP 2.0 的写法，部分客户端两种都会带，这里都接受。
+func hasRTCPMuxTransport(transportStr string) bool {
+	for _, p := range strings.Split(transportStr, ";") {
+		if strings.EqualFold(strings.TrimSpace(p), "rtcp-mux") {
+			return true
+		}
+	}
+	return false
+}
+
+// clientPortsMuxed 判断 client_port 是否写成 RTP/RTCP 同一个端口（A-A）。
+// 这是 RTSP 1.0 下客户端同意 RTP/RTCP mux 的实际信号。
+func clientPortsMuxed(s string) bool {
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return false
+	}
+	rtp, errRTP := strconv.Atoi(strings.TrimSpace(parts[0]))
+	rtcp, errRTCP := strconv.Atoi(strings.TrimSpace(parts[1]))
+	return errRTP == nil && errRTCP == nil && rtp > 0 && rtp == rtcp
+}
+
 // parseInterleaved 解析 Transport 里的 interleaved=0-1，返回 RTP / RTCP 两个 channel 号。
 // 推流时要把 channel 号写进 $ 帧头，所以这里先解析并存好。
 func parseInterleaved(s string) (rtpCh, rtcpCh int, err error) {

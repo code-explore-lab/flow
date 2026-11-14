@@ -286,6 +286,9 @@ func describeTransport(t *mediaTrack) string {
 	if t.isMulticast {
 		return fmt.Sprintf("multicast %s", t.mcRTCPAddr)
 	}
+	if t.rtcpMux {
+		return fmt.Sprintf("udp %s (rtcp-mux)", t.clientAddr)
+	}
 	return fmt.Sprintf("udp %s", t.clientRTCPAddr)
 }
 

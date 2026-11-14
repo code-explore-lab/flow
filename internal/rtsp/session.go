@@ -26,8 +26,9 @@ type mediaTrack struct {
 	interleavedRTP  int          // RTP channel（写 $ 帧时用）
 	interleavedRTCP int          // RTCP channel
 	conn            *Conn        // TCP 模式下共用的 RTSP 连接（UDP 模式为 nil）
-	rtpConn         *net.UDPConn // 服务端 RTP socket（用来发）
-	rtcpConn        *net.UDPConn // 服务端 RTCP socket（用来收发）
+	rtpConn         *net.UDPConn // 服务端 RTP socket（用来发；rtcp-mux 时也收 RTCP）
+	rtcpConn        *net.UDPConn // 独立 RTCP socket；rtcp-mux 模式下为 nil
+	rtcpMux         bool         // RTP/RTCP 共用 rtpConn（RFC 5761）
 	clientAddr      *net.UDPAddr // 客户端 RTP 目标地址 ip:port
 	clientRTCPAddr  *net.UDPAddr // 客户端 RTCP 目标地址 ip:port（= client_port+1）
 	isMulticast     bool         // 组播：RTP/RTCP 发到固定组地址，不按客户端开 socket
@@ -171,10 +172,18 @@ func (t *mediaTrack) writeRTP(pkt []byte) error {
 
 // writeRTCP 按这条轨的传输方式发送 RTCP 包：
 // TCP 模式走协商出来的 RTCP channel（ffmpeg 下视频=1、音频=3），
-// UDP unicast 发给客户端 RTCP 端口（client_port+1），组播发到组 RTCP 端口。
+// rtcp-mux 时和 RTP 共用 rtpConn、发往客户端同一个端口，
+// 普通 UDP unicast 发给客户端 RTCP 端口（client_port+1），组播发到组 RTCP 端口。
 func (t *mediaTrack) writeRTCP(pkt []byte) error {
 	if t.isInterleaved {
 		return t.writeInterleavedChannel(t.interleavedRTCP, pkt)
+	}
+	if t.rtcpMux {
+		if t.rtpConn == nil || t.clientAddr == nil {
+			return fmt.Errorf("rtcp-mux transport is not configured")
+		}
+		_, err := t.rtpConn.WriteToUDP(pkt, t.clientAddr)
+		return err
 	}
 	if t.isMulticast {
 		if t.rtpConn == nil || t.mcRTCPAddr == nil {
@@ -531,17 +540,17 @@ func (s *Session) closeAll() {
 	}
 }
 
-// hasRTCPChannel 判断 channel 是不是这个会话某条轨的 RTCP 通道。
-// interleaved 模式下客户端发来的 RTCP RR 就走这个 channel。
-func (s *Session) hasRTCPChannel(channel int) bool {
+// trackByRTCPChannel 返回使用该 interleaved RTCP channel 的轨。
+// interleaved 模式下客户端发来的 RTCP RR/NACK 就走这个 channel。
+func (s *Session) trackByRTCPChannel(channel int) (*mediaTrack, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range s.tracks {
 		if t.isInterleaved && t.interleavedRTCP == channel {
-			return true
+			return t, true
 		}
 	}
-	return false
+	return nil, false
 }
 
 // sessionHeaderValue 拼 SETUP/PLAY/PAUSE/TEARDOWN 响应里的 Session 头。
@@ -564,4 +573,16 @@ func openUDPPortPair() (rtpConn, rtcpConn *net.UDPConn, err error) {
 		return rtp, rtcp, nil
 	}
 	return nil, nil, fmt.Errorf("no udp port pair available")
+}
+
+// openUDPPort 为 rtcp-mux 只开一个 UDP socket（RTP/RTCP 共用）。
+// 端口范围与 openUDPPortPair 一致，仍从偶数开始，方便抓包辨认。
+func openUDPPort() (*net.UDPConn, error) {
+	for port := 50000; port < 60000; port += 2 {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, fmt.Errorf("no udp port available")
 }

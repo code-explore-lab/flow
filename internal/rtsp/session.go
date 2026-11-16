@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,17 @@ import (
 	"flow/internal/source"
 	"flow/internal/stream"
 )
+
+// localCNAME 是本服务端所有 RTP 源的稳定 CNAME（RFC 3550 §6.5），
+// 形如 flow@host。audio/video 两条轨必须共用同一个值：CNAME 标识源，
+// SSRC 才标识单条流；播放器靠它把同一源的两路归在一起做音视频同步。
+var localCNAME = func() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "localhost"
+	}
+	return "flow@" + host
+}()
 
 // mediaTrack 一条媒体轨（video/audio）的传输参数。
 // 一个 Session 下有两条轨，各自一对端口、各自的目标地址。
@@ -62,6 +74,14 @@ type mediaTrack struct {
 	lastParamSets [][]byte // 最近一个只含 SPS/PPS 的 AU
 	kfHasParams   bool     // lastKeyframe 里是否已包含 SPS/PPS
 	lastKFReply   time.Time
+
+	// C-3 客户端最近一条 RR report block：只保留上报本轨 SSRC 的块，
+	// 供 C-4 计算 RTT、丢包率和抖动。rrMu 保护以下字段。
+	rrMu     sync.Mutex
+	lastRR   rtcp.ReportBlock
+	hasRR    bool
+	rrSender uint32
+	rrAt     time.Time
 
 	// 推流（ANNOUNCE/RECORD）方向：客户端把 RTP 发到服务端，服务端只接收。
 	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
@@ -141,6 +161,25 @@ func (t *mediaTrack) setClockRate(rate uint32) {
 	t.stats.mu.Lock()
 	t.clockRate = rate
 	t.stats.mu.Unlock()
+}
+
+// recordReceiverReport 保存客户端对这条轨的最新 RR report block（C-3）。
+// 只应在 block.SSRC 匹配本轨时调用。
+func (t *mediaTrack) recordReceiverReport(sender uint32, blk rtcp.ReportBlock, at time.Time) {
+	t.rrMu.Lock()
+	defer t.rrMu.Unlock()
+	t.lastRR = blk
+	t.hasRR = true
+	t.rrSender = sender
+	t.rrAt = at
+}
+
+// latestReceiverReport 返回最近一条 RR 的上报方、report block 和接收时刻。
+// C-4 用它计算 RTT/丢包率/抖动；never reported 时 ok=false。
+func (t *mediaTrack) latestReceiverReport() (sender uint32, blk rtcp.ReportBlock, at time.Time, ok bool) {
+	t.rrMu.Lock()
+	defer t.rrMu.Unlock()
+	return t.rrSender, t.lastRR, t.rrAt, t.hasRR
 }
 
 // recordSent 在一包 RTP 成功写出后更新统计：
@@ -237,7 +276,10 @@ func (t *mediaTrack) writeInterleavedChannel(channel int, pkt []byte) error {
 	return t.conn.write(frame)
 }
 
-// senderReport 生成当前时刻的 RTCP SR（PT=200）。
+// senderReport 生成当前时刻的 RTCP compound packet：SR（PT=200）+ SDES
+// CNAME（PT=202）。RFC 3550 §6.1 要求复合包以 SR/RR 开头并携带 CNAME，
+// 播放器据此识别源、做音视频同步，不会再告警“缺少 CNAME”。
+//
 // NTP 填 now，RTP timestamp 填“如果现在发一包会用到的值”：
 // 上一包的 RTP timestamp + 距上一包发送时刻经过的时间 × 时钟频率。
 // 还没发过任何 RTP 时返回 false，避免客户端拿到错误的时间映射。
@@ -265,7 +307,26 @@ func (t *mediaTrack) senderReport(now time.Time) ([]byte, bool) {
 		PacketCount: packets,
 		OctetCount:  octets,
 	}
-	return sr.Marshal(), true
+	return rtcp.Compound(sr.Marshal(), rtcp.CNAME(ssrc, localCNAME)), true
+}
+
+// sendBye 在会话回收时给这条轨发 RTCP BYE（C-2）。BYE 仍须放在以
+// SR/RR 开头的复合包里（RFC 3550 §6.1），所以复用 senderReport 生成的
+// SR+SDES 再追加 BYE。
+//
+// senderReport 返回 false 说明还没发出过 RTP，自然也没发过 SR；
+// RFC 3550 §6.3.7 规定从未发过 RTP/RTCP 的参与者不得发 BYE，这里直接跳过。
+func (t *mediaTrack) sendBye() {
+	sr, ok := t.senderReport(time.Now())
+	if !ok {
+		return
+	}
+	ssrc := t.currentSSRC()
+	if err := t.writeRTCP(rtcp.Compound(sr, rtcp.BYE(ssrc))); err != nil {
+		fmt.Printf("send rtcp bye (%s): %v\n", t.kind, err)
+		return
+	}
+	fmt.Printf("RTCP BYE sent (%s, ssrc=%08x)\n", t.kind, ssrc)
 }
 
 // Session 是挂在 session.Session.Data 上的 RTSP 层状态：
@@ -535,6 +596,9 @@ func (s *Session) closeAll() {
 	s.mu.Unlock()
 
 	for _, t := range tracks {
+		// C-2：先发 BYE，再关 socket；UDP/mux 的 BYE 一定能送出去，
+		// interleaved 在 TCP 已断时写失败，只记日志。
+		t.sendBye()
 		if t.isPush {
 			// 打一条终态统计，便于和推流端（ffmpeg）的发送量对比。
 			packets, bytes, frames, gaps := t.recvSummary()

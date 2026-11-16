@@ -265,15 +265,25 @@
 
 ## C — RTCP 反馈闭环
 
-- [ ] **C-1 SDES / CNAME + compound packet**
-  - 每个 SR 前带 SDES CNAME（稳定值，如 `flow@host`），组成 compound packet；
-  - 验收：Wireshark 解析出 CNAME，播放器不再因缺少 CNAME 告警。
-- [ ] **C-2 BYE**
-  - TEARDOWN / 会话回收时发送 RTCP BYE + SSRC；
-  - 验收：客户端立即感知流结束。
-- [ ] **C-3 解析 RR report block**
-  - 解析 fraction lost、cumulative lost、extended highest seq、jitter、LSR、DLSR；
-  - 验收：单测构造 RR 包，字段解析正确。
+- [x] **C-1 SDES / CNAME + compound packet**
+  - 新增 `internal/rtcp/sdes.go`：`CNAME(ssrc, name)` 构造 `PT=202` 的 SDES 包（V=2、SC=1，item type=1，END item 后补零到 32 位边界，length 字段包含补齐）；`ParseCNAME` 供测试和抓包排查；
+  - `internal/rtcp/compound.go` 增加 `Compound(...)` 按序拼接子包；`mediaTrack.senderReport` 改为返回 `Compound(SR, CNAME)`，SR 仍是首包（RFC 3550 §6.1）；
+  - CNAME 取包级 `localCNAME = "flow@" + hostname`，跨会话、跨 PAUSE/PLAY 稳定；video/audio 共用同一个 CNAME（标识源），SSRC 各自独立；
+  - UDP 双端口、rtcp-mux 单端口、TCP interleaved 三条路径共用 `writeRTCP`，无需改动；`IsRTCP` 对 compound 仍按首包 SR 的 PT 和 length 判定；
+  - 验收：`internal/rtcp/sdes_test.go` 覆盖 CNAME 编解码、1~12 字节 CNAME 的 32 位对齐与 length 字段、非法包拒绝、`Compound(SR, SDES)` 遍历顺序与 `IsRTCP`；`internal/rtsp/sender_report_test.go` 覆盖 SR 后跟 SDES、CNAME 与 SR SSRC 一致、video/audio CNAME 相同而 SSRC 不同；
+  - 真实 e2e：裸 RTSP 探针在 legacy 双端口与 rtcp-mux 单端口下均收到 `pts=[200, 202]` 的复合包，`cname='flow@DESKTOP-NTFNG9O'`，SDES SSRC 与 SR/RTP SSRC 一致；`ffmpeg -rtsp_transport udp` 拉流 4 秒 exit 0；
+  - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
+- [x] **C-2 BYE**
+  - `internal/rtcp/bye.go`：`BYE(ssrcs...)` 构造 `PT=203` 单/多 SSRC 包（SC=N、length=N，不带 reason），`ParseBYE` 供测试和抓包排查；
+  - `mediaTrack.sendBye` 复用 `senderReport` 的 SR+SDES 再追加 BYE，组成 `SR+SDES+BYE` 复合包（RFC 3550 §6.1 要求以 SR/RR 开头）；`senderReport` 返回 false（从未发过 RTP）时按 §6.3.7 跳过；
+  - 接在 `Session.closeAll` 关闭 socket 之前，TEARDOWN、TCP 断开、60s 超时、推流源结束四条回收路径全覆盖；UDP / rtcp-mux 正常送达，TCP 已断时 interleaved 写失败只记日志；
+  - 验收：`internal/rtcp/bye_test.go` 覆盖单/多 SSRC 编解码与非法包；`internal/rtsp/bye_test.go` 覆盖复合包顺序 `[200,202,203]`、SSRC 与 RTP 一致、无 RTP 时不发 BYE、`closeAll` 在关 socket 前发出 BYE；真实 e2e 探针在 legacy 与 rtcp-mux 下 TEARDOWN 后均收到 `pts=[200,202,203]` 的 BYE；
+  - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
+- [x] **C-3 解析 RR report block**
+  - `internal/rtcp/rr.go`：`ReportBlock` 含 fraction lost、24 位有符号 cumulative lost（手工符号扩展）、extended highest seq、jitter、LSR、DLSR；`ParseRR` 按 RC 与 length 校验，`ParseRRs` 用 `Walk` 从复合包提取所有 `PT=201`；
+  - `handleIncomingRTCP` 解析 RR，只保存 `blk.SSRC == track.currentSSRC()` 的块到 `mediaTrack.lastRR`（含上报方 SSRC、接收时刻），打印一行字段便于抓包对照；数据留给 C-4 计算 RTT/丢包率/抖动；
+  - 验收：`internal/rtcp/rr_test.go` 覆盖单块/多块/空 RR、负累计丢包符号扩展、RC 与实际长度不符、错误 PT/version/short/length、`RR+SDES` 复合包；`internal/rtsp/rr_test.go` 覆盖复合包写入 `lastRR`、其他 media SSRC 忽略；真实 e2e 探针发送 `fraction=5/cumulative=12/ext_seq=10/jitter=1234` 的 RR，服务端日志输出 `RTCP RR (video): ...`，legacy 与 rtcp-mux 均通过；ffmpeg 拉流发送的空 RR（RC=0）也能正常解析；
+  - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
 - [ ] **C-4 计算 RTT / 丢包率 / 抖动指标**
   - 用 LSR/DLSR 算 RTT；按会话/轨聚合丢包率和抖动；
   - 输出到日志和指标接口（依赖 E-4）；

@@ -22,6 +22,21 @@ func Walk(b []byte, fn func(pt uint8, pkt []byte) bool) {
 	}
 }
 
+// Compound 按顺序把子包拼成一个复合 RTCP 包（RFC 3550 §6.1）。
+// 调用方负责保证第一个子包是 SR 或 RR：RTCP 复合包必须由报告包开头，
+// 例如 Compound(sr, CNAME(ssrc, name))。
+func Compound(pkts ...[]byte) []byte {
+	n := 0
+	for _, p := range pkts {
+		n += len(p)
+	}
+	out := make([]byte, 0, n)
+	for _, p := range pkts {
+		out = append(out, p...)
+	}
+	return out
+}
+
 // NACKFeedback 是复合包中解析出的一条 Generic NACK。
 // 一个复合包里可能有多条（不同 media SSRC），因此用切片返回。
 type NACKFeedback struct {

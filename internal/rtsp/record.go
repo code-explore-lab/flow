@@ -568,6 +568,20 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 		}
 		return true
 	})
+
+	// C-3：解析客户端 RR（PT=201）里的 report block。复合包里可能同时有
+	// RR/SDES/NACK，只保存上报本轨 SSRC 的那一条，供 C-4 计算指标。
+	for _, rr := range rtcp.ParseRRs(pkt) {
+		for _, blk := range rr.Blocks {
+			if blk.SSRC != track.currentSSRC() {
+				continue
+			}
+			track.recordReceiverReport(rr.SSRC, blk, time.Now())
+			fmt.Printf("RTCP RR (%s): from=%08x fraction_lost=%d/256 cumulative_lost=%d ext_seq=%d jitter=%d lsr=%08x dlsr=%d\n",
+				track.kind, rr.SSRC, blk.FractionLost, blk.CumulativeLost,
+				blk.ExtendedHighestSeq, blk.Jitter, blk.LastSR, blk.DelaySinceLastSR)
+		}
+	}
 }
 
 // serveUDPMux 在 rtcp-mux 模式下从单个 UDP 端口收包：

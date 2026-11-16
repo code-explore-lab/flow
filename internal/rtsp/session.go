@@ -217,13 +217,14 @@ func (t *mediaTrack) cachedPacket(seq uint16) ([]byte, bool) {
 // writeRTP 按这条轨的传输方式发送一个已经序列化好的 RTP 包：
 // TCP 模式套上 $ 帧，UDP unicast 发给客户端地址，组播发到固定组地址。
 func (t *mediaTrack) writeRTP(pkt []byte) error {
-	if t.isInterleaved {
+	if t.isInterleaved { //TCP 交织
 		return t.writeInterleavedChannel(t.interleavedRTP, pkt)
 	}
-	if t.isMulticast {
+	if t.isMulticast { //UDP 组播
 		_, err := t.rtpConn.WriteToUDP(pkt, t.mcAddr)
 		return err
 	}
+	// UDP单播
 	_, err := t.rtpConn.WriteToUDP(pkt, t.clientAddr)
 	return err
 }
@@ -233,23 +234,24 @@ func (t *mediaTrack) writeRTP(pkt []byte) error {
 // rtcp-mux 时和 RTP 共用 rtpConn、发往客户端同一个端口，
 // 普通 UDP unicast 发给客户端 RTCP 端口（client_port+1），组播发到组 RTCP 端口。
 func (t *mediaTrack) writeRTCP(pkt []byte) error {
-	if t.isInterleaved {
+	if t.isInterleaved { //TCP 交织
 		return t.writeInterleavedChannel(t.interleavedRTCP, pkt)
 	}
-	if t.rtcpMux {
+	if t.rtcpMux { // UDP单播 RTP/RTCP 复用端口
 		if t.rtpConn == nil || t.clientAddr == nil {
 			return fmt.Errorf("rtcp-mux transport is not configured")
 		}
 		_, err := t.rtpConn.WriteToUDP(pkt, t.clientAddr)
 		return err
 	}
-	if t.isMulticast {
+	if t.isMulticast { // UDP 组播
 		if t.rtpConn == nil || t.mcRTCPAddr == nil {
 			return fmt.Errorf("rtcp transport is not configured")
 		}
 		_, err := t.rtpConn.WriteToUDP(pkt, t.mcRTCPAddr)
 		return err
 	}
+	// UDP 单播 分离端口
 	if t.rtcpConn == nil || t.clientRTCPAddr == nil {
 		return fmt.Errorf("rtcp transport is not configured")
 	}
@@ -263,7 +265,9 @@ func (t *mediaTrack) writeRTCP(pkt []byte) error {
 /*
 $      channel     length(2B大端)     payload(原始RTP/RTCP包)
 0x24   1字节        2字节              N字节
-
+$ (0x24) | channel(1B) | length(2B big-endian) | payload
+4 字节固定头；payload 最大 65535 字节
+RTP、RTCP 包共用这个封装函数，只需要传入不同 channel 号
 */
 func (t *mediaTrack) writeInterleavedChannel(channel int, pkt []byte) error {
 	if len(pkt) > 0xFFFF {
@@ -494,6 +498,7 @@ func (s *Session) pushTrackByRTPChannel(channel int) (*mediaTrack, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range s.tracks {
+		// 接收推流的轨  TCP交织模式，  channel和 $ 帧解析出来的channel一致
 		if t.isPush && t.isInterleaved && t.interleavedRTP == channel {
 			return t, true
 		}

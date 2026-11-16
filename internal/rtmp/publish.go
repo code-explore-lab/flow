@@ -26,7 +26,7 @@ const defaultAACRate uint32 = 44100
 // publishState 一条连接当前的推流状态。只在连接的读循环里读写，不需要锁。
 type publishState struct {
 	stream    *stream.Stream
-	audioRate uint32
+	audioRate uint32 //采样率
 }
 
 // stopPublish 注销当前推流并关闭帧源（读循环退出、FCUnpublish、
@@ -58,6 +58,7 @@ func (c *Conn) handleVideo(m *Message) {
 	}
 
 	switch vt.PacketType {
+	// AVC序列头， 里面放SPS/PPS
 	case flv.AVCSeqHeader:
 		sps, pps, err := flv.ParseAVCDecoderConfig(vt.Config)
 		if err != nil {
@@ -71,6 +72,7 @@ func (c *Conn) handleVideo(m *Message) {
 			src.Write(source.Frame{Data: sps, Timestamp: 0})
 			src.Write(source.Frame{Data: pps, Timestamp: 0})
 		}
+		// 普通H264 NALU帧
 	case flv.AVCNALU:
 		src := p.stream.SourceFor("video")
 		if src == nil {
@@ -99,6 +101,7 @@ func (c *Conn) handleAudio(m *Message) {
 	}
 
 	switch at.PacketType {
+	// 存放音频编码配置
 	case flv.AACSeqHeader:
 		rate, ch, err := media.ParseASC(at.Config)
 		if err != nil {
@@ -107,6 +110,7 @@ func (c *Conn) handleAudio(m *Message) {
 		}
 		p.audioRate = uint32(rate)
 		p.stream.SetAudioParams(at.Config, uint32(rate), ch)
+		// AAC原始音频帧
 	case flv.AACRaw:
 		rate := p.audioRate
 		if rate == 0 {

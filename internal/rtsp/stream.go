@@ -22,6 +22,7 @@ type videoFrameSource interface {
 // audioFrameSource 音频帧源额外提供采样率，用来设置 RTCP SR 的 RTP 时钟。
 type audioFrameSource interface {
 	videoFrameSource
+	// 包含一个接口， 方法集合合并
 	SamplingRate() uint32
 }
 
@@ -69,7 +70,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		return false
 	}
 	defer cancel()
-
+	// 初始化打包器， SSRC 缓存变量
 	packer := rtp.NewH264Packer(1400)
 	// 推流场景沿用 ANNOUNCE 的 payload type，保证和 DESCRIBE 一致。
 	if track.payloadType > 0 {
@@ -87,6 +88,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		pendingTS   uint32
 		pendingSize int // 1 字节 STAP-A 头 + 每个 NALU 的 2 字节长度
 	)
+	// 发包回调，NALU 类型判断、降码丢弃、RTP 封装、写连接、缓存 PLI 关键帧
 	sendFrame := func(nalus [][]byte, ts uint32) bool {
 		// R-8：识别这一帧是否带 IDR / 参数集，发送成功后缓存整帧的
 		// 完整 RTP 包，供 PLI/FIR 原样重放。
@@ -147,6 +149,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		}
 		return true
 	}
+	// 把pending缓冲区里， 属于同一个ts的一批NALU， 交去给sendFrame发送，发完清空pending
 	flush := func() bool {
 		if len(pending) == 0 {
 			return true
@@ -156,7 +159,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		return ok
 	}
 
-	for {
+	for { // 单客户端视频流的主循环
 		f, ok := reader.Next(done)
 		if !ok {
 			if isDone(done) {
@@ -242,6 +245,7 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 	}
 	var dropped uint64
 	ssrc := track.ensureSSRC()
+	// 只设置一次RTCP的时钟频率
 	rateSet := false
 	for {
 		f, ok := reader.Next(done)
@@ -323,13 +327,13 @@ func (s *Server) sendSenderReports(track *mediaTrack, done <-chan struct{}) {
 }
 
 func describeTransport(t *mediaTrack) string {
-	if t.isInterleaved {
+	if t.isInterleaved { // RTSP 交织模式
 		return fmt.Sprintf("tcp ch=%d", t.interleavedRTCP)
 	}
-	if t.isMulticast {
+	if t.isMulticast { // UDP 组播
 		return fmt.Sprintf("multicast %s", t.mcRTCPAddr)
 	}
-	if t.rtcpMux {
+	if t.rtcpMux { //UDP 单薄
 		return fmt.Sprintf("udp %s (rtcp-mux)", t.clientAddr)
 	}
 	return fmt.Sprintf("udp %s", t.clientRTCPAddr)

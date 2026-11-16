@@ -110,7 +110,7 @@ func (s *Server) handleConn(conn *Conn) {
 			fmt.Printf("rtmp: ack to %s failed: %v\n", conn.RemoteAddr(), err)
 			return
 		}
-
+		// 控制消息优先
 		if handled, err := conn.handleControl(m); err != nil {
 			fmt.Printf("rtmp: control message from %s: %v\n", conn.RemoteAddr(), err)
 			return

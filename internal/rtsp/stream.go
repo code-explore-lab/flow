@@ -88,10 +88,26 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		pendingSize int // 1 字节 STAP-A 头 + 每个 NALU 的 2 字节长度
 	)
 	sendFrame := func(nalus [][]byte, ts uint32) bool {
+		// R-8：识别这一帧是否带 IDR / 参数集，发送成功后缓存整帧的
+		// 完整 RTP 包，供 PLI/FIR 原样重放。
+		isIDR, hasParams := false, false
+		for _, n := range nalus {
+			if len(n) == 0 {
+				continue
+			}
+			switch n[0] & 0x1F {
+			case rtp.NALUTypeIDR:
+				isIDR = true
+			case rtp.NALUTypeSPS, rtp.NALUTypePPS:
+				hasParams = true
+			}
+		}
+
 		pkts, err := packer.PackFrame(nalus)
 		if err != nil {
 			return true
 		}
+		au := make([][]byte, 0, len(pkts))
 		for _, p := range pkts {
 			p.Header.Seq = uint16(track.nextSeq())
 			p.Header.Timestamp = ts
@@ -104,10 +120,21 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 				fmt.Println("write video rtp:", err)
 				return false
 			}
+			au = append(au, data)
 			// 给 SR 累计包数/字节数，并记下最后一个时间戳。
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
 			// 保留最近的包，NACK 重传（R-7）按 seq 取回。
 			track.cacheSent(p.Header.Seq, data)
+		}
+		// 整帧都发成功后再登记，避免把只发了一半的 AU 当作关键帧重放。
+		// 只有单播拉流轨会收到客户端 PLI/FIR；用 sendCache 做同样的判定，
+		// 避免为组播轨缓存体积较大的 IDR 帧。
+		if track.sendCache != nil {
+			if isIDR {
+				track.storeKeyframe(au, hasParams)
+			} else if hasParams {
+				track.storeParamSets(au)
+			}
 		}
 		return true
 	}

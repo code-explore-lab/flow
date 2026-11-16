@@ -546,6 +546,28 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 		}
 		s.retransmit(track, fb.Seqs)
 	}
+
+	// R-8：PLI（FMT=1）/ FIR（FMT=4）请求关键帧，重放缓存的
+	// SPS/PPS + 最近 IDR。PSFB 也可能出现在复合包里，逐个子包检查。
+	rtcp.Walk(pkt, func(pt uint8, sub []byte) bool {
+		if pt != plc.PSFBType {
+			return true
+		}
+		switch sub[0] & 0x1F {
+		case plc.PLIFMT:
+			// media SSRC 为 0 时按通配处理，兼容未填 SSRC 的客户端。
+			if _, media, ok := plc.ParsePLI(sub); ok &&
+				(media == 0 || media == track.currentSSRC()) {
+				track.replayKeyframe("PLI")
+			}
+		case plc.FIRFMT:
+			if _, target, _, ok := plc.ParseFIR(sub); ok &&
+				(target == 0 || target == track.currentSSRC()) {
+				track.replayKeyframe("FIR")
+			}
+		}
+		return true
+	})
 }
 
 // serveUDPMux 在 rtcp-mux 模式下从单个 UDP 端口收包：

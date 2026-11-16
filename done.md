@@ -233,10 +233,14 @@
   - 新增 `internal/rtsp/retransmit.go`：seq 去重、单条 NACK 最多处理 64 个 seq；从 R-1 `sendCache` 按 seq 取回完整 RTP 包，用 `writeRTP` 原样重发（seq/timestamp/SSRC 不变，不调用 `recordSent`/`cacheSent`，SR 统计和缓存年龄不受影响）；缓存未命中（已淘汰/未发送）只记录不造包；
   - 限速：每轨令牌桶稳态 200 包/秒、突发 64 包，`takeRTXTokens` 按经过时间补充；超限停止本轮重传并打印 `throttled`；
   - 验收：`internal/rtcp/compound_test.go` 覆盖复合包、多 NACK、非 NACK、非法 FMT、截断 length；`internal/rtsp/retransmit_test.go` 覆盖原包字节一致重传、重复 seq 只发一次、未缓存 seq 不回应、其他 media SSRC 忽略、无缓存不 panic、令牌桶补充/上限、去重；真实 e2e 用循环推流 + 裸 RTSP 探针分别走 legacy 双端口与 rtcp-mux 单端口，NACK 一个已发送 seq 均收到 1 个字节完全相同的重传，NACK 未发送 seq 无回应；`gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
-- [ ] **R-8 PLI / FIR 处理**
-  - 解析 `PT=206, FMT=1`（PLI）和 `FMT=4`（FIR）；
-  - 收到后补发 SPS/PPS + 最近 IDR，限频（如 1 次/秒）；
-  - 验收：Wireshark 触发 PLI 后能看到关键帧重发。
+- [x] **R-8 PLI / FIR 处理**
+  - `internal/plc/fir.go` 新增 FIR（`PT=206, FMT=4`）构造/解析：20 字节，目标 SSRC 取 FCI 的 `[12:16]`（头部 media SSRC 按 RFC 惯例为 0），带 FIR 序号；PLI（`FMT=1`）继续复用 `plc.PLI/ParsePLI`；
+  - `handleIncomingRTCP` 用 `rtcp.Walk` 逐个子包识别 PLI/FIR（支持 RR + PSFB 复合包）：PLI 匹配 media SSRC、FIR 匹配 FCI target SSRC，SSRC 为 0 时按通配处理，只对命中本轨的请求重放；
+  - `streamH264` 的 `sendFrame` 识别 IDR（type 5）与 SPS/PPS（type 7/8）：整帧发送成功后把完整 RTP 包存入 `mediaTrack.lastKeyframe`；若参数集单独成帧则存 `lastParamSets`，重放时在 IDR 前补发（`kfHasParams` 避免重复）；
+  - `internal/rtsp/keyframe.go` 实现 `replayKeyframe`：按原 seq/timestamp/SSRC 原样重放，不调用 `recordSent`/`cacheSent`（SR 统计不变）；每轨限频 1 秒；空缓存直接忽略；
+  - 只对拉流轨生效（推流轨没有关键帧缓存）；UDP、rtcp-mux、TCP interleaved 三条路径因共用 `handleIncomingRTCP` 同时支持；
+  - 验收：`internal/plc/fir_test.go` 覆盖 FIR 往返与非法包；`internal/rtsp/keyframe_test.go` 覆盖 PLI/FIR 重放、参数集前置、复合包、SSRC 不匹配忽略、1 秒限频与窗口恢复、空缓存、`streamH264` 对“参数集单独帧 + IDR 帧”的分别缓存；真实 e2e 用循环推流 + 裸 RTSP 探针等到 IDR 后发 PLI/FIR，legacy 双端口与 rtcp-mux 单端口均收到成组旧 seq 的关键帧包（服务端日志 `RTCP PLI/FIR (video): replay keyframe (N packets)`），直播流不中断；
+  - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/plc/ ./internal/rtcp/ ./internal/rtsp/` 通过。
 - [ ] **R-9 RTX 重传通道**
   - SDP 协商 `rtx/90000` + `apt=96`，重传使用独立 SSRC/PT；
   - 验收：客户端支持 RTX 时走 RTX，不支持时回退同 seq 重传。

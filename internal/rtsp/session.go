@@ -54,6 +54,15 @@ type mediaTrack struct {
 	rtxTokens float64
 	rtxLast   time.Time
 
+	// R-8 关键帧缓存：PLI/FIR 到达时原样重放最近的 SPS/PPS + IDR。
+	// 包是 streamH264 发出的完整 RTP 包（含这个客户端自己的 seq/SSRC），
+	// 重放不能再重新封包。kfMu 保护以下字段。
+	kfMu          sync.Mutex
+	lastKeyframe  [][]byte // 最近一个含 IDR 的 AU
+	lastParamSets [][]byte // 最近一个只含 SPS/PPS 的 AU
+	kfHasParams   bool     // lastKeyframe 里是否已包含 SPS/PPS
+	lastKFReply   time.Time
+
 	// 推流（ANNOUNCE/RECORD）方向：客户端把 RTP 发到服务端，服务端只接收。
 	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
 	isPush      bool

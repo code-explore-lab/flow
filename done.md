@@ -289,13 +289,17 @@
   - `handleIncomingRTCP` 保存 RR 后立即计算快照并输出 `RTCP metrics (session=..., video): rtt=... fraction_lost=... cumulative_lost=... (x%) jitter=...ms`；快照字段就是 E-4 `/metrics` 的数据源，E-4 落地后直接遍历 `Session.metricsSnapshot` 输出即可；
   - 验收：`internal/rtsp/metrics_test.go` 覆盖 LSR/DLSR RTT（含 LSR=0 不可用）、区间/累计丢包率、负累计丢包 clamp 为 0、90000/44100 抖动换算、无 RR 时只返回发送统计、会话加权聚合与空会话；真实 e2e 用自写 RTSP 接收端每 10 包丢 1 包并按秒发 RR，服务端日志显示 `cumulative_lost=25/259 (9.65%)`、`fraction_lost≈10%`、收到 SR 后 `rtt=0.17~1.7ms`；零丢包重跑同一探针，指标变为 `0/259 (0.00%)`、RTT 正常，证明指标随人为丢包变化；
   - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
-- [ ] **C-5 SR 发送策略**
-  - 按 RFC 3550 的带宽比例计算间隔，支持 reduced-size SR；
-  - 验收：多会话时 SR 总带宽不超标。
-- [ ] **C-6 反馈驱动降级**
-  - 连续 N 秒丢包率 > 阈值时，跳过非关键帧或降低发送速率；
-  - 说明纯转发场景无法改编码码率的限制；
-  - 验收：模拟高丢包，发送帧率下降且不断流。
+- [x] **C-5 SR 发送策略**
+  - 新增 `internal/rtsp/rtcpsched.go`：把原来的每轨固定 5s ticker 换成服务端共享的 RTCP 带宽预算调度器。按 RFC 3550 §6.3.1 计算 `Td = max(Tmin, n × avg_rtcp_size × 8 / rtcp_bw)`，其中 `rtcp_bw = 5% × 发送方份额 50% × Σ 实测媒体码率`（单播两端各半，SR 不超过 2.5%）、`n` 是在发轨数、平均包长按 1/16 EWMA 维护并计入 28 字节 IPv4/UDP 头；实际间隔在 `Td` 之后再乘 `[0.5,1.5)` 随机因子（实际落在 2.5~7.5s、均值 5s），`Tmin` 取单播 5s；
+  - 每条轨进入 PLAY 时向 `Server.rtcp` 注册、PLAY 生命周期结束时注销；`nextInterval` 用各轨 `trackStats.octets` 的增量估算码率（0.75/0.25 平滑）。会话数增加时 `n` 与总码率同时增长，单路码率不低时间隔仍由 5s 下限决定；单路码率低时 `avg_size / 码率` 变大、间隔随之拉长。两种情况下都保证 `n × avg_size / Td ≤ 2.5% × 媒体总带宽`；单会话均值仍为 5s；
+  - SR 保持 `RC=0`（不带 report block，即 reduced-size SR 形态），`buildSDP`/`publishedSDP` 的每个 `m=` 段新增 `a=rtcp-rsize` 宣告（RFC 5506）；CNAME 仍随每次 SR 发送，避免削弱音视频同步；
+  - 验收：`internal/rtsp/rtcpsched_test.go` 覆盖 5s 下限、间隔随轨数增长、带宽预算等式（`n×88/Td = 2.5%×B/8`）、随机区间、平均包长 EWMA、注册/注销计数、SDP 含 `a=rtcp-rsize`；`test/e2e/rtsp_rtcp_degrade.py` 用 ffmpeg 循环推流 + 自写 RTSP 接收端实测：DESCRIBE SDP 含 `a=rtcp-rsize`，9 秒内收到 1 个 60 字节 SR（落在 2.5~7.5s 的随机区间内），服务端日志每轮打印 `RTCP SR sent`；`gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtsp/` 通过。
+- [x] **C-6 反馈驱动降级**
+  - 新增 `internal/rtsp/degrade.go`：`degradeState` 用 RR 的区间丢包率（`FractionLost/256`）驱动状态机，连续 `Sustain`（默认 3s）高于阈值（默认 10%）进入降级，连续 `Recover`（默认 5s）低于阈值才恢复；中途反向采样会重置窗口，形成迟滞。使用区间丢包而不是累计丢包，因为后者只增不减、无法作为恢复依据；
+  - `handleSetup` 只为单播拉流视频轨创建降级状态（与 `sendCache` 同条件），推流/组播轨和音频轨为 nil（音频没有关键帧概念且码率小，保持完整发送）；`Server.SetDegradePolicy` + `-degrade-loss/-degrade-sustain/-degrade-recover` 可调，非法值保持默认；
+  - `handleIncomingRTCP` 保存 RR 后调用 `observe`，切换时打印 `degrade on/off`；`streamH264` 的 `sendFrame` 在降级期间把含 VCL 且不含 IDR/参数集的 AU 整帧丢弃（`dropNonKeyFrame`），只保留 SPS/PPS 与 IDR，不拆 NALU、不改 seq/timestamp，音频轨不受影响；
+  - 明确局限：纯转发没有编码器，无法改码率/QP/GOP，只能丢帧；丢 P 帧会破坏参考链，客户端在下一个 IDR 前可能卡顿/花屏，但 RTSP/RTP/SR 不断流。更优方案是向上游发 PLI/FIR 请求 IDR（R-8 目前只处理下游 PLI）或做 RTX/TWCC（R-9/R-11）；降级生效时间还受客户端 RR 发送周期（通常 5s）影响；
+  - 验收：`internal/rtsp/degrade_test.go` 覆盖进入/恢复时间窗口、反向采样重置、非法配置回退、无状态/未激活不丢帧、降级时只发送参数集与 IDR（P 帧整 AU 被跳过、丢弃计数正确、流正常结束）；`test/e2e/rtsp_rtcp_degrade.py` 对真实 ffmpeg 推流注入 25% 丢包 RR：视频包速率从基线 39.0/s 降到 7.3/s（只剩关键帧），期间 RTP 持续流动不断流，改发 0% 丢包 RR 后恢复到 44.5/s；服务端日志对应输出 `degrade on` → `degrade (video): dropped N non-key frame(s)` → `degrade off`；`gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtsp/` 通过。
 
 ---
 

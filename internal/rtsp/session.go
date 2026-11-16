@@ -60,6 +60,10 @@ type mediaTrack struct {
 	// 重传的语义，SETUP 时不会创建（保持 nil）。
 	sendCache *rtp.SendCache
 
+	// C-6 丢包降级状态：只有拉流单播视频轨创建（和 sendCache 同一条件）。
+	// 推流/组播轨没有可依据的客户端 RR，音频没有关键帧，均保持 nil。
+	degrade *degradeState
+
 	// R-7 重传令牌桶：RTCP 读协程收到 NACK 后按轨限速重发，
 	// 防止重复/恶意 NACK 把重传流量放大。
 	rtxMu     sync.Mutex

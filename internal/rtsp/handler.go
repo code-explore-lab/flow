@@ -277,6 +277,9 @@ func (s *Server) buildSDP(uri string) (string, error) {
 	// 明确不允许组播使用 rtcp-mux）。
 	sdp += "a=control:trackID=0\r\n" +
 		"a=rtcp-mux\r\n" +
+		// C-5：本端发出的 SR 不带 report block（RC=0），同时宣告
+		// 接受 reduced-size RTCP（RFC 5506）。
+		"a=rtcp-rsize\r\n" +
 		multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
 
 	if s.audio != nil {
@@ -287,6 +290,7 @@ func (s *Server) buildSDP(uri string) (string, error) {
 		sdp += aacInfo.MediaDescription(media.AACPT) +
 			"a=control:trackID=1\r\n" +
 			"a=rtcp-mux\r\n" +
+			"a=rtcp-rsize\r\n" +
 			multicastSDPAttrs(s.multicastAddr, s.multicastTTL)
 	}
 	return sdp, nil
@@ -618,6 +622,11 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	// 推流轨（服务端只收不发）和组播轨（没有按客户端重传的语义）不占这份内存。
 	if !push && !isMulticast {
 		t.sendCache = rtp.NewSendCache(rtp.DefaultSendCachePackets, rtp.DefaultSendCacheBytes)
+		// C-6：只有视频轨需要按 RR 丢非关键帧；音频没有关键帧概念，
+		// 码率也小，保持完整发送，避免声音断续。
+		if kind == "video" && s.degrade.valid() {
+			t.degrade = newDegradeState(s.degrade)
+		}
 	}
 
 	// 同一个 Session 下按轨登记；重复 SETUP 同一条轨时先关掉旧端口。
@@ -747,12 +756,12 @@ func (s *Server) handlePlay(conn *Conn, req *Request, hd map[string]string) erro
 			}()
 		}
 	}
-	// 每 5s 发一次 RTCP SR，带 NTP↔RTP 映射；随 PLAY 生命周期启停。
+	// 按 C-5 的 RTCP 带宽预算发 SR，带 NTP↔RTP 映射；随 PLAY 生命周期启停。
 	if video != nil {
-		go sendSenderReports(video, playDone)
+		go s.sendSenderReports(video, playDone)
 	}
 	if audio != nil {
-		go sendSenderReports(audio, playDone)
+		go s.sendSenderReports(audio, playDone)
 	}
 	return nil
 }

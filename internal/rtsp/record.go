@@ -576,7 +576,8 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 			if blk.SSRC != track.currentSSRC() {
 				continue
 			}
-			track.recordReceiverReport(rr.SSRC, blk, time.Now())
+			now := time.Now()
+			track.recordReceiverReport(rr.SSRC, blk, now)
 
 			// C-4：换算 RTT/丢包率/抖动并输出到日志。
 			m := track.metricsSnapshot()
@@ -587,6 +588,18 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 			fmt.Printf("RTCP metrics (session=%s, %s): rtt=%s fraction_lost=%.2f%% cumulative_lost=%d/%d (%.2f%%) jitter=%.2fms\n",
 				sess.ID, track.kind, rtt, m.FractionLost*100,
 				m.CumulativeLost, m.ExpectedPackets, m.LossRate*100, m.JitterMs)
+
+			// C-6：用区间丢包率驱动发送降级/恢复。累计丢包只增不减，
+			// 不能作为恢复依据。
+			if track.degrade != nil {
+				if entered, exited := track.degrade.observe(m.FractionLost, now); entered {
+					fmt.Printf("degrade on (session=%s, %s): fraction_lost=%.2f%% over %s\n",
+						sess.ID, track.kind, m.FractionLost*100, track.degrade.cfg.Sustain)
+				} else if exited {
+					fmt.Printf("degrade off (session=%s, %s): fraction_lost=%.2f%%\n",
+						sess.ID, track.kind, m.FractionLost*100)
+				}
+			}
 		}
 	}
 }

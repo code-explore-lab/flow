@@ -90,17 +90,26 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 	sendFrame := func(nalus [][]byte, ts uint32) bool {
 		// R-8：识别这一帧是否带 IDR / 参数集，发送成功后缓存整帧的
 		// 完整 RTP 包，供 PLI/FIR 原样重放。
-		isIDR, hasParams := false, false
+		isIDR, hasParams, hasVCL := false, false, false
 		for _, n := range nalus {
 			if len(n) == 0 {
 				continue
 			}
-			switch n[0] & 0x1F {
+			typ := n[0] & 0x1F
+			switch typ {
 			case rtp.NALUTypeIDR:
 				isIDR = true
 			case rtp.NALUTypeSPS, rtp.NALUTypePPS:
 				hasParams = true
 			}
+			if typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR {
+				hasVCL = true
+			}
+		}
+		// C-6：降级期间只放行参数集和 IDR，整 AU 丢弃非关键帧。
+		// 只丢整个 AU，不拆 NALU，seq/timestamp 不会错乱。
+		if hasVCL && !isIDR && !hasParams && track.dropNonKeyFrame() {
+			return true
 		}
 
 		pkts, err := packer.PackFrame(nalus)
@@ -276,22 +285,28 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 	}
 }
 
-// sendSenderReports 每 5 秒给这条轨的客户端发一次 SR。
+// sendSenderReports 按 C-5 的共享 RTCP 带宽预算给这条轨的客户端发 SR。
+// 间隔由 rtcpScheduler 根据「在发轨数 × 平均包长 / 媒体总码率」计算，
+// 多会话时总 SR 流量不会超过媒体带宽的 2.5%；单会话均值仍是 5 秒。
+//
 // 播放器靠 NTP↔RTP 映射做音视频同步；有些播放器收不到 SR 会判定
 // 发送方失联而停止播放。会话关闭（TEARDOWN / 超时 / TCP 断开）时
 // done 关闭，goroutine 跟着退出。
-func sendSenderReports(track *mediaTrack, done <-chan struct{}) {
-	const interval = 5 * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+func (s *Server) sendSenderReports(track *mediaTrack, done <-chan struct{}) {
+	s.rtcp.add(track)
+	defer s.rtcp.remove(track)
 
 	fmt.Printf("RTCP SR sender started (%s, %s)\n", track.kind, describeTransport(track))
 	for {
+		// 每轮重新计算间隔：会话数、码率和 SR 平均长度都可能变化。
+		// 首轮没有码率样本，rtcpScheduler 会退回 5 秒基准间隔。
+		timer := time.NewTimer(s.rtcp.nextInterval(time.Now()))
 		select {
-		case <-done:
+		case <-done: //收到关闭信号，打印日志，return 退出goroutine
+			timer.Stop()
 			fmt.Printf("RTCP SR sender stopped (%s)\n", track.kind)
 			return
-		case now := <-ticker.C:
+		case now := <-timer.C:
 			sr, ok := track.senderReport(now)
 			if !ok {
 				continue // 还没发出任何 RTP，等下一轮
@@ -300,6 +315,7 @@ func sendSenderReports(track *mediaTrack, done <-chan struct{}) {
 				fmt.Printf("write rtcp sr (%s): %v\n", track.kind, err)
 				return
 			}
+			s.rtcp.noteSent(len(sr))
 			fmt.Printf("RTCP SR sent (%s, ssrc=%08x, %d bytes)\n",
 				track.kind, track.currentSSRC(), len(sr))
 		}

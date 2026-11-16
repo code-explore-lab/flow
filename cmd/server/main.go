@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"flow/internal/rtmp"
 	"flow/internal/rtsp"
@@ -33,23 +34,40 @@ import (
 //	ffmpeg -f v4l2 -i /dev/video0 -c:v libx264 -preset ultrafast -tune zerolatency \
 //	       -f h264 pipe:1 | ./flow -live
 func main() {
+	// 开启实时流
 	live := flag.Bool("live", false, "read Annex-B H.264 from stdin (e.g. ffmpeg camera pipe); audio disabled")
 	redirect := flag.String("redirect", "", "answer OPTIONS/DESCRIBE with 302 + this Location instead of serving streams")
+	// 组播配置
 	multicastAddr := flag.String("multicast-addr", "239.255.0.1", "UDP multicast group address (empty disables multicast)")
 	multicastTTL := flag.Int("multicast-ttl", 1, "UDP multicast TTL (1 = loopback/本网段)")
+	// RTSP认证相关
 	user := flag.String("user", "", "RTSP auth username (also FLOW_RTSP_USER; empty with -pass disables auth)")
 	pass := flag.String("pass", "", "RTSP auth password (also FLOW_RTSP_PASS)")
 	authFile := flag.String("auth-file", "", "credential file, username:password per line (also FLOW_RTSP_AUTH_FILE)")
 	authMode := flag.String("auth-mode", "basic", "RTSP auth scheme: basic or digest")
+	// CSeq序列号校验
 	cseqCheck := flag.Bool("cseq-check", true, "reject replayed or out-of-order CSeq on RTSP connections")
 	cseqMaxGap := flag.Int("cseq-max-gap", 0, "reject CSeq jumps larger than this (0 = unlimited)")
+	// 弱网降级
+	degradeLoss := flag.Float64("degrade-loss", 0.10, "C-6: fraction lost threshold (0~1) that triggers frame skipping")
+	degradeSustain := flag.Duration("degrade-sustain", 3*time.Second, "C-6: how long loss must stay above threshold before degrading")
+	degradeRecover := flag.Duration("degrade-recover", 5*time.Second, "C-6: how long loss must stay below threshold before recovering")
 	flag.Parse()
+	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
 		fmt.Fprintf(os.Stderr, "invalid -auth-mode %q (want basic or digest)\n", *authMode)
 		os.Exit(2)
 	}
 	if *cseqMaxGap < 0 {
 		fmt.Fprintln(os.Stderr, "invalid -cseq-max-gap (must be >= 0)")
+		os.Exit(2)
+	}
+	if *degradeLoss <= 0 || *degradeLoss > 1 {
+		fmt.Fprintln(os.Stderr, "invalid -degrade-loss (must be in (0,1])")
+		os.Exit(2)
+	}
+	if *degradeSustain <= 0 || *degradeRecover <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -degrade-sustain/-degrade-recover (must be > 0)")
 		os.Exit(2)
 	}
 	if *redirect != "" && !strings.HasPrefix(*redirect, "rtsp://") && !strings.HasPrefix(*redirect, "rtsps://") {
@@ -75,7 +93,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "auth: username is empty but password is set (use -user or FLOW_RTSP_USER)")
 		os.Exit(2)
 	}
-
 	users := map[string]string{}
 	if authFilePath != "" {
 		loaded, err := rtsp.LoadAuthFile(authFilePath)
@@ -90,6 +107,7 @@ func main() {
 		users[authUser] = authPass
 	}
 	// 媒体源构造
+	// 不带 -live 本地文件回放源
 	video := source.NewH264Source("testdata/test.h264")
 	audio := source.NewAACSource("testdata/test.aac")
 	if *live {
@@ -109,6 +127,8 @@ func main() {
 	rtspSrv.SetCSeqCheck(*cseqCheck, *cseqMaxGap)
 	rtspSrv.SetRedirect(*redirect)
 	rtspSrv.SetMulticast(*multicastAddr, *multicastTTL)
+	rtspSrv.SetDegradePolicy(*degradeLoss, *degradeSustain, *degradeRecover)
+	// 切换basic / digest认证
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
 	}

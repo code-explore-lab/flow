@@ -56,6 +56,11 @@ type Server struct {
 	multicastAddr string
 	multicastTTL  int
 
+	// C-5：所有在发轨共享的 RTCP 带宽预算与 SR 调度状态。
+	// C-6：拉流轨的丢包降级策略，SETUP 时复制到 mediaTrack。
+	rtcp    *rtcpScheduler
+	degrade degradeConfig
+
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
@@ -84,6 +89,8 @@ func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 		cseqCheck:     true,
 		multicastAddr: defaultMulticastAddr,
 		multicastTTL:  defaultMulticastTTL,
+		rtcp:          newRTCPScheduler(),
+		degrade:       defaultDegradeConfig,
 	}
 }
 
@@ -172,6 +179,21 @@ func (s *Server) SetMulticast(addr string, ttl int) {
 	}
 	s.multicastAddr = addr
 	s.multicastTTL = ttl
+}
+
+// SetDegradePolicy 配置 C-6 的丢包降级策略：
+// 区间丢包率连续 sustain 超过 lossThreshold 后只发参数集和 IDR，
+// 连续 recover 低于阈值后恢复。阈值不在 (0,1] 或窗口非正时保持默认值。
+// 必须在 Serve 之前配置；已 SETUP 的轨沿用创建时的策略。
+func (s *Server) SetDegradePolicy(lossThreshold float64, sustain, recover time.Duration) {
+	cfg := degradeConfig{
+		LossThreshold: lossThreshold,
+		Sustain:       sustain,
+		Recover:       recover,
+	}
+	if cfg.valid() {
+		s.degrade = cfg
+	}
 }
 
 // authEnabled 报告是否配置了鉴权用户。

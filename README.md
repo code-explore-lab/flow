@@ -29,11 +29,35 @@ ffmpeg -f dshow -rtbufsize 100M -i video="USB Camera" \
 
 常用参数见 `go run ./cmd/server -h`（鉴权、重定向、组播、CSeq 校验等）。
 
+压测：N 路并发 DESCRIBE/SETUP/PLAY，统计收包数、序号空洞和建连耗时；
+`-transport udp` 可切到 UDP 收流，`-d` 控制时长。
+
+```bash
+go run ./cmd/loadtest -url rtsp://127.0.0.1:8554/live -n 20 -d 5m
+```
+
+性能分析（仅回环可访问，空值关闭）：
+
+```bash
+go run ./cmd/server -pprof :6060
+
+# CPU 30s / heap / goroutine / block / mutex
+curl -o cpu.pprof "http://127.0.0.1:6060/debug/pprof/profile?seconds=30"
+curl -o heap.pprof "http://127.0.0.1:6060/debug/pprof/heap?gc=1"
+curl "http://127.0.0.1:6060/debug/pprof/goroutine?debug=1"
+curl -o block.pprof "http://127.0.0.1:6060/debug/pprof/block"
+curl -o mutex.pprof "http://127.0.0.1:6060/debug/pprof/mutex"
+
+# 浏览器里看 Top / Graph / Flame Graph
+go tool pprof -http=127.0.0.1:8081 cpu.pprof
+```
+
 ## 目录结构
 
 | 路径 | 说明 |
 | --- | --- |
 | `cmd/server/` | 服务入口：解析参数、组装媒体源、并发启动 RTSP 与 RTMP 服务 |
+| `cmd/loadtest/` | 压测客户端：N 路并发拉流，统计收包/丢包/建连耗时 |
 | `cmd/demux_test/` | 裸 H.264 文件解复用的小工具 |
 | `internal/rtsp/` | RTSP 协议层：请求解析、会话、鉴权、SR/RR、NACK/PLI、组播等 |
 | `internal/rtmp/` | RTMP 协议层：握手、Chunk、AMF0、publish/play |

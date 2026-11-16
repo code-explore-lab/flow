@@ -305,13 +305,17 @@
 
 ## E — 工程化与生产
 
-- [ ] **E-1 压测客户端**
-  - `cmd/loadtest`：N 路并发 DESCRIBE/SETUP/PLAY，统计收包数、丢包、建连耗时；
-  - 验收：20 路并发稳定运行 5 分钟。
-- [ ] **E-2 pprof 接入**
-  - `-pprof :6060` 开关，仅监听 127.0.0.1；
-  - 采集 CPU、heap、goroutine、block、mutex profile；
-  - 验收：能出火焰图并定位到封包/发送热点。
+- [x] **E-1 压测客户端**
+  - `cmd/loadtest`：N 路并发，每路独立 TCP 控制连接完成 DESCRIBE → SETUP(video) → PLAY，持续收流到时长达标后 TEARDOWN；
+  - 支持 `-transport tcp`（interleaved，默认）与 `-transport udp`（自动绑定 RTP/RTCP 端口并写 `client_port`）；会话有 60s 空闲超时，客户端每 20s 用 `GET_PARAMETER` 保活；
+  - 统计项：建连/DESCRIBE/SETUP/PLAY 耗时（p50/p95/max）、收包数与字节数、RTP 序号空洞（16 位回绕差分，乱序/重复不计丢包）、单客户端最少/平均包数；`-report` 周期输出实时速率，`-max-loss` 超阈值或会话卡流（最后 5s 无包）时退出码 1；
+  - 验收：20 路并发 TCP interleaved 跑满 5 分钟，`established=20/20`、`226340` 包（754 pkt/s，190.98 MiB）、序号空洞 0（0.000%），每路 11317 包且全程无卡流；建连 p50=1.68ms/p95=2.89ms，PLAY p50<1ms。20 路 × 15s UDP 对照同样 0 丢包。`cmd/loadtest/main_test.go` 覆盖参数解析、序号回绕/乱序/重复、RTSP 响应解析与 interleaved 分流、百分位与丢包率计算。
+- [x] **E-2 pprof 接入**
+  - `cmd/server` 新增 `-pprof`（如 `-pprof :6060`），空值不启动；`pprofListenAddr` 强制回环：`:6060` 补成 `127.0.0.1:6060`，`0.0.0.0:6060`、局域网 IP、`localhost` 一律拒绝并以退出码 2 退出；
+  - `startPprof` 用独立 `http.ServeMux` 显式注册 `Index/Cmdline/Profile/Symbol/Trace`（heap、goroutine、block、mutex 由 `Index` 按路径分发），设置 `ReadHeaderTimeout=5s`，复用 `signal.NotifyContext` 的 ctx 做 `Shutdown`；block/mutex 采样率只在开启 pprof 时设置，平时零开销；
+  - 验收：20 路 TCP 拉流 + 4Mbps 转码推流跑 90s，同时抓 30s CPU profile，服务端收 500509 包（5560 pkt/s、327.74 MiB）且 0 丢包；CPU 总样本 5.92s/30s（19.73%），累计热点集中在发送链路：`streamH264` 78.9%、`writeRTP/writeInterleavedChannel` 69.3%、`WSASend` 64.5%，另有 `SendCache.Add` 2.5% 与 `findLocked` 2.2% 的 flat 开销；heap 14.9MB（`RTPHeader.Marshal` 58.5%、`NewSendCache` 10.5%），block 顶部为 `selectgo`（`streamH264` 48.5%、`sendSenderReports` 46.4% 定时等待），mutex 顶部为 `runtime.unlock`，goroutine profile 可正常导出；
+  - 火焰图：`go tool pprof -http=127.0.0.1:8081 <profile>` 的 Flame Graph 页可正常打开；另用 `-raw` 输出渲染了静态 SVG（146 个栈、592 个样本），`writeInterleavedChannel`/`streamH264`/`SendCache` 均可见，确认热点能定位到封包/发送路径；
+  - `cmd/server/main_test.go` 覆盖 `-pprof` 地址规范化与回环限制；`gofmt`/`go vet`/`go test ./...` 通过。
 - [ ] **E-3 压测基线与优化（原 5.1.8）**
   - 记录 20 路时的 CPU、内存、goroutine 数；
   - 目标：CPU < 30%、内存 < 200MB、goroutine 随会话线性且可回收；

@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,6 +57,8 @@ func main() {
 	degradeLoss := flag.Float64("degrade-loss", 0.10, "C-6: fraction lost threshold (0~1) that triggers frame skipping")
 	degradeSustain := flag.Duration("degrade-sustain", 3*time.Second, "C-6: how long loss must stay above threshold before degrading")
 	degradeRecover := flag.Duration("degrade-recover", 5*time.Second, "C-6: how long loss must stay below threshold before recovering")
+	// E-2：pprof 调试端口，空表示关闭；只允许回环地址。
+	pprofAddr := flag.String("pprof", "", "E-2: pprof listen address, e.g. :6060 (loopback only; empty disables)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -119,6 +126,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// E-2：pprof 调试端口。必须显式开启，且只允许回环地址。
+	if *pprofAddr != "" {
+		if err := startPprof(ctx, *pprofAddr); err != nil {
+			fmt.Fprintf(os.Stderr, "pprof: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	// 两个协议共用一份注册表，实现互通。
 	reg := stream.NewRegistry()
 	rtspSrv := rtsp.New(video, audio, *live)
@@ -147,4 +162,63 @@ func main() {
 	go serve("rtsp", ":8554", rtspSrv.Serve)
 	go serve("rtmp", ":1935", rtmpSrv.Serve)
 	wg.Wait()
+}
+
+// pprofListenAddr 规范化 -pprof 的监听地址，并强制只监听回环。
+// ":6060" 会补成 "127.0.0.1:6060"；"0.0.0.0:6060"、局域网 IP、
+// "localhost" 一律拒绝，避免把 profile 接口暴露到外网。
+func pprofListenAddr(raw string) (string, error) {
+	host, port, err := net.SplitHostPort(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid -pprof %q (want :6060 or 127.0.0.1:6060): %w", raw, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("invalid -pprof %q: missing port", raw)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", fmt.Errorf("-pprof only allows loopback, got %q", host)
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// startPprof 启动 pprof HTTP 服务，仅回环可达；ctx 取消时优雅关闭。
+// block/mutex 采样只在开启 pprof 时设置，平时没有额外开销。
+func startPprof(ctx context.Context, raw string) error {
+	addr, err := pprofListenAddr(raw)
+	if err != nil {
+		return err
+	}
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+
+	// 显式注册到独立 mux，不依赖 net/http/pprof 对 DefaultServeMux 的副作用。
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Printf("pprof serve: %v\n", err)
+		}
+	}()
+	fmt.Printf("pprof listen on http://%s/debug/pprof/ (loopback only)\n", addr)
+	return nil
 }

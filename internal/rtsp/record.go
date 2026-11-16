@@ -76,7 +76,7 @@ type pushReceiver struct {
 // H.264 的 marker 位标出 AU 的最后一个包；时间戳变化作为 marker 丢失时的
 // 兜底边界。攒齐是为了在包级丢包时整帧丢弃，不把半帧发给解码器。
 type auAssembler struct {
-	has     bool
+	has     bool //是否正在攒一个 AU
 	ts      uint32
 	corrupt bool
 	nalus   [][]byte
@@ -577,9 +577,16 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 				continue
 			}
 			track.recordReceiverReport(rr.SSRC, blk, time.Now())
-			fmt.Printf("RTCP RR (%s): from=%08x fraction_lost=%d/256 cumulative_lost=%d ext_seq=%d jitter=%d lsr=%08x dlsr=%d\n",
-				track.kind, rr.SSRC, blk.FractionLost, blk.CumulativeLost,
-				blk.ExtendedHighestSeq, blk.Jitter, blk.LastSR, blk.DelaySinceLastSR)
+
+			// C-4：换算 RTT/丢包率/抖动并输出到日志。
+			m := track.metricsSnapshot()
+			rtt := "n/a"
+			if m.HasRTT {
+				rtt = m.RTT.Round(10 * time.Microsecond).String()
+			}
+			fmt.Printf("RTCP metrics (session=%s, %s): rtt=%s fraction_lost=%.2f%% cumulative_lost=%d/%d (%.2f%%) jitter=%.2fms\n",
+				sess.ID, track.kind, rtt, m.FractionLost*100,
+				m.CumulativeLost, m.ExpectedPackets, m.LossRate*100, m.JitterMs)
 		}
 	}
 }

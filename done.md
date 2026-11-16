@@ -282,12 +282,13 @@
 - [x] **C-3 解析 RR report block**
   - `internal/rtcp/rr.go`：`ReportBlock` 含 fraction lost、24 位有符号 cumulative lost（手工符号扩展）、extended highest seq、jitter、LSR、DLSR；`ParseRR` 按 RC 与 length 校验，`ParseRRs` 用 `Walk` 从复合包提取所有 `PT=201`；
   - `handleIncomingRTCP` 解析 RR，只保存 `blk.SSRC == track.currentSSRC()` 的块到 `mediaTrack.lastRR`（含上报方 SSRC、接收时刻），打印一行字段便于抓包对照；数据留给 C-4 计算 RTT/丢包率/抖动；
-  - 验收：`internal/rtcp/rr_test.go` 覆盖单块/多块/空 RR、负累计丢包符号扩展、RC 与实际长度不符、错误 PT/version/short/length、`RR+SDES` 复合包；`internal/rtsp/rr_test.go` 覆盖复合包写入 `lastRR`、其他 media SSRC 忽略；真实 e2e 探针发送 `fraction=5/cumulative=12/ext_seq=10/jitter=1234` 的 RR，服务端日志输出 `RTCP RR (video): ...`，legacy 与 rtcp-mux 均通过；ffmpeg 拉流发送的空 RR（RC=0）也能正常解析；
+  - 验收：`internal/rtcp/rr_test.go` 覆盖单块/多块/空 RR、负累计丢包符号扩展、RC 与实际长度不符、错误 PT/version/short/length、`RR+SDES` 复合包；`internal/rtsp/rr_test.go` 覆盖复合包写入 `lastRR`、其他 media SSRC 忽略；真实 e2e 探针发送 `fraction=5/cumulative=12/ext_seq=10/jitter=1234` 的 RR，服务端日志输出解析结果，legacy 与 rtcp-mux 均通过；ffmpeg 拉流发送的空 RR（RC=0）也能正常解析；
   - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
-- [ ] **C-4 计算 RTT / 丢包率 / 抖动指标**
-  - 用 LSR/DLSR 算 RTT；按会话/轨聚合丢包率和抖动；
-  - 输出到日志和指标接口（依赖 E-4）；
-  - 验收：人为丢包时指标随之变化。
+- [x] **C-4 计算 RTT / 丢包率 / 抖动指标**
+  - 新增 `internal/rtsp/metrics.go`：`TrackMetrics`/`SessionMetrics` 快照；`rttFromReport` 用 RR 的 LSR/DLSR 与 NTP 中间 32 位（单位 1/65536 秒，uint32 减法自然回绕）计算 RTT；`metricsSnapshot` 把 `FractionLost/256` 作为区间丢包率、`clamp(CumulativeLost,0)/(ExtendedHighestSeq+1)` 作为累计丢包率、`Jitter/clockRate*1000` 换算抖动毫秒；会话聚合用 `Σlost/Σexpected` 加权而不是各轨百分比平均；
+  - `handleIncomingRTCP` 保存 RR 后立即计算快照并输出 `RTCP metrics (session=..., video): rtt=... fraction_lost=... cumulative_lost=... (x%) jitter=...ms`；快照字段就是 E-4 `/metrics` 的数据源，E-4 落地后直接遍历 `Session.metricsSnapshot` 输出即可；
+  - 验收：`internal/rtsp/metrics_test.go` 覆盖 LSR/DLSR RTT（含 LSR=0 不可用）、区间/累计丢包率、负累计丢包 clamp 为 0、90000/44100 抖动换算、无 RR 时只返回发送统计、会话加权聚合与空会话；真实 e2e 用自写 RTSP 接收端每 10 包丢 1 包并按秒发 RR，服务端日志显示 `cumulative_lost=25/259 (9.65%)`、`fraction_lost≈10%`、收到 SR 后 `rtt=0.17~1.7ms`；零丢包重跑同一探针，指标变为 `0/259 (0.00%)`、RTT 正常，证明指标随人为丢包变化；
+  - `gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
 - [ ] **C-5 SR 发送策略**
   - 按 RFC 3550 的带宽比例计算间隔，支持 reduced-size SR；
   - 验收：多会话时 SR 总带宽不超标。

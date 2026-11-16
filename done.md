@@ -497,9 +497,10 @@
 - [ ] **DOC-4 覆盖率与 fuzz 基线（P2）**
   - 关键包（rtsp/rtmp/rtp/flv/stream）覆盖率目标；为各解析器加 fuzz（与 R-3 合并）；
   - 验收：覆盖率报告可查，fuzz 跑 10 分钟无崩溃。
-- [ ] **DOC-5 LICENSE（P2）**
+- [x] **DOC-5 LICENSE（P2）**
   - 选择许可证并在仓库根目录添加文件；
-  - 验收：仓库根目录有 LICENSE。
+  - 采用 MIT：无第三方依赖，许可宽松、与 Go 生态惯例一致；根目录新增 `LICENSE`，README 增加许可证小节；
+  - 验收：仓库根目录有 LICENSE，GitHub 仓库页识别为 MIT。
 - [ ] **DOC-6 版本与发布（P2）**
   - `-version` 输出、git commit/构建时间注入（ldflags）、CHANGELOG；
   - 验收：二进制能打印版本，发布流程有文档。

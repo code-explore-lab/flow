@@ -57,3 +57,7 @@ git switch stages
 
 主线只需要 `cmd/` + `internal/` 下的包结构，不再保留重复的历史实现。
 对应的学习大纲和自测题见 `docs/TASK.md`。
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。

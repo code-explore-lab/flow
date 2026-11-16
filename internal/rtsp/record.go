@@ -537,6 +537,15 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 	sess.TouchRTCP()
 	fmt.Printf("RTCP recv %d bytes (%s, pt=%d, session=%s)\n",
 		len(pkt), track.kind, pkt[1], sess.ID)
+
+	// R-7：客户端用 Generic NACK 请求重传。复合包里可能有 RR + NACK，
+	// 按 media SSRC 只处理本轨的请求。
+	for _, fb := range rtcp.ParseNACKs(pkt) {
+		if fb.MediaSSRC != track.currentSSRC() {
+			continue
+		}
+		s.retransmit(track, fb.Seqs)
+	}
 }
 
 // serveUDPMux 在 rtcp-mux 模式下从单个 UDP 端口收包：

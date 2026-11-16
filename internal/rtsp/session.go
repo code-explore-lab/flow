@@ -48,6 +48,12 @@ type mediaTrack struct {
 	// 重传的语义，SETUP 时不会创建（保持 nil）。
 	sendCache *rtp.SendCache
 
+	// R-7 重传令牌桶：RTCP 读协程收到 NACK 后按轨限速重发，
+	// 防止重复/恶意 NACK 把重传流量放大。
+	rtxMu     sync.Mutex
+	rtxTokens float64
+	rtxLast   time.Time
+
 	// 推流（ANNOUNCE/RECORD）方向：客户端把 RTP 发到服务端，服务端只接收。
 	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
 	isPush      bool

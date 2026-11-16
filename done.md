@@ -227,10 +227,12 @@
   - 验收：单测覆盖 NACK 往返、BLP 合并、回绕、非法包拒绝、FCI 上限，以及 tracker 的缺口登记、宽限期、乱序不误报、重传取消、限速与 3 次放弃、SSRC 切换、重复包/缺口上限、单包条数上限；`TestPushNACKRetransmitKeepsOrder` 丢 1 个包后读到含该 seq 的 NACK，注入重传包后 AU 按 `0x0A,0x0B,0x0C` 顺序恢复，`plc_drop=0`；
   - 真实 e2e：本地代理缓存转发的 RTP 并按 `PT=205/FMT=1` 的 PID/BLP 回灌原包；`testdata/with_audio.mp4` 每 20 包丢 1 包（509 包丢 25），服务端发出 25 个 NACK（video 20、audio 5），代理全部命中缓存重传 25 次；最终 video `packets=364 gaps=0 plc_drop=0 plc_repeat=0 pli=0`、audio `packets=137 gaps=0`，拉流 `ffmpeg -t 3 -f null -` exit 0，重传后无缺口、按序播放；
   - `gofmt -l .`/`go vet ./...`/`go test ./...` 通过，`go test -race ./internal/rtcp/ ./internal/rtpbuf/ ./internal/rtsp/` 通过。
-- [ ] **R-7 解析客户端 NACK 并重传**
-  - 解析 `PT=205, FMT=1`（RTPFB/NACK）的 PID/BLP；
-  - 从 R-1 缓存重发原包（同 seq）；限制重传速率防放大；
-  - 验收：模拟丢包后 Wireshark 能看到重传，ffplay 花屏减少。
+- [x] **R-7 解析客户端 NACK 并重传**
+  - 新增 `internal/rtcp/compound.go`：`Walk` 按 RTCP length 字段遍历复合包（客户端通常发 RR+NACK），`ParseNACKs` 提取所有 `PT=205, FMT=1` 的 PID/BLP，支持一个复合包里多条 NACK、多个 media SSRC；
+  - 重传接在 `handleIncomingRTCP`，mux / 独立 UDP RTCP / TCP interleaved 三条路径自动生效；先按 `fb.MediaSSRC == track.currentSSRC()` 过滤，再交给 `retransmit`；
+  - 新增 `internal/rtsp/retransmit.go`：seq 去重、单条 NACK 最多处理 64 个 seq；从 R-1 `sendCache` 按 seq 取回完整 RTP 包，用 `writeRTP` 原样重发（seq/timestamp/SSRC 不变，不调用 `recordSent`/`cacheSent`，SR 统计和缓存年龄不受影响）；缓存未命中（已淘汰/未发送）只记录不造包；
+  - 限速：每轨令牌桶稳态 200 包/秒、突发 64 包，`takeRTXTokens` 按经过时间补充；超限停止本轮重传并打印 `throttled`；
+  - 验收：`internal/rtcp/compound_test.go` 覆盖复合包、多 NACK、非 NACK、非法 FMT、截断 length；`internal/rtsp/retransmit_test.go` 覆盖原包字节一致重传、重复 seq 只发一次、未缓存 seq 不回应、其他 media SSRC 忽略、无缓存不 panic、令牌桶补充/上限、去重；真实 e2e 用循环推流 + 裸 RTSP 探针分别走 legacy 双端口与 rtcp-mux 单端口，NACK 一个已发送 seq 均收到 1 个字节完全相同的重传，NACK 未发送 seq 无回应；`gofmt`/`go vet`/`go test ./...` 与 `go test -race ./internal/rtcp/ ./internal/rtsp/` 通过。
 - [ ] **R-8 PLI / FIR 处理**
   - 解析 `PT=206, FMT=1`（PLI）和 `FMT=4`（FIR）；
   - 收到后补发 SPS/PPS + 最近 IDR，限频（如 1 次/秒）；

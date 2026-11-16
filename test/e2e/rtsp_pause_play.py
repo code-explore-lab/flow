@@ -11,7 +11,7 @@
 
 用法（先启动服务端，默认 8554）：
 
-    go run "Stage5/5-1-6.go"          # 或先编译成 exe 再跑
+    go run ./cmd/server               # 或先编译成 exe 再跑
     python test/e2e/rtsp_pause_play.py --port 8554
 
 退出码 0 表示通过，1 表示失败。依赖 Python 3.7+，只用标准库。

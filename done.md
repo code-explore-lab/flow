@@ -30,13 +30,13 @@
 
 ## P0（已完成）— 修复 PAUSE 语义
 
-原问题（P0-1/P0-2 已修）：`PAUSE` 只把状态改成 `Paused`，[Stage5/5-1-6.go](Stage5/5-1-6.go) 里推流 goroutine 只监听 `sess.Done()`，不会停；再次 `PLAY` 会再起一组，RTP 重复发送。
+原问题（P0-1/P0-2 已修）：`PAUSE` 只把状态改成 `Paused`，当时的单文件版本 `Stage5/5-1-6.go`（现保留在 `stages` 分支）里推流 goroutine 只监听 `sess.Done()`，不会停；再次 `PLAY` 会再起一组，RTP 重复发送。
 
 - [x] **P0-1 每次 PLAY 建立独立的流生命周期**
   - 给 `rtspSession` 增加 `playCancel context.CancelFunc` 和对应 mutex；
   - PLAY 时以会话 context（`sess.Context()`，`Close` 时取消）为父派生 `playCtx`，把 `playCtx.Done()` 传给 `streamH264` / `streamAAC` / `sendSenderReports`；
   - 重复 PLAY 复用已有生命周期，不再起第二组 goroutine；
-  - 验收：`Stage5/5-1-6_test.go` 覆盖 startPlay 幂等、stopPlay 取消消费循环、会话关闭级联取消；ffmpeg TCP 拉流 7s 后正常 TEARDOWN，SR 随 PLAY 启停。
+  - 验收：当时的 `Stage5/5-1-6_test.go`（现保留在 `stages` 分支）覆盖 startPlay 幂等、stopPlay 取消消费循环、会话关闭级联取消；ffmpeg TCP 拉流 7s 后正常 TEARDOWN，SR 随 PLAY 启停。
 - [x] **P0-2 PAUSE 时取消推流 goroutine，但保留会话**
   - PAUSE 调 `playCancel()`，state 置 `Paused`，Session、SSRC、UDP 端口、源订阅都保留；
   - 验收：PAUSE 后 1 秒内抓包无新增 RTP；会话仍在 `sessionMgr` 中；
@@ -486,9 +486,10 @@
   - AGENTS.md 的 PR 日志流程与本文 DoD 都引用了它，但仓库里没有；
   - 建立索引表 + `devlog/NNN-<slug>.md` 模板；
   - 验收：完成一个任务后能按模板追加记录。
-- [ ] **DOC-3 清理 legacy 目录（P1）**
+- [x] **DOC-3 清理 legacy 目录（P1）**
   - `Stage 1` ~ `Stage5` 是早期单文件版本；归档到 `legacy/` 或删除并在 README 说明；
   - 验收：`go build ./...` 不受影响，仓库结构清晰。
+  - ✅ 已完成：`Stage 1` ~ `Stage5` 已从 `dev` 删除，代码保留在 `stages` 分支；根目录新增 `README.md` 说明目录结构与来源；`test/e2e/rtsp_pause_play.py` 的启动命令改为 `go run ./cmd/server`，删除误命名的 `.gitnore`。
 - [ ] **DOC-4 覆盖率与 fuzz 基线（P2）**
   - 关键包（rtsp/rtmp/rtp/flv/stream）覆盖率目标；为各解析器加 fuzz（与 R-3 合并）；
   - 验收：覆盖率报告可查，fuzz 跑 10 分钟无崩溃。

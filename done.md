@@ -2,9 +2,10 @@
 
 > 当前基线（2026-11）：
 >
-> - **RTSP**：拉流 + 推流都已跑通 —— 文件/stdin 源、UDP/TCP interleaved、H.264+AAC、RTCP SR、PAUSE/PLAY、ANNOUNCE/SETUP/RECORD、RTP 收包解包、转发给拉流端、断开清理（P0-1~P0-5、P1-1~P1-9 全部完成）。
-> - **RTMP**：握手、Chunk Stream、AMF0、FLV、控制消息、publish/play、共享注册表、main 双协议接线全部完成（M0~M5，历史计划见 [rtmp.md](rtmp.md)）。
-> - **互通**：RTSP ↔ RTMP 按流名共享同一组 `ExternalSource`；本地文件回放、跨协议推拉、断开回收均已 e2e 验证。
+> - **RTSP**：拉流 + 推流都已跑通 —— 文件/stdin 源、UDP/TCP interleaved、H.264/H.265（HEVC 由推流带入）+AAC、RTCP SR、PAUSE/PLAY、ANNOUNCE/SETUP/RECORD、RTP 收包解包、转发给拉流端、断开清理（P0-1~P0-5、P1-1~P1-9 全部完成）。
+> - **RTMP**：simple/complex(digest) 握手、Chunk Stream、AMF0、FLV、控制消息、publish/play、Enhanced RTMP HEVC、共享注册表、main 双协议接线全部完成（M0~M5，历史计划见 [rtmp.md](rtmp.md)）。
+> - **互通**：RTSP ↔ RTMP 按流名共享同一组 `ExternalSource`；本地文件回放、跨协议推拉、断开回收、HEVC 跨协议转出均已 e2e 验证。
+> - **生产化**：pprof（E-2）、Prometheus `/metrics`（E-4）、连接/会话上限与超时（E-5）、白名单/建连限速/认证退避（E-8）、资源回收测试（E-9）均已实现并接入 main。
 > - 当前 `go build` / `go vet` / `go test ./...` 全绿。下面这份清单是「协议完整 + 生产可用 + 产品化」之间剩余的差距。
 >
 > 规则：
@@ -320,28 +321,34 @@
   - 记录 20 路时的 CPU、内存、goroutine 数；
   - 目标：CPU < 30%、内存 < 200MB、goroutine 随会话线性且可回收；
   - 验收：优化前后数据对比写进 `日志-导出.md`。
-- [ ] **E-4 指标与结构化日志**
+- [x] **E-4 指标与结构化日志**
   - 计数器：连接数、会话数、每轨包数/字节数、丢帧/丢包、SR/RR 数；
   - 提供 `/metrics`（Prometheus 文本）或 `/debug/vars`；
   - 验收：压测时能实时观察指标。
-- [ ] **E-5 连接/会话上限与超时**
+  - ✅ 已实现：新增 `internal/metrics` 并发安全注册表与 `-metrics :9090`（复用 E-2 的回环地址校验），`/metrics` 输出 `flow_connections(_total)`、`flow_sessions(_total)`、`flow_rtmp_publishes/plays(_total)`、`flow_rtsp_packets_sent_total` / `octets_sent_total` / `frames_dropped_total`（按 video/audio）、`flow_rtsp_sr_sent_total` / `rr_received_total`，抓取时额外采样 `flow_goroutines`（E-9）。RTSP/RTMP 共用同一注册表，在 accept/结束、PLAY/推流、发送与 RTCP 路径埋点；`metrics_test.go` 覆盖文本格式、gauge 回落与 nil 注册表。结构化日志未实现，日志仍为 `fmt.Printf`。
+- [x] **E-5 连接/会话上限与超时**
   - `-max-conns` / `-max-sessions` / 单 IP 上限；超限返回 `503` 或直接拒绝；
   - 读写超时、握手超时；
   - 验收：超限时新连接被拒，已有连接不受影响。
-- [ ] **E-6 TLS（RTSPS）**
+  - ✅ 已实现：`internal/limiter` 为 RTSP/RTMP 各维护一份「总连接 + 每 IP」计数；accept 阶段超限时 RTSP 回 `503 Service Unavailable`、RTMP 直接断开，不进入 goroutine，已有连接不受影响。`-max-sessions` 限制 RTSP 会话数，ANNOUNCE/SETUP 超限回 503。`-handshake-timeout`（默认 10s）覆盖 RTMP 握手，`-conn-timeout`（默认 60s）覆盖 RTMP 消息读写空闲；RTSP 会话另有 60s 空闲回收。`limiter_test.go` 覆盖总数/单 IP/不限制/nil，`setup_test.go` 覆盖会话上限。
+- [x] **E-6 TLS（RTSPS）**
   - `-tls-cert` / `-tls-key`，`tls.Listen` 复用现有处理逻辑；
-  - 验收：`ffmpeg -rtsp_transport tls -tls_verify 0` 拉流成功。
+  - 验收：`ffmpeg -tls_verify 0 -rtsp_transport tcp -i rtsps://host:8554/live/test` 拉流成功。
+    （ffmpeg 8 的 `-rtsp_transport` 没有 `tls` 值，TLS 由 `rtsps://` scheme 选择。）
+  - ✅ 已实现：`rtsp.Server.SetTLS(cert, key)` 用 `tls.LoadX509KeyPair` 加载 PEM（`MinVersion: TLS1.2`），`Serve` 在配置了证书时改用 `tls.Listen` 并打印 `RTSPS server listen`，accept 后的白名单/建连限速/连接上限、`remoteIP`、`RejectRTSPConn`、HTTP 隧道、鉴权与 play/publish 全部原样复用；每个 `*tls.Conn` 在 `handleConn` 前显式握手并设 10s 超时，明文客户端快速失败（日志 `tls: first record does not look like a TLS handshake`）。`cmd/server` 新增 `-tls-cert`/`-tls-key`（必须成对，不成对退出码 2；加载失败退出码 1）。`internal/rtsp/tls_test.go` 用测试内生成的自签证书覆盖：OPTIONS over TLS 成功、明文客户端被拒、缺失/不匹配证书报错。本机 e2e（自签证书 + ffmpeg 8.0.1）：`ffprobe -tls_verify 0 -rtsp_transport tcp rtsps://127.0.0.1:8554/live/test` → h264 640x480 + aac 44100；`ffmpeg ... -f rtsp rtsps://.../live/tls_push` 推流（ANNOUNCE/RECORD，881 包/827KB，gaps=0）后同 URL 用 RTSPS 拉回 → h264 320x240；明文 `rtsp://127.0.0.1:8554` 客户端被拒。证书轮换需重启，单端口 rtsp/rtsps 双协议嗅探未做。
 - [ ] **E-7 真实 USB 摄像头验证**
   - Windows：`ffmpeg -f dshow -i video="..." -c:v libx264 -tune zerolatency -f h264 pipe:1`；
   - Linux：`ffmpeg -f v4l2 -i /dev/video0 ...`；
   - 记录延迟、CPU、分辨率切换、断流重连；
   - 验收：实机连续运行 10 分钟无崩溃。
-- [ ] **E-8 访问控制 / 限流**
+- [x] **E-8 访问控制 / 限流**
   - IP 白名单（CIDR）、每 IP 建连速率限制、失败认证退避；
   - 验收：非白名单连接被拒，暴力尝试被限速。
-- [ ] **E-9 资源回收测试**
+  - ✅ 已实现：新增 `internal/access`：`Whitelist` 解析 CIDR 文件（空文件 = 关闭，IPv4-mapped IPv6 先归一）、`RateLimiter` 每 IP 令牌桶（每分钟惰性清理 5 分钟空闲桶）、`Backoff` 每 IP 失败认证指数退避（认证成功清零）。RTSP/RTMP accept 顺序为白名单 → 建连限速 → E-5 连接上限；RTSP 认证失败在回 401 前按退避时长 sleep。参数：`-whitelist-file`、`-conn-rate/-conn-burst`、`-auth-backoff-threshold/-base/-max`。单测见 `access_test.go`；实测白名单只含 `10.0.0.0/8` 时 127.0.0.1 的 RTSP/RTMP 连接均被拒（日志 `not in whitelist`），`-conn-rate 0.01 -conn-burst 1` 连续 3 条连接 1 通过 2 被限（`connection rate exceeded`），`-auth-backoff-threshold 1 -auth-backoff-base 300ms` 连续 4 次无凭据 DESCRIBE 的 401 延迟为 36/332/631/1231ms。
+- [x] **E-9 资源回收测试**
   - `kill -9` 客户端、断网、半开连接各测一遍；
   - 验收：60s 内会话回收，UDP 端口释放，goroutine 数回落。
+  - ✅ 已实现：`internal/rtsp/reclaim_test.go` 覆盖客户端被 kill -9、半开连接（CloseWrite 发 FIN）、静默断网三种场景，会话在 3s 内回收、UDP 端口可重新绑定、控制连接随会话关闭；静默断网用例把会话超时压缩到 300ms 走真实 `Sweep` 路径。`internal/rtmp/server_test.go` 增加客户端被杀后 `flow_connections{proto="rtmp"}` 回落为 0 的测试。`/metrics` 的 `flow_goroutines` 用于观测回收后 goroutine 是否回落。
 - [ ] **E-10 文档与笔记**
   - README：架构图、运行命令、协议实现范围、已知限制；
   - `docs/rtsp.md` 补充 ANNOUNCE/RECORD、RTCP 反馈、鉴权流程；
@@ -351,10 +358,11 @@
 
 ## T — RTMP 完整性与生产化
 
-- [ ] **T-1 复杂握手（complex/digest handshake，P2）**
+- [x] **T-1 复杂握手（complex/digest handshake，P2）**
   - 现状只做 simple echo（S1 版本字段清零），ffmpeg/ffplay 能退化兼容；只支持 complex handshake 的客户端会失败；
   - 实现 C1/C2/S1/S2 的 HMAC-SHA256（FP9/FP10）校验，校验失败回退 simple；
   - 验收：ffmpeg/ffplay 推拉流不变；complex-only 客户端能完成握手。
+  - ✅ 已实现：新增 `internal/rtmp/handshake_digest.go`，按 FP9/FP10 的两种 digest offset 方案（块首 / 块尾 4 字节求和 % 728）校验 C1 的 HMAC-SHA256（FP key 前 30 字节）；命中则生成带 FMS 摘要的 S1（前 36 字节）与 `random + HMAC(FMS 68B, C1 摘要)` 的 S2，并校验 C2 尾部摘要；两种方案都不命中时逐字节保持原 simple echo，C2 不符只记录不拒绝。`handshake_test.go` 覆盖两种 offset 方案、合法/损坏 C2、simple 回退；ffmpeg 8.0.1 RTMP 推拉 e2e 回归通过（h264 320x240）。本机无 librtmp/OBS，complex-only 真实客户端未联调，完整握手由合成 FP9 客户端单测覆盖。
 - [ ] **T-2 RTMPS（P2）**
   - 与 E-6 共用证书参数，用 `tls.Listen` 包住 RTMP 监听；
   - 验收：`ffmpeg -f flv rtmps://127.0.0.1:1936/live/test` 推流、`ffplay rtmps://...` 拉流成功。
@@ -392,12 +400,13 @@
 
 ---
 
-## F — 编解码与媒体能力（当前只有 H.264 + AAC，P3）
+## F — 编解码与媒体能力（当前支持 H.264/H.265 + AAC，P3）
 
-- [ ] **F-1 H.265 / HEVC**
+- [x] **F-1 H.265 / HEVC**
   - RTSP：SDP `H265/90000`、RTP 单 NALU/FU 解包打包、`sprop-vps/sps/pps`；
   - RTMP：Enhanced RTMP / HEVC FourCC；拉流端对老客户端优雅降级；
   - 验收：HEVC 推拉 RTSP/RTMP，另一协议能转出。
+  - ✅ 已实现：`stream.VideoCodec` 增加 `Codec`/`VPS`，`media.ClassifyVideoNAL` 统一 H.264/H.265 的 VPS/SPS/PPS/IDR/VCL 判定；新增 RFC 7798 `H265Packer`/`H265Depacketizer`（单 NALU / AP / FU）。RTSP 侧支持 SDP `H265/90000`、ANNOUNCE 解析与合成 `sprop-vps/sps/pps`、推流解包与拉流按编码选 packer。RTMP 侧实现 Enhanced RTMP `hvc1` FourCC 的序列头 / CodedFrames / Metadata 忽略、HEVCDecoderConfigurationRecord 编解码，并按 `fourCcList` 对不含 `hvc1` 的老客户端回 `NetStream.Play.Failed`。本地 `-live`/testdata 源仍为 H.264，HEVC 只来自推流。测试覆盖 NAL 分类、packer/depacketizer 往返、FLV 配置记录与标签、RTSP/RTMP HEVC 路径、老客户端拒绝；e2e（ffmpeg 8.0.1/libx265）RTSP→RTMP、RTMP→RTSP、RTSP→RTSP 均解出 `hevc 640x360`。
 - [ ] **F-2 音频扩展**
   - RTSP：G.711（PCMA/PCMU）、Opus、MP3；RTMP：MP3/G.711（按需求）；
   - 验收：各编码单独推拉成功，音画同步。

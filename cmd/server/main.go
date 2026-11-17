@@ -77,6 +77,10 @@ func main() {
 	backoffThreshold := flag.Int("auth-backoff-threshold", 5, "E-8: failed RTSP auth attempts before backoff")
 	backoffBase := flag.Duration("auth-backoff-base", time.Second, "E-8: base auth backoff delay (0 disables)")
 	backoffMax := flag.Duration("auth-backoff-max", 30*time.Second, "E-8: max auth backoff delay")
+	// E-6：RTSPS（RTSP over TLS）。两个 flag 必须成对出现；空表示明文 RTSP。
+	// 命名与协议无关，后续 T-2（RTMPS）可以直接复用。
+	tlsCert := flag.String("tls-cert", "", "E-6: TLS certificate file for RTSPS (requires -tls-key)")
+	tlsKey := flag.String("tls-key", "", "E-6: TLS private key file for RTSPS (requires -tls-cert)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -117,6 +121,10 @@ func main() {
 	}
 	if *backoffThreshold < 0 || *backoffBase < 0 || *backoffMax <= 0 {
 		fmt.Fprintln(os.Stderr, "invalid -auth-backoff-threshold/-auth-backoff-base/-auth-backoff-max (threshold>=0, base>=0, max>0)")
+		os.Exit(2)
+	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(os.Stderr, "-tls-cert and -tls-key must be set together")
 		os.Exit(2)
 	}
 
@@ -209,6 +217,13 @@ func main() {
 	// 切换basic / digest认证
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
+	}
+	// E-6：配置了 -tls-cert/-tls-key 就让 RTSP 监听走 TLS（RTSPS）。
+	if *tlsCert != "" {
+		if err := rtspSrv.SetTLS(*tlsCert, *tlsKey); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	rtmpSrv := rtmp.New(reg, video, audio)
 	rtmpSrv.SetMetrics(flowMetrics)

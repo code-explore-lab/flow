@@ -7,6 +7,7 @@ package rtsp
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
@@ -53,6 +54,10 @@ type Server struct {
 	// redirectURI 非空时服务器进入重定向模式：OPTIONS/DESCRIBE 回
 	// 302 Found + Location，不建会话、不推流。只在 Serve 前配置。
 	redirectURI string
+
+	// tlsConfig 非空时 Serve 用 tls.Listen 起 RTSPS（E-6）；nil 表示明文 RTSP。
+	// 只在 Serve 前配置。
+	tlsConfig *tls.Config
 
 	// multicastAddr / multicastTTL 组播发送配置。addr 为空表示关闭组播，
 	// 默认启用 239.255.0.1 / TTL 1。只在 Serve 前配置。
@@ -221,6 +226,22 @@ func (s *Server) SetRedirect(uri string) {
 	s.redirectURI = uri
 }
 
+// SetTLS 启用 RTSPS：从 PEM 文件加载证书与私钥，Serve 改用 tls.Listen。
+// 证书或私钥读取/匹配失败时返回错误，服务器保持明文模式。
+// 必须成对提供；只在 Serve 之前调用（证书轮换需重启）。
+// 启动前配置， 不支持热证书轮换
+func (s *Server) SetTLS(certFile, keyFile string) error {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("rtsp tls: %w", err)
+	}
+	s.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	return nil
+}
+
 // SetMulticast 配置组播发送的地址与 TTL。addr 为空关闭组播；ttl 越界时
 // 夹到 1~255。必须在 Serve 之前调用。
 func (s *Server) SetMulticast(addr string, ttl int) {
@@ -256,18 +277,34 @@ func (s *Server) authEnabled() bool {
 	return len(s.authUsers) > 0
 }
 
+// tlsHandshakeTimeout RTSPS 的显式 TLS 握手超时。tls.Conn 的握手是懒的
+// （首次读写才触发），不显式设限就要等到 handleConn 的读 deadline
+// （会话超时 + 扫描间隔）才失败，慢客户端会白占 goroutine。
+const tlsHandshakeTimeout = 10 * time.Second
+
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
 // 返回的错误只有监听失败这一种（Accept 错误按信号区分，正常退出返回 nil）。
 func (s *Server) Serve(ctx context.Context, addr string) error {
 	s.installExpireHook()
 	go s.sessions.Run(ctx) //启动会话管理器
 
-	listener, err := net.Listen("tcp", addr)
+	// E-6：配置了证书就用 tls.Listen（RTSPS），否则保持明文 RTSP。
+	// TLS 只是包在 TCP 外面一层，accept 循环与后续处理逻辑完全复用；
+	// tls.Conn 的 RemoteAddr() 也仍返回底层 *net.TCPAddr。
+	var listener net.Listener
+	var err error
+	scheme := "RTSP"
+	if s.tlsConfig != nil {
+		scheme = "RTSPS"
+		listener, err = tls.Listen("tcp", addr, s.tlsConfig)
+	} else {
+		listener, err = net.Listen("tcp", addr)
+	}
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	fmt.Printf("RTSP server listen on %s (Ctrl+C to stop)\n", addr)
+	fmt.Printf("%s server listen on %s (Ctrl+C to stop)\n", scheme, addr)
 	if s.live {
 		fmt.Println("input: stdin (live H.264, audio disabled)")
 	} else {
@@ -324,6 +361,17 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 			defer s.connWG.Done()
 			defer s.metrics.DecConn("rtsp")
 			defer s.limiter.Release(ip)
+			// E-6：显式完成 TLS 握手并限时，明文客户端或卡住的握手快速失败。
+			// 握手完成后清掉 deadline，交给 handleConn 按会话超时重新设置。
+			if tc, ok := c.(*tls.Conn); ok {
+				_ = tc.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
+				if err := tc.Handshake(); err != nil {
+					fmt.Printf("rtsp: tls handshake from %s: %v\n", ip, err)
+					_ = tc.Close()
+					return
+				}
+				_ = tc.SetDeadline(time.Time{})
+			}
 			s.handleConn(&Conn{Conn: c})
 		}(conn, ip)
 	}

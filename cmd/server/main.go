@@ -77,6 +77,12 @@ func main() {
 	backoffThreshold := flag.Int("auth-backoff-threshold", 5, "E-8: failed RTSP auth attempts before backoff")
 	backoffBase := flag.Duration("auth-backoff-base", time.Second, "E-8: base auth backoff delay (0 disables)")
 	backoffMax := flag.Duration("auth-backoff-max", 30*time.Second, "E-8: max auth backoff delay")
+	// T-3：RTMP token 鉴权。token 放在推/拉流名的查询串里：?token=SECRET。
+	rtmpToken := flag.String("rtmp-token", "", "T-3: RTMP token for both publish and play (also FLOW_RTMP_TOKEN)")
+	rtmpPublishToken := flag.String("rtmp-publish-token", "", "T-3: RTMP token for publish only (also FLOW_RTMP_PUBLISH_TOKEN)")
+	rtmpPlayToken := flag.String("rtmp-play-token", "", "T-3: RTMP token for play only (also FLOW_RTMP_PLAY_TOKEN)")
+	rtmpAuthFile := flag.String("rtmp-auth-file", "", "T-3: RTMP token file, lines publish:TOKEN / play:TOKEN / all:TOKEN / app:NAME (also FLOW_RTMP_AUTH_FILE)")
+	rtmpApps := flag.String("rtmp-app-whitelist", "", "T-3: comma-separated RTMP app whitelist (also FLOW_RTMP_APPS)")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -161,6 +167,30 @@ func main() {
 	if authUser != "" {
 		users[authUser] = authPass
 	}
+
+	// T-3：RTMP 鉴权，优先级同 RTSP：文件 < 环境变量 < 命令行参数。
+	// token 通过流名查询串传递；日志只打拒绝原因，不打印明文 token。
+	rtmpAuthCfg := rtmp.AuthConfig{}
+	if path := envOrFlag(*rtmpAuthFile, "FLOW_RTMP_AUTH_FILE"); path != "" {
+		loaded, err := rtmp.LoadAuthFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load rtmp auth file: %v\n", err)
+			os.Exit(1)
+		}
+		rtmpAuthCfg = loaded
+		fmt.Printf("rtmp auth: loaded credentials from %s\n", path)
+	}
+	rtmpAuthCfg = rtmpAuthCfg.Add(rtmp.AuthConfig{
+		AllTokens:     oneOrNone(envOrFlag(*rtmpToken, "FLOW_RTMP_TOKEN")),
+		PublishTokens: oneOrNone(envOrFlag(*rtmpPublishToken, "FLOW_RTMP_PUBLISH_TOKEN")),
+		PlayTokens:    oneOrNone(envOrFlag(*rtmpPlayToken, "FLOW_RTMP_PLAY_TOKEN")),
+		Apps:          splitCommaList(envOrFlag(*rtmpApps, "FLOW_RTMP_APPS")),
+	})
+	rtmpAuth := rtmp.NewAuth(rtmpAuthCfg)
+	if rtmpAuth.Enabled() {
+		fmt.Println("rtmp auth: enabled (tokens and/or app whitelist)")
+	}
+
 	// 媒体源构造
 	// 不带 -live 本地文件回放源
 	video := source.NewH264Source("testdata/test.h264")
@@ -237,6 +267,7 @@ func main() {
 		srv.SetRateLimit(rtmpRate)
 		srv.SetHandshakeTimeout(*handshakeTimeout)
 		srv.SetConnTimeout(*connTimeout)
+		srv.SetAuth(rtmpAuth)
 		return srv
 	}
 	rtmpSrv := newRTMP()
@@ -276,6 +307,33 @@ func main() {
 		go serve("rtmps", *rtmpsAddr, rtmpsSrv.Serve)
 	}
 	wg.Wait()
+}
+
+// envOrFlag 返回命令行 flag 值，为空时回退到环境变量。
+func envOrFlag(flagValue, envName string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return os.Getenv(envName)
+}
+
+// oneOrNone 把非空字符串包成 0/1 个元素的切片，方便合并鉴权配置。
+func oneOrNone(v string) []string {
+	if v = strings.TrimSpace(v); v != "" {
+		return []string{v}
+	}
+	return nil
+}
+
+// splitCommaList 按逗号切分，去掉空白和空项。
+func splitCommaList(s string) []string {
+	var out []string
+	for v := range strings.SplitSeq(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // loopbackListenAddr 规范化调试/指标端点的监听地址，并强制只监听回环。

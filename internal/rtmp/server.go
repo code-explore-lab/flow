@@ -8,6 +8,7 @@ package rtmp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,9 @@ type Server struct {
 
 	// T-2：非空时 Serve 用 tls.Listen 起 RTMPS；nil 表示明文 RTMP。
 	tlsConfig *tls.Config
+
+	// T-3：RTMP token / app 白名单鉴权。nil 表示不鉴权。
+	auth *Auth
 }
 
 // New 构造一个 RTMP 服务器。reg 为 nil 时自建一份；video/audio 可以为 nil
@@ -104,6 +108,12 @@ func (s *Server) SetHandshakeTimeout(d time.Duration) {
 // 必须在 Serve 之前调用。
 func (s *Server) SetConnTimeout(d time.Duration) {
 	s.connTimeout = d
+}
+
+// SetAuth 注入 RTMP 鉴权配置（T-3）。nil 表示不鉴权。
+// 必须在 Serve 之前调用。
+func (s *Server) SetAuth(a *Auth) {
+	s.auth = a
 }
 
 // SetTLS 启用 RTMPS：从 PEM 文件加载证书与私钥，Serve 改用 tls.Listen。
@@ -265,7 +275,10 @@ func (s *Server) handleConn(conn *Conn) {
 		switch m.TypeID {
 		case msgCommandAMF0:
 			if err := conn.handleCommand(m); err != nil {
-				fmt.Printf("rtmp: command from %s: %v\n", conn.RemoteAddr(), err)
+				// 鉴权拒绝已经回过 _error/onStatus 并单独打过日志，不再刷一条。
+				if !errors.Is(err, errAuthRejected) {
+					fmt.Printf("rtmp: command from %s: %v\n", conn.RemoteAddr(), err)
+				}
 				return
 			}
 		case msgVideo:

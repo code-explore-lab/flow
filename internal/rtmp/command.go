@@ -40,6 +40,10 @@ const (
 // connect 后下发给客户端的 chunk size。
 const connectChunkSize uint32 = 4096
 
+// errAuthRejected 表示连接因鉴权失败被拒绝：错误消息已经写回客户端，
+// 读循环收到后只需关闭连接。
+var errAuthRejected = errors.New("rtmp: connection rejected")
+
 // Command 一条解析后的命令消息。
 type Command struct {
 	Name          string
@@ -207,6 +211,12 @@ func (c *Conn) handleConnect(cmd *Command) error {
 		c.fourCCs = list
 	}
 
+	// T-3：app 白名单。拒绝时回 NetConnection.Connect.Rejected 并断开。
+	if c.srv != nil && !c.srv.auth.AppAllowed(c.app) {
+		fmt.Printf("rtmp: reject app=%q from %s: app not allowed\n", appBase(c.app), c.RemoteAddr())
+		return c.rejectConnection(cmd.TransactionID, "Application not allowed.")
+	}
+
 	if err := c.writeWindowAckSize(ackWindow); err != nil {
 		return err
 	}
@@ -227,8 +237,18 @@ func (c *Conn) handleConnect(cmd *Command) error {
 		flv.Elem("description", flv.Str("Connection succeeded.")),
 		flv.Elem("objectEncoding", flv.Num(0)),
 	)
-	fmt.Printf("rtmp: connect app=%q from %s\n", c.app, c.RemoteAddr())
+	fmt.Printf("rtmp: connect app=%q from %s\n", appBase(c.app), c.RemoteAddr())
 	return c.writeCommand(0, "_result", cmd.TransactionID, props, info)
+}
+
+// rejectConnection 回 NetConnection.Connect.Rejected 并返回 errAuthRejected，
+// 让读循环在错误消息写完后关闭连接。
+func (c *Conn) rejectConnection(txID float64, description string) error {
+	if err := c.writeCommand(0, "_error", txID, flv.Null(),
+		statusObj("error", "NetConnection.Connect.Rejected", description)); err != nil {
+		return err
+	}
+	return errAuthRejected
 }
 
 // handleCreateStream 分配一个 message stream id（从 1 开始）并回 _result。
@@ -243,7 +263,20 @@ func (c *Conn) handleCreateStream(cmd *Command) error {
 
 // handlePublish 处理 publish：登记流并回 NetStream.Publish.Start。
 func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
-	name := sanitizeStreamName(cmd.stringArg(0))
+	rawName := cmd.stringArg(0)
+	// T-3：token 在查询串里，必须在 sanitizeStreamName 剥掉之前校验。
+	// app 白名单在这里再查一次，防止客户端跳过 connect 直接 publish。
+	if c.srv != nil && !c.srv.auth.AppAllowed(c.app) {
+		fmt.Printf("rtmp: reject publish (app %q) from %s: app not allowed\n",
+			appBase(c.app), c.RemoteAddr())
+		return c.rejectConnection(cmd.TransactionID, "Application not allowed.")
+	}
+	if c.srv != nil && !c.srv.auth.Allow(rawName, c.app, permPublish) {
+		fmt.Printf("rtmp: reject publish (app %q) from %s: invalid or missing token\n",
+			appBase(c.app), c.RemoteAddr())
+		return c.rejectConnection(cmd.TransactionID, "Publish not authorized.")
+	}
+	name := sanitizeStreamName(rawName)
 	if name == "" {
 		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
 			statusObj("error", "NetStream.Publish.BadName", "empty stream name"))
@@ -263,7 +296,7 @@ func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
 	c.srv.metrics.IncPublish()
 	c.srv.metrics.IncPublishTotal()
 
-	fmt.Printf("rtmp: publish %q (app %q) from %s\n", name, c.app, c.RemoteAddr())
+	fmt.Printf("rtmp: publish %q (app %q) from %s\n", name, appBase(c.app), c.RemoteAddr())
 	return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
 		statusObj("status", "NetStream.Publish.Start", "Start publishing"))
 }

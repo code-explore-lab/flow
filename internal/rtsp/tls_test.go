@@ -141,15 +141,28 @@ func TestServeRTSPS(t *testing.T) {
 	}
 }
 
+// dialPlaintext 轮询建立明文 TCP 连接，等 Serve 真正开始监听（端口刚释放，有窗口）。
+func dialPlaintext(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			return c
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestRTSPSRejectsPlaintext 验证明文客户端连 TLS 端口不会拿到 RTSP 响应：
 // 显式 TLS 握手失败后连接被关闭。
 func TestRTSPSRejectsPlaintext(t *testing.T) {
 	addr := startRTSPServer(t)
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	conn := dialPlaintext(t, addr)
 	defer conn.Close()
 	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)

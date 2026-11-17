@@ -87,7 +87,23 @@ func (c *Conn) supportsHEVC() bool {
 
 // handlePlay 处理 play 命令：选定帧源、订阅、回状态并启动播放 goroutine。
 func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
-	name := sanitizeStreamName(cmd.stringArg(0))
+	rawName := cmd.stringArg(0)
+	// T-3：token 在查询串里，必须在 sanitizeStreamName 剥掉之前校验。
+	// app 白名单在这里再查一次，防止客户端跳过 connect 直接 play。
+	// 鉴权失败统一回 StreamNotFound，不暴露流是否存在。
+	if c.srv != nil && !c.srv.auth.AppAllowed(c.app) {
+		fmt.Printf("rtmp: reject play (app %q) from %s: app not allowed\n",
+			appBase(c.app), c.RemoteAddr())
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("error", "NetStream.Play.StreamNotFound", "no stream named "+sanitizeStreamName(rawName)))
+	}
+	if c.srv != nil && !c.srv.auth.Allow(rawName, c.app, permPlay) {
+		fmt.Printf("rtmp: reject play (app %q) from %s: invalid or missing token\n",
+			appBase(c.app), c.RemoteAddr())
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("error", "NetStream.Play.StreamNotFound", "no stream named "+sanitizeStreamName(rawName)))
+	}
+	name := sanitizeStreamName(rawName)
 	if name == "" {
 		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
 			statusObj("error", "NetStream.Play.StreamNotFound", "empty stream name"))
@@ -164,7 +180,7 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 	ps := &playState{streamID: streamID, cancel: make(chan struct{})}
 	c.play = ps
 
-	fmt.Printf("rtmp: play %q (app %q) from %s\n", name, c.app, c.RemoteAddr())
+	fmt.Printf("rtmp: play %q (app %q) from %s\n", name, appBase(c.app), c.RemoteAddr())
 
 	if err := c.writeCommand(streamID, "onStatus", 0, flv.Null(),
 		statusObj("status", "NetStream.Play.Reset", "Playing and resetting "+name)); err != nil {

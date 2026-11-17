@@ -124,6 +124,54 @@ func TestHandleConnect(t *testing.T) {
 	}
 }
 
+func TestHandleConnectCustomChunkSize(t *testing.T) {
+	server, client := pipeConns(t)
+	server.srv = New(nil, nil, nil)
+	server.srv.SetChunkSize(50000)
+
+	cmd, err := parseCommand(buildCommand("connect", 1, flv.Obj(
+		flv.Elem("app", flv.Str("live")),
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errc := make(chan error, 1)
+	go func() { errc <- server.handleConnect(cmd) }()
+	for range 4 { // Window Ack Size / Set Peer Bandwidth / Set Chunk Size / _result
+		m, err := client.readMessage()
+		if err != nil {
+			t.Fatalf("readMessage: %v", err)
+		}
+		if _, err := client.handleControl(m); err != nil {
+			t.Fatalf("handleControl: %v", err)
+		}
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("handleConnect: %v", err)
+	}
+
+	if server.writeChunkSize != 50000 {
+		t.Fatalf("server writeChunkSize = %d, want 50000", server.writeChunkSize)
+	}
+	if client.readChunkSize != 50000 {
+		t.Fatalf("client readChunkSize = %d, want 50000", client.readChunkSize)
+	}
+}
+
+func TestSetChunkSizeRejectsInvalid(t *testing.T) {
+	srv := New(nil, nil, nil)
+	srv.SetChunkSize(0)
+	srv.SetChunkSize(maxChunkSize + 1)
+	if srv.chunkSize != 0 {
+		t.Fatalf("chunkSize = %d after invalid values, want 0", srv.chunkSize)
+	}
+	srv.SetChunkSize(60000)
+	if srv.chunkSize != 60000 {
+		t.Fatalf("chunkSize = %d, want 60000", srv.chunkSize)
+	}
+}
+
 func TestHandleCreateStream(t *testing.T) {
 	server, client := pipeConns(t)
 	for want := 1; want <= 2; want++ {

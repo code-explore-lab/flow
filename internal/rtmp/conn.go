@@ -153,6 +153,24 @@ func (st *chunkStream) reset() {
 	st.received = 0
 }
 
+// maxAssemblePrealloc 是单条消息预分配重组缓冲的上限。常见视频帧都
+// 小于 1MB；更大的消息（协议上限 16MB）按需增长，避免对端只发一个
+// 超大 length 就让本端立刻分配十几 MB。
+const maxAssemblePrealloc = 1 << 20
+
+// begin 开始一条新消息：复用上次缓冲的容量，按 message length 一次
+// 预分配，后续每个 chunk 直接读进缓冲区尾部，避免逐片 append 的增长和
+// 拷贝（T-7：4096 chunk 下 150KB 关键帧原来要 append 37 次）。
+func (st *chunkStream) begin(length uint32) {
+	st.received = 0
+	want := min(int(length), maxAssemblePrealloc)
+	if cap(st.buf) >= want {
+		st.buf = st.buf[:want]
+		return
+	}
+	st.buf = make([]byte, want)
+}
+
 // write 串行写一整块字节。
 func (c *Conn) write(b []byte) error {
 	c.mu.Lock()

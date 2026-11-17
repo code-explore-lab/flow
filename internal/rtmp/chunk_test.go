@@ -245,6 +245,34 @@ func TestExtendedTimestampContinuation(t *testing.T) {
 	}
 }
 
+func TestReadMessageLargeMessageAcrossChunks(t *testing.T) {
+	// 超过 maxAssemblePrealloc 的消息走按需增长路径，验证跨 chunk 拼装正确。
+	payload := make([]byte, 2*maxAssemblePrealloc+12345)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	m := &Message{TypeID: msgVideo, StreamID: 1, Timestamp: 40, Payload: payload}
+
+	w := &Conn{Conn: &bufConn{}, writeChunkSize: 4096}
+	if err := w.writeMessage(m, videoCSID); err != nil {
+		t.Fatalf("writeMessage: %v", err)
+	}
+	raw := w.Conn.(*bufConn).Bytes()
+
+	r := &Conn{
+		br:            bufio.NewReader(bytes.NewReader(raw)),
+		readChunkSize: 4096,
+		chunks:        make(map[uint32]*chunkStream),
+	}
+	got, err := r.readMessage()
+	if err != nil {
+		t.Fatalf("readMessage: %v", err)
+	}
+	if got.Timestamp != 40 || !bytes.Equal(got.Payload, payload) {
+		t.Fatalf("got ts=%d len=%d, want 40/%d", got.Timestamp, len(got.Payload), len(payload))
+	}
+}
+
 func TestSetChunkSizeAffectsReassembly(t *testing.T) {
 	// 读端 chunk size 设为 200，发送端按 200 拆片（200 + 200 + 100）。
 	payload := bytes.Repeat([]byte{0xEF}, 500)

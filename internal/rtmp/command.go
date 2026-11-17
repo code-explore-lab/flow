@@ -260,7 +260,11 @@ func (c *Conn) handleConnect(cmd *Command) error {
 	if err := c.writeSetPeerBandwidth(ackWindow, bandwidthDynamic); err != nil {
 		return err
 	}
-	if err := c.writeSetChunkSize(connectChunkSize); err != nil {
+	chunkSize := connectChunkSize
+	if c.srv != nil && c.srv.chunkSize != 0 {
+		chunkSize = c.srv.chunkSize
+	}
+	if err := c.writeSetChunkSize(chunkSize); err != nil {
 		return err
 	}
 

@@ -83,6 +83,7 @@ func main() {
 	rtmpPlayToken := flag.String("rtmp-play-token", "", "T-3: RTMP token for play only (also FLOW_RTMP_PLAY_TOKEN)")
 	rtmpAuthFile := flag.String("rtmp-auth-file", "", "T-3: RTMP token file, lines publish:TOKEN / play:TOKEN / all:TOKEN / app:NAME (also FLOW_RTMP_AUTH_FILE)")
 	rtmpApps := flag.String("rtmp-app-whitelist", "", "T-3: comma-separated RTMP app whitelist (also FLOW_RTMP_APPS)")
+	rtmpChunkSize := flag.Uint("rtmp-chunk-size", 4096, "T-7: RTMP outbound chunk size advertised to peers (bytes, 1..16777215)")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -101,6 +102,10 @@ func main() {
 	}
 	if *cseqMaxGap < 0 {
 		fmt.Fprintln(os.Stderr, "invalid -cseq-max-gap (must be >= 0)")
+		os.Exit(2)
+	}
+	if *rtmpChunkSize == 0 || *rtmpChunkSize > 0xFFFFFF {
+		fmt.Fprintf(os.Stderr, "invalid -rtmp-chunk-size %d (want 1..16777215)\n", *rtmpChunkSize)
 		os.Exit(2)
 	}
 	if *degradeLoss <= 0 || *degradeLoss > 1 {
@@ -272,6 +277,7 @@ func main() {
 		srv.SetHandshakeTimeout(*handshakeTimeout)
 		srv.SetConnTimeout(*connTimeout)
 		srv.SetAuth(rtmpAuth)
+		srv.SetChunkSize(uint32(*rtmpChunkSize))
 		return srv
 	}
 	rtmpSrv := newRTMP()

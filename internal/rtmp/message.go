@@ -26,6 +26,7 @@ const (
 	msgCommandAMF3 uint8 = 17 // AMF3 命令（本实现不支持）
 	msgDataAMF0    uint8 = 18 // onMetaData 等
 	msgCommandAMF0 uint8 = 20 // connect/publish/play 等
+	msgAggregate   uint8 = 22 // 聚合消息，内部是一串 FLV tag 风格子消息
 )
 
 // Set Peer Bandwidth 的限速类型。

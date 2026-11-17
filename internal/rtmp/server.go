@@ -52,6 +52,9 @@ type Server struct {
 
 	// T-3：RTMP token / app 白名单鉴权。nil 表示不鉴权。
 	auth *Auth
+
+	// T-7：connect 时向对端通告的 chunk size。0 表示用 connectChunkSize。
+	chunkSize uint32
 }
 
 // New 构造一个 RTMP 服务器。reg 为 nil 时自建一份；video/audio 可以为 nil
@@ -94,6 +97,16 @@ func (s *Server) SetWhitelist(w *access.Whitelist) {
 // 必须在 Serve 之前调用。
 func (s *Server) SetRateLimit(r *access.RateLimiter) {
 	s.rate = r
+}
+
+// SetChunkSize 设置 connect 时向对端通告的 chunk size（T-7），默认
+// connectChunkSize（4096）。非法值（0 或超过 maxChunkSize）忽略。
+// 必须在 Serve 之前调用。
+func (s *Server) SetChunkSize(n uint32) {
+	if n == 0 || n > maxChunkSize {
+		return
+	}
+	s.chunkSize = n
 }
 
 // SetHandshakeTimeout 设置握手超时（E-5）。<=0 表示不设超时。
@@ -287,6 +300,12 @@ func (s *Server) handleConn(conn *Conn) {
 			conn.handleAudio(m)
 		case msgDataAMF0:
 			conn.handleData(m)
+		case msgAggregate:
+			// T-7：聚合消息拆成子消息后按普通消息处理。
+			if err := conn.handleAggregate(m); err != nil {
+				fmt.Printf("rtmp: aggregate from %s: %v\n", conn.RemoteAddr(), err)
+				return
+			}
 		default:
 			// msgDataAMF3(15)、msgCommandAMF3(17) 等不支持的 AMF3 消息
 			// 与未知类型忽略。

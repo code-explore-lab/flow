@@ -99,7 +99,7 @@ func (c *Conn) readMessage() (*Message, error) {
 			st.typeID = typeID
 			st.streamID = streamID
 			st.extTimestamp = ext
-			st.reset()
+			st.begin(st.length)
 		case 1:
 			delta, ext, err := readUint24Ext(c.br)
 			if err != nil {
@@ -123,7 +123,7 @@ func (c *Conn) readMessage() (*Message, error) {
 			st.length = length
 			st.typeID = typeID
 			st.extTimestamp = ext
-			st.reset()
+			st.begin(st.length)
 		case 2:
 			delta, ext, err := readUint24Ext(c.br)
 			if err != nil {
@@ -137,7 +137,7 @@ func (c *Conn) readMessage() (*Message, error) {
 			st.timestampDelta = delta
 			st.timestamp += delta
 			st.extTimestamp = ext
-			st.reset()
+			st.begin(st.length)
 		case 3:
 			if st.extTimestamp {
 				// 该消息用扩展时间戳时，每个 fmt 3 chunk 都重复 4 字节；
@@ -152,7 +152,7 @@ func (c *Conn) readMessage() (*Message, error) {
 					return nil, fmt.Errorf("rtmp: fmt3 chunk with no prior message on csid %d", csid)
 				}
 				st.timestamp += st.timestampDelta
-				st.reset()
+				st.begin(st.length)
 			}
 			// received > 0：续片，什么都不改。
 		default:
@@ -165,12 +165,16 @@ func (c *Conn) readMessage() (*Message, error) {
 			n = remain
 		}
 		if n > 0 {
-			data := make([]byte, n)
-			if _, err := io.ReadFull(c.br, data); err != nil {
+			// 直接读进预分配缓冲的尾部。begin 已按 length 备好空间；
+			// 只有 Abort 后从 fmt 3 续片等异常路径才需要补足。
+			end := st.received + n
+			if int(end) > len(st.buf) {
+				st.buf = append(st.buf, make([]byte, int(end)-len(st.buf))...)
+			}
+			if _, err := io.ReadFull(c.br, st.buf[st.received:end]); err != nil {
 				return nil, err
 			}
-			st.buf = append(st.buf, data...)
-			st.received += n
+			st.received = end
 		}
 		if st.received == st.length {
 			msg := &Message{
@@ -186,7 +190,7 @@ func (c *Conn) readMessage() (*Message, error) {
 }
 
 // readUint24Ext 读 3 字节时间戳字段，并报告是否为 0xFFFFFF（扩展时间戳标记）。
-func readUint24Ext(r io.Reader) (uint32, bool, error) {
+func readUint24Ext(r io.ByteReader) (uint32, bool, error) {
 	v, err := readUint24(r)
 	if err != nil {
 		return 0, false, err
@@ -196,45 +200,51 @@ func readUint24Ext(r io.Reader) (uint32, bool, error) {
 
 // writeMessage 把一条消息按当前 writeChunkSize 拆成 chunk 写出去。
 // 第一个 chunk 用 fmt 0 完整 header，续片用 fmt 3。
+//
+// T-7：整条消息（全部 chunk）先拼进一个缓冲区，最后一次 write 写出。
+// 这样每条消息只有一次加锁/系统调用；也避免同一消息的续片之间被其它
+// goroutine 的写插入，导致接收端把 fmt 3 续片误判成另一条消息。
 func (c *Conn) writeMessage(m *Message, csid uint32) error {
 	if len(m.Payload) > 0xFFFFFF {
 		return fmt.Errorf("rtmp: message too large: %d bytes", len(m.Payload))
 	}
 
-	buf := make([]byte, 0, 16+len(m.Payload))
-	buf = append(buf, encodeBasicHeader(0, csid)...)
-	buf = appendMessageHeaderFmt0(buf, m.Timestamp, uint32(len(m.Payload)), m.TypeID, m.StreamID)
-
-	payload := m.Payload
 	chunkSize := c.writeChunkSize
 	if chunkSize == 0 {
 		chunkSize = defaultChunkSize
 	}
 
-	// 第一片。
-	n := min(chunkSize, uint32(len(payload)))
-	buf = append(buf, payload[:n]...)
-	if err := c.write(buf); err != nil {
-		return err
-	}
-	payload = payload[n:]
-
 	ext := m.Timestamp >= 0xFFFFFF
-	// fmt 3 续片。消息用扩展时间戳时，每个续片也要重复 4 字节。
-	for len(payload) > 0 {
-		n := min(chunkSize, uint32(len(payload)))
-		chunk := make([]byte, 0, len(encodeBasicHeader(3, csid))+8+int(n))
-		chunk = append(chunk, encodeBasicHeader(3, csid)...)
-		if ext {
-			chunk = appendUint32(chunk, m.Timestamp)
-		}
-		chunk = append(chunk, payload[:n]...)
-		if err := c.write(chunk); err != nil {
-			return err
-		}
-		payload = payload[n:]
+	basic := encodeBasicHeader(0, csid)
+	cont := encodeBasicHeader(3, csid)
+
+	// 预分配：fmt0 header + 扩展时间戳 + 负载 + 每个续片的 basic header
+	// （以及用扩展时间戳时每片重复的 4 字节）。
+	continuations := 0
+	if len(m.Payload) > 0 {
+		continuations = (len(m.Payload) - 1) / int(chunkSize)
 	}
-	return nil
+	capHint := len(basic) + 11 + len(m.Payload) + continuations*len(cont)
+	if ext {
+		capHint += 4 * (continuations + 1)
+	}
+	buf := make([]byte, 0, capHint)
+	buf = append(buf, basic...)
+	buf = appendMessageHeaderFmt0(buf, m.Timestamp, uint32(len(m.Payload)), m.TypeID, m.StreamID)
+
+	for off := 0; off < len(m.Payload); {
+		if off > 0 {
+			buf = append(buf, cont...)
+			if ext {
+				// 消息用扩展时间戳时，每个续片也要重复 4 字节。
+				buf = appendUint32(buf, m.Timestamp)
+			}
+		}
+		n := min(len(m.Payload)-off, int(chunkSize))
+		buf = append(buf, m.Payload[off:off+n]...)
+		off += n
+	}
+	return c.write(buf)
 }
 
 // encodeBasicHeader 编码 basic header。
@@ -270,40 +280,72 @@ func appendMessageHeaderFmt0(buf []byte, ts, length uint32, typeID uint8, stream
 	return buf
 }
 
+// 以下读取函数走 io.ByteReader（bufio.Reader.ReadByte），逐字节读。
+// 不用 io.ReadFull(r, b[:])：数组经 io.Reader 接口传递会让每个 header
+// 字段堆分配一次，4096 chunk 下每帧多出几十次小分配（T-7 基准可见）。
+
 // readByte 读 1 字节。
-func readByte(r io.Reader) (byte, error) {
-	var b [1]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return 0, err
-	}
-	return b[0], nil
+func readByte(r io.ByteReader) (byte, error) {
+	return r.ReadByte()
 }
 
 // readUint24 读 3 字节大端。
-func readUint24(r io.Reader) (uint32, error) {
-	var b [3]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
+func readUint24(r io.ByteReader) (uint32, error) {
+	b0, err := r.ReadByte()
+	if err != nil {
 		return 0, err
 	}
-	return uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2]), nil
+	b1, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b2, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	return uint32(b0)<<16 | uint32(b1)<<8 | uint32(b2), nil
 }
 
 // readUint32 读 4 字节大端。
-func readUint32(r io.Reader) (uint32, error) {
-	var b [4]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
+func readUint32(r io.ByteReader) (uint32, error) {
+	b0, err := r.ReadByte()
+	if err != nil {
 		return 0, err
 	}
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]), nil
+	b1, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b2, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b3, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	return uint32(b0)<<24 | uint32(b1)<<16 | uint32(b2)<<8 | uint32(b3), nil
 }
 
 // readUint32LE 读 4 字节小端（message stream id）。
-func readUint32LE(r io.Reader) (uint32, error) {
-	var b [4]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
+func readUint32LE(r io.ByteReader) (uint32, error) {
+	b0, err := r.ReadByte()
+	if err != nil {
 		return 0, err
 	}
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24, nil
+	b1, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b2, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b3, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	return uint32(b0) | uint32(b1)<<8 | uint32(b2)<<16 | uint32(b3)<<24, nil
 }
 
 // appendUint24 追加 3 字节大端。

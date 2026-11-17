@@ -154,16 +154,28 @@ func BuildHEVCVideoSequenceHeader(vps, sps, pps []byte) []byte {
 // BuildHEVCVideoTag 生成单个 NALU 的 HEVC 视频 tag（CodedFrames）。
 // key 决定 FrameType；cts 是组成时间偏移。
 func BuildHEVCVideoTag(nalu []byte, key bool, cts int32) []byte {
+	return BuildHEVCVideoTagNALUs([][]byte{nalu}, key, cts)
+}
+
+// BuildHEVCVideoTagNALUs 生成一个包含多个 NALU 的 HEVC 视频 tag。
+// 同一访问单元的多个 NALU 共用 tag 的 DTS/CTS。
+func BuildHEVCVideoTagNALUs(nalus [][]byte, key bool, cts int32) []byte {
 	ft := frameTypeInter
 	if key {
 		ft = frameTypeKey
 	}
-	body := make([]byte, 5+3+4+len(nalu))
+	size := 8
+	for _, nalu := range nalus {
+		size += 4 + len(nalu)
+	}
+	body := make([]byte, 8, size)
 	body[0] = exHeaderFlag | ft<<4 | exPacketTypeCodedFrames
 	binary.BigEndian.PutUint32(body[1:5], fourCCHVC1)
 	putCTS24(body[5:8], cts)
-	binary.BigEndian.PutUint32(body[8:12], uint32(len(nalu)))
-	copy(body[12:], nalu)
+	for _, nalu := range nalus {
+		body = binary.BigEndian.AppendUint32(body, uint32(len(nalu)))
+		body = append(body, nalu...)
+	}
 	return body
 }
 

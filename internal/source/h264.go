@@ -14,13 +14,21 @@ import (
 // Frame 源写入 ring buffer 的一帧数据。
 type Frame struct {
 	Data      []byte // H.264：一个 NALU（已去 Annex-B 起始码）；AAC：一个 AU（已去 ADTS 头）
-	Timestamp uint32 // 相对流起点的 RTP 时间戳（视频 90kHz，音频按采样率）
-	Keyframe  bool   // 视频：IDR；音频恒为 true，方便统一处理
+	Timestamp uint32 // 相对流起点的 RTP 时间戳 = 呈现时间 PTS（视频 90kHz，音频按采样率）
+	// CompositionTime 是 PTS − DTS（视频 90kHz，可为负；音频恒 0）。
+	// 无 B 帧时保持 0，此时 DTS == PTS。拉流端写 FLV 时间戳用 DTS，
+	// 写 CompositionTime 用这个偏移；RTSP 发送端直接用 Timestamp 作 RTP 时间戳。
+	CompositionTime int32
+	Keyframe        bool // 视频：IDR；音频恒为 true，方便统一处理
 	// AUStart 表示该 NALU 是一个新访问单元（一帧）的首个 NALU。
 	// 一帧被切成多个 slice 时，只有首 slice 为 true，其余 slice 共用
 	// 首 slice 的时间戳。拉流端据此把整帧聚合进同一个 RTP AU，
 	// 保证 marker 只打在最后一个包上。源不提供该信息时按时间戳划分 AU。
 	AUStart bool
+	// AUEnd 表示该 NALU 是当前访问单元的最后一个 NALU。推流解包器
+	// 知道 FLV tag / RTP AU 的边界，据此标记；拉流端收到 AUEnd 可以
+	// 立刻把整帧写成一个 FLV tag，不必等下一帧来确定边界。
+	AUEnd bool
 }
 
 const (

@@ -114,6 +114,26 @@ func TestHEVCVideoTagRoundTrip(t *testing.T) {
 	}
 }
 
+// TestHEVCVideoTagMultiNALUWithCTS Enhanced RTMP 的 HEVC tag 也支持多 NALU
+// 和负 CTS（B 帧 PTS 早于 DTS）。
+func TestHEVCVideoTagMultiNALUWithCTS(t *testing.T) {
+	sei := []byte{0x4E, 0x01, 0x05}
+	idr := []byte{0x26, 0x01, 0xAF, 0x12}
+	for _, cts := range []int32{80, -80} {
+		tag := BuildHEVCVideoTagNALUs([][]byte{sei, idr}, true, cts)
+		vt, err := ParseVideoTag(tag)
+		if err != nil {
+			t.Fatalf("cts=%d: %v", cts, err)
+		}
+		if vt.Codec != "H265" || !vt.Keyframe || vt.CTS != cts {
+			t.Fatalf("cts=%d: codec=%q key=%v got=%d", cts, vt.Codec, vt.Keyframe, vt.CTS)
+		}
+		if len(vt.NALUs) != 2 || !bytes.Equal(vt.NALUs[0], sei) || !bytes.Equal(vt.NALUs[1], idr) {
+			t.Fatalf("cts=%d: nalus = %x", cts, vt.NALUs)
+		}
+	}
+}
+
 func TestParseVideoTagCodecDispatch(t *testing.T) {
 	// 传统 AVC 标签仍按 H264 解析。
 	avc := BuildVideoTag([]byte{0x65, 0x88}, true, 0)

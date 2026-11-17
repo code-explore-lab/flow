@@ -95,9 +95,23 @@ func (c *Conn) handleVideo(m *Message) {
 			p.stream.EnsureVideo()
 			src = p.stream.SourceFor("video")
 		}
-		ts := videoTimestamp(m.Timestamp)
-		for _, nalu := range vt.NALUs {
-			src.Write(source.Frame{Data: nalu, Timestamp: ts, Keyframe: vt.Keyframe})
+		// FLV tag 的 timestamp 是 DTS，CompositionTime 是 PTS−DTS（毫秒）。
+		// 帧源统一存 PTS（视频 90kHz）和 CTS，拉流端据此还原两者。
+		dts := int64(videoTimestamp(m.Timestamp))
+		cts := int64(vt.CTS) * 90 // 毫秒 → 90kHz
+		pts := dts + cts
+		if pts < 0 {
+			pts = 0
+		}
+		for i, nalu := range vt.NALUs {
+			src.Write(source.Frame{
+				Data:            nalu,
+				Timestamp:       uint32(pts),
+				CompositionTime: int32(cts),
+				Keyframe:        vt.Keyframe,
+				AUStart:         i == 0,
+				AUEnd:           i == len(vt.NALUs)-1,
+			})
 		}
 	case flv.AVCEndSeq:
 		// 流结束标记，忽略；连接断开时由 stopPublish 收尾。

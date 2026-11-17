@@ -125,22 +125,44 @@ func TestVideoNALUFrames(t *testing.T) {
 	idr := []byte{0x65, 0x88, 0x84, 0x00}
 	p := []byte{0x41, 0x9a, 0x02}
 
-	c.handleVideo(&Message{TypeID: msgVideo, Timestamp: 40, Payload: flv.BuildVideoTag(idr, true, 0)})
+	// DTS=40ms、CTS=80ms → PTS=120ms，帧源存 PTS 和 CTS（90kHz）。
+	c.handleVideo(&Message{TypeID: msgVideo, Timestamp: 40, Payload: flv.BuildVideoTag(idr, true, 80)})
 	f := nextFrame(t, rd)
 	if !bytes.Equal(f.Data, idr) {
 		t.Fatalf("data = %x, want idr", f.Data)
 	}
-	if f.Timestamp != 3600 {
-		t.Fatalf("timestamp = %d, want 3600 (40ms -> 90kHz)", f.Timestamp)
+	if f.Timestamp != 10800 {
+		t.Fatalf("timestamp = %d, want 10800 (40ms+80ms -> 90kHz)", f.Timestamp)
 	}
-	if !f.Keyframe {
-		t.Fatal("IDR frame lost its keyframe flag")
+	if f.CompositionTime != 7200 {
+		t.Fatalf("composition time = %d, want 7200", f.CompositionTime)
+	}
+	if !f.Keyframe || !f.AUStart || !f.AUEnd {
+		t.Fatalf("IDR flags = key %v start %v end %v", f.Keyframe, f.AUStart, f.AUEnd)
 	}
 
-	c.handleVideo(&Message{TypeID: msgVideo, Timestamp: 80, Payload: flv.BuildVideoTag(p, false, 0)})
+	// 负 CTS：PTS 早于 DTS 的 B 帧。
+	c.handleVideo(&Message{TypeID: msgVideo, Timestamp: 80, Payload: flv.BuildVideoTag(p, false, -40)})
 	f = nextFrame(t, rd)
-	if f.Timestamp != 7200 || f.Keyframe {
-		t.Fatalf("p-frame = ts %d key %v, want 7200/false", f.Timestamp, f.Keyframe)
+	if f.Timestamp != 3600 || f.CompositionTime != -3600 || f.Keyframe {
+		t.Fatalf("b-frame = ts %d cts %d key %v, want 3600/-3600/false",
+			f.Timestamp, f.CompositionTime, f.Keyframe)
+	}
+
+	// 一个 tag 多个 NALU：共用 PTS/CTS，只有首尾标 AU 边界。
+	sei := []byte{0x06, 0x05, 0x01}
+	c.handleVideo(&Message{TypeID: msgVideo, Timestamp: 120,
+		Payload: flv.BuildVideoTagNALUs([][]byte{sei, idr}, true, 0)})
+	first := nextFrame(t, rd)
+	second := nextFrame(t, rd)
+	for i, fr := range []source.Frame{first, second} {
+		if fr.Timestamp != 10800 || fr.CompositionTime != 0 {
+			t.Fatalf("nalu %d ts/cts = %d/%d, want 10800/0", i, fr.Timestamp, fr.CompositionTime)
+		}
+	}
+	if !first.AUStart || first.AUEnd || second.AUStart || !second.AUEnd {
+		t.Fatalf("AU flags = %v/%v then %v/%v, want start.. end",
+			first.AUStart, first.AUEnd, second.AUStart, second.AUEnd)
 	}
 }
 

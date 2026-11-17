@@ -131,7 +131,18 @@ func BuildVideoSequenceHeader(sps, pps []byte) []byte {
 // BuildVideoTag 生成单个 NALU 的视频 tag 的 Data（AVCPacketType=1）。
 // key 决定 FrameType（关键帧=1，非关键帧=2）；cts 是组成时间偏移。
 func BuildVideoTag(nalu []byte, key bool, cts int32) []byte {
-	body := make([]byte, 5+4+len(nalu))
+	return BuildVideoTagNALUs([][]byte{nalu}, key, cts)
+}
+
+// BuildVideoTagNALUs 生成一个包含多个 NALU 的视频 tag（同一个访问单元）。
+// 一个访问单元（一帧）被切成多个 slice 或带 SEI 时，必须放在同一个 tag、
+// 共用同一个 DTS/CTS，否则拉流端会把它当成多帧，时间戳重复或帧序错乱。
+func BuildVideoTagNALUs(nalus [][]byte, key bool, cts int32) []byte {
+	size := 5
+	for _, nalu := range nalus {
+		size += 4 + len(nalu)
+	}
+	body := make([]byte, 5, size)
 	if key {
 		body[0] = frameTypeKey<<4 | codecIDAVC // 0x17
 	} else {
@@ -139,8 +150,10 @@ func BuildVideoTag(nalu []byte, key bool, cts int32) []byte {
 	}
 	body[1] = AVCNALU
 	putCTS24(body[2:5], cts)
-	binary.BigEndian.PutUint32(body[5:9], uint32(len(nalu)))
-	copy(body[9:], nalu)
+	for _, nalu := range nalus {
+		body = binary.BigEndian.AppendUint32(body, uint32(len(nalu)))
+		body = append(body, nalu...)
+	}
 	return body
 }
 

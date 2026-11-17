@@ -392,10 +392,11 @@
   - 解析 `pause`/`seek`；暂停停发但保留订阅，恢复后 seq/时间戳连续；文件源按 G-2 索引 seek，live 源返回不支持；
   - 验收：暂停 2s 恢复不重复/不跳变；文件 seek 后从 IDR 开始。
   - ✅ 已实现：`Command` 新增 `boolArg`/`numberArg`，`handleCommand` 分发 `pause`/`seek`。暂停：`playState` 增加带锁的暂停门闩，`playVideo`/`playAudio` 暂停期间继续消费源并缓存到每条轨 256 帧的本地队列（避免暂停超过 ring 窗口后丢帧），恢复后按原顺序补发；`relativeClock.rebase` 在缓存上限丢帧时把恢复首帧映射为上一帧 DTS+1，DTS 保持单调。暂停回 `NetStream.Pause.Notify`，恢复先回 `NetStream.Unpause.Notify` 再唤醒播放 goroutine，避免状态与媒体消息乱序。seek：新增可选接口 `seekSource`（`SubscribeFrom(start, scale)`），文件源 `H264Source`/`AACSource` 实现，实时 `ExternalSource` 不实现；`handleSeek` 先建立新订阅（失败时旧播放不受影响）、再停旧 goroutine、先回 `NetStream.Seek.Notify` 后启动新 goroutine，保证客户端在状态之后收到的媒体一定来自新位置；视频从不超过目标时间的最后一个 IDR 开始（G-2 索引），音频按 AU 对齐；新 `playState` 用 `tsOffset = 旧播放最后 DTS + 1` 叠加相对时间戳，前进/回退 seek 都不出现 DTS 倒退。live 源 seek 回 `NetStream.Seek.Failed` 且不打断当前播放。测试新增 `internal/rtmp/pause_seek_test.go`：暂停期间无媒体消息、恢复后按 160/200/240/280 连续补发；live seek 失败但播放状态保留；文件 seek 后先重发序列头、首帧为 IDR 且 ts 从 seek 前最后一帧继续；`rebase` 时间基准单测。e2e 实测（ffmpeg 8.0.1）：`ffmpeg -ss 3 -i rtmp://127.0.0.1:1935/live/test -t 1 -f null -` 触发客户端 `seek`（服务端收到 2870ms，ffmpeg 按 start time 调整），日志 `h264 seek source: start at frame 50 (ts=180000...)`、`aac seek source: start at offset 44773 (ts=125952...)`，解码 25 帧无告警。说明：暂停期间播放 goroutine 阻塞在 `Reader.Next` 时，恢复要等下一帧到达才生效（真实源持续出帧，≤1 帧间隔）；暂停超过 256 帧缓存上限时丢弃最老帧并重设时间基准，时间戳连续但内容跳到较新位置。`gofmt`/`go vet`/`go test ./...` 及 `go test -race ./internal/rtmp/` 通过。
-- [ ] **T-6 视频 CTS / B 帧时间戳（P2）**
+- [x] **T-6 视频 CTS / B 帧时间戳（P2）**
   - 现状 FLV VideoTag 的 CompositionTime 固定 0，RTSP 侧也不重建 DTS，含 B 帧素材会出现 `non monotonically increasing dts` 告警；
   - 推流侧解析 PTS-DTS 写入 CTS，拉流侧按 CTS 排序；无 B 帧时保持 0；
   - 验收：`testdata/with_audio.mp4` 推拉后 ffmpeg 无 non-monotonic 告警，帧序正确。
+  - ✅ 已实现：`source.Frame` 新增 `CompositionTime`（PTS−DTS，90kHz，有符号；音频恒 0）和 `AUEnd`（访问单元最后一个 NALU），与既有 `AUStart` 一起把「一帧多 NALU」的边界带到拉流端。FLV 侧新增 `BuildVideoTagNALUs` / `BuildHEVCVideoTagNALUs`，一个 tag 内按「4 字节长度前缀 + NALU」放多个 NALU 并写有符号 24 位 CTS；原单 NALU 构造函数改为委托。RTMP 推流（`publish.go`）把 FLV tag 时间戳当 DTS、`CompositionTime` 当 PTS−DTS 换算成 90kHz，写入帧源的 `Timestamp` 存 PTS、`CompositionTime` 存 CTS，并按 NALU 标 `AUStart`/`AUEnd`。RTMP 拉流（`play.go`）按 `(Timestamp, CompositionTime)` 聚合同一 AU 的多个 NALU，发一个 tag：`DTS = PTS−CTS`（`ticksToMillis` 四舍五入、负数向零取整，<0 钳到 0），tag 时间戳用相对 DTS，CTS 原样写回；参数集仍只进序列头，不打断 AU。RTSP 侧：ANNOUNCE SDP 解析 `a=framerate`（支持 `25`、`29.97`、`30000/1001`，非法/≤0/>240 视为无），经 `announcedTrack.Framerate` 传到 `mediaTrack`/`pushReceiver`；推流接收端 `videoDTS` 以首 AU 的 PTS 为 DTS 起点、按 `90000/framerate` 浮点累加出严格递增的 DTS，`CTS = PTS−DTS`（B 帧为负），完整 AU 和 PLC 补帧都走同一逻辑；无帧率信息时保持 DTS=PTS、CTS=0。另修复中途加入的断帧问题：`ExternalSource` 原来只预热 SPS/PPS+最近 IDR，缺 IDR 之后的参考帧，拉流端会报 `co located POCs unavailable` 继而偶发 non-monotonic；现在按最近一个 IDR 缓存整个 GOP（上限 256 帧/1MB，新 IDR 重置），订阅时连同参数集一起按序预发，缓存更新与 ring 写入同锁，保证不重复不丢帧。测试新增：FLV AVC/HEVC 多 NALU + 正负 CTS 往返；SDP `parseFramerate` 整数/小数/分数/非法值及 ANNOUNCE 带帧率；RTSP `videoDTS` 的 B 帧序列（I P B B P → DTS 0/3600/7200/10800/14400，CTS 0/7200/−3600/−3600/7200）、29.97fps 浮点累加无漂移、无帧率直通；RTMP 推流的 PTS/CTS/AU 边界（含负 CTS 与多 NALU tag）；RTMP 拉流按 CTS 还原 DTS、输出 CTS 与 AU 合并（I P B B → tag DTS 0/40/80/120ms、CTS 80/200/80/0）。e2e：`test/e2e/rtmp_matrix.py` 的 `check_pull` 增加 `non monotonically increasing dts` 断言；实测 ffmpeg 8.0.1 四项互通（RTMP↔RTSP 双向、RTMP↔RTMP、RTSP↔RTSP）在推流 2.5s 后中途加入，`-loglevel warning` 解码 4s 全部 0 条 non-monotonic、0 条 `co located POCs`；RTMP 推→拉 8s 用 `-c copy` 取流，解码 200 帧与源文件前 200 帧 `framemd5` 逐帧一致（帧序正确）；RTSP 推→RTMP 拉的 FLV tag 带正确 CTS（如 dts=40/cts=120）且 DTS 严格递增。`gofmt`/`go vet`/`go test ./...` 通过。
 - [ ] **T-7 Chunk 层优化（P2，可选）**
   - 评测 Set Chunk Size（当前 4096）对吞吐/延迟的影响；解包 Aggregate Message（type 22）；
   - 验收：压测下吞吐提升且低延迟不退化，单测覆盖聚合消息边界。
@@ -406,10 +407,11 @@
 - [ ] **T-9 RTMP 客户端 / 回源（P3，可选）**
   - 新增 client 模式：从上游 RTMP 拉流并作为一路源发布，支持断线重连；
   - 验收：上游断开后自动重连，下游明确收到流结束或持续。
-- [ ] **T-10 RTMP e2e 自动化（P1）**
+- [x] **T-10 RTMP e2e 自动化（P1）**
   - 把 rtmp.md 的手工矩阵固化为脚本：本地回放、RTMP↔RTSP 双向、RTMP↔RTMP、断开回收；
   - 断言收到帧数/音视频轨/退出码；
   - 验收：一条命令跑通全矩阵。
+  - ✅ 已实现：新增 `test/e2e/rtmp_matrix.py`（Python 3.7+ 标准库），`python test/e2e/rtmp_matrix.py` 一条命令完成编译、起服、全矩阵与清理。脚本自动挑选空闲端口，`cmd/server` 新增 `-rtsp-addr`/`-rtmp-addr` 两个监听地址参数（默认仍是 `:8554`/`:1935`），避免与本机已有进程或并行 e2e 抢端口。矩阵五项：本地文件回放（`/live/test`）、RTMP 推 → RTSP 拉、RTSP 推 → RTMP 拉、RTMP 推 → RTMP 拉、断开回收。每项用 ffmpeg `-progress pipe:2` 取解码帧数、从输入流行断言 `Video`/`Audio` 轨（并显示源编码），要求退出码 0；跨协议用例先等服务器日志 `rtmp: publish`/`published stream` 再起拉流，避免注册表未命中时 RTMP 回退本地源造成假阳性；断开回收用例直接终止推流端，断言 `rtmp: unpublished` 日志出现且 `/metrics` 的 `flow_connections`、`flow_rtmp_publishes`、`flow_rtmp_plays`、`flow_sessions` 全部回零。支持 `--case` 单跑、`--server-bin` 复用二进制、`--keep` 保留日志、`--verbose` 实时看日志；缺 ffmpeg/编译失败返回 2，用例失败返回 1。实测本机（ffmpeg 8.0.1）：五项全部 PASS，2s 拉流分别解出 48/51/48/47 帧，音视频轨为 h264+aac；全矩阵约 15s。`gofmt`/`go vet`/`go test ./...` 通过。
 
 ---
 

@@ -332,3 +332,61 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// TestParseFramerate a=framerate 支持整数、小数和分数形式；非法值按 0 处理。
+func TestParseFramerate(t *testing.T) {
+	tests := []struct {
+		in   string
+		want float64
+	}{
+		{"25", 25},
+		{"29.97", 29.97},
+		{"30000/1001", 30000.0 / 1001},
+		{" 25 ", 25},
+		{"60", 60},
+		{"", 0},
+		{"abc", 0},
+		{"0", 0},
+		{"-25", 0},
+		{"25/0", 0},
+		{"300/1", 0}, // 超过 240fps 视为非法
+	}
+	for _, tt := range tests {
+		got := parseFramerate(tt.in)
+		if tt.want == 0 {
+			if got != 0 {
+				t.Fatalf("parseFramerate(%q) = %v, want 0", tt.in, got)
+			}
+			continue
+		}
+		if diff := got - tt.want; diff > 1e-9 || diff < -1e-9 {
+			t.Fatalf("parseFramerate(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestParseAnnounceSDPFramerate a=framerate 挂在媒体段上，解析后进入
+// announcedTrack.Framerate，供 RTSP 推流侧按固定步长重建 DTS。
+func TestParseAnnounceSDPFramerate(t *testing.T) {
+	sdp := "v=0\r\n" +
+		"m=video 0 RTP/AVP 96\r\n" +
+		"a=rtpmap:96 H264/90000\r\n" +
+		"a=framerate:25\r\n" +
+		"a=control:streamid=0\r\n"
+	tracks, err := parseAnnounceSDP([]byte(sdp))
+	if err != nil {
+		t.Fatalf("parseAnnounceSDP: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].Framerate != 25 {
+		t.Fatalf("tracks = %+v, want Framerate 25", tracks)
+	}
+
+	// 没有 a=framerate 时保持 0（表示不重建 DTS）。
+	tracks, err = parseAnnounceSDP([]byte(minVideoSDP("H264")))
+	if err != nil {
+		t.Fatalf("parseAnnounceSDP(no framerate): %v", err)
+	}
+	if tracks[0].Framerate != 0 {
+		t.Fatalf("Framerate = %v, want 0", tracks[0].Framerate)
+	}
+}

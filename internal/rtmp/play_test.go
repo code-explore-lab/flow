@@ -176,6 +176,78 @@ func TestPlayVideoFromRegistry(t *testing.T) {
 	}
 }
 
+// TestPlayVideoCompositionTime 拉流侧用 PTS−CTS 还原 FLV 的 DTS 和 CTS：
+// tag 时间戳（DTS）按解码顺序单调，CTS 保留 B 帧的呈现偏移（可为负）。
+// 同一访问单元的多个 NALU 合并成一个 tag。
+func TestPlayVideoCompositionTime(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := srv.registry.Publish("live/b", &stream.Stream{})
+	sps := []byte{0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed}
+	pps := []byte{0x68, 0xee, 0x3c, 0x80}
+	st.SetVideoParams("H264", nil, sps, pps)
+	st.EnsureVideo()
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	startPlay(t, server, client, "live/b")
+	defer stopPlayer(t, server, client)
+
+	src := st.SourceFor("video")
+	sei := []byte{0x06, 0x05, 0x01}
+	idr := []byte{0x65, 0x88, 0x84, 0x00}
+	p := []byte{0x41, 0x9a, 0x02}
+
+	// 编码顺序 I P B B，PTS 分别是 80/240/160/120ms。
+	src.Write(source.Frame{Data: sei, Timestamp: 7200, CompositionTime: 7200, AUStart: true})
+	src.Write(source.Frame{Data: idr, Timestamp: 7200, CompositionTime: 7200,
+		Keyframe: true, AUEnd: true})
+	src.Write(source.Frame{Data: p, Timestamp: 21600, CompositionTime: 18000,
+		AUStart: true, AUEnd: true})
+	src.Write(source.Frame{Data: p, Timestamp: 14400, CompositionTime: 7200,
+		AUStart: true, AUEnd: true})
+	src.Write(source.Frame{Data: p, Timestamp: 10800,
+		AUStart: true, AUEnd: true})
+
+	// 序列头。
+	if m := readMessageWithin(t, client); m.TypeID != msgVideo {
+		t.Fatalf("first message type = %d, want video", m.TypeID)
+	}
+
+	want := []struct {
+		ts   uint32 // FLV DTS（相对首帧，毫秒）
+		cts  int32
+		nalu int
+		key  bool
+	}{
+		{0, 80, 2, true}, // 80/240/160/120ms 的 PTS → 0/40/80/120ms 的 DTS
+		{40, 200, 1, false},
+		{80, 80, 1, false},
+		{120, 0, 1, false},
+	}
+	for i, w := range want {
+		m := readMessageWithin(t, client)
+		if m.TypeID != msgVideo {
+			t.Fatalf("frame %d type = %d, want video", i, m.TypeID)
+		}
+		tag, err := flv.ParseVideoTag(m.Payload)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		if m.Timestamp != w.ts {
+			t.Fatalf("frame %d ts = %d, want %d", i, m.Timestamp, w.ts)
+		}
+		if tag.CTS != w.cts {
+			t.Fatalf("frame %d cts = %d, want %d", i, tag.CTS, w.cts)
+		}
+		if len(tag.NALUs) != w.nalu {
+			t.Fatalf("frame %d nalu count = %d, want %d", i, len(tag.NALUs), w.nalu)
+		}
+		if tag.Keyframe != w.key {
+			t.Fatalf("frame %d keyframe = %v, want %v", i, tag.Keyframe, w.key)
+		}
+	}
+}
+
 func TestPlayCapturesParamSetsFromFrames(t *testing.T) {
 	srv := New(nil, nil, nil)
 	// 没有 SetVideoParams 的流：模拟本地回退源（SPS/PPS 在首帧里）。

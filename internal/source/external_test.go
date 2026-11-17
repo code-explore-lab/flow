@@ -36,18 +36,20 @@ func TestExternalSourceTwoReadersSameFrames(t *testing.T) {
 	}
 }
 
-// TestExternalSourceLateJoinerGetsPreload 中途加入的订阅者先收到缓存的 SPS/PPS/IDR。
+// TestExternalSourceLateJoinerGetsPreload 中途加入的订阅者先收到缓存的
+// SPS/PPS 和整个 GOP（IDR 及其后续帧），不会重复收到实时帧。
 func TestExternalSourceLateJoinerGetsPreload(t *testing.T) {
 	src := NewExternalSource()
 	src.Write(Frame{Data: []byte{0x67, 1}, Timestamp: 0})                 // SPS
 	src.Write(Frame{Data: []byte{0x68, 2}, Timestamp: 0})                 // PPS
 	src.Write(Frame{Data: []byte{0x65, 3}, Timestamp: 0, Keyframe: true}) // IDR
 	src.Write(Frame{Data: []byte{0x41, 4}, Timestamp: 3600})              // 非 IDR
+	src.Write(Frame{Data: []byte{0x41, 5}, Timestamp: 7200})              // 非 IDR
 
 	rd, cancel := src.Subscribe()
 	defer cancel()
 
-	want := []byte{0x67, 0x68, 0x65} // 预加载顺序：SPS、PPS、IDR
+	want := []byte{0x67, 0x68, 0x65, 0x41, 0x41} // SPS、PPS，然后整个 GOP
 	for i, w := range want {
 		f, ok := nextWithTimeout(t, rd)
 		if !ok {
@@ -66,6 +68,30 @@ func TestExternalSourceLateJoinerGetsPreload(t *testing.T) {
 	}
 	if f.Data[0] != 0x41 || f.Timestamp != 10800 {
 		t.Fatalf("live frame = %#x ts=%d, want 0x41 ts=10800", f.Data[0], f.Timestamp)
+	}
+}
+
+// TestExternalSourceGOPResetsOnIDR 新关键帧开始新 GOP：订阅者只拿最新 GOP，
+// 不会收到上一个 GOP 的残留帧。
+func TestExternalSourceGOPResetsOnIDR(t *testing.T) {
+	src := NewExternalSource()
+	src.Write(Frame{Data: []byte{0x65, 1}, Timestamp: 0, Keyframe: true}) // 旧 IDR
+	src.Write(Frame{Data: []byte{0x41, 2}, Timestamp: 3600})              // 旧 GOP 的帧
+	src.Write(Frame{Data: []byte{0x65, 3}, Timestamp: 7200, Keyframe: true})
+	src.Write(Frame{Data: []byte{0x41, 4}, Timestamp: 10800})
+
+	rd, cancel := src.Subscribe()
+	defer cancel()
+
+	want := []byte{0x65, 0x41}
+	for i, w := range want {
+		f, ok := nextWithTimeout(t, rd)
+		if !ok {
+			t.Fatalf("frame %d missing", i)
+		}
+		if got := f.Data[0]; got != w {
+			t.Fatalf("frame %d = %#x, want %#x", i, got, w)
+		}
 	}
 }
 

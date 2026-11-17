@@ -71,6 +71,14 @@ type pushReceiver struct {
 	plcRepeats  uint64
 	plcDropped  uint64
 	silenceAUs  uint64
+
+	// 视频 DTS 重建（T-6）：RTP 只带 PTS，推流带 B 帧时 PTS 在到达
+	// （解码）顺序上不单调。SDP 有 a=framerate 时按固定帧间隔生成 DTS，
+	// CTS = PTS − DTS；无帧率信息时保持 CTS=0（DTS=PTS）的旧行为。
+	frameDur float64 // 每帧 90kHz ticks；0 表示不重建
+	dts      float64 // 浮点累加，避免 29.97 这类帧率长期漂移
+	dtsSet   bool
+	lastDTS  uint32
 }
 
 // auAssembler 把一个访问单元的 NALU 攒齐再发布。
@@ -92,13 +100,16 @@ func (a *auAssembler) reset() {
 // newPushReceiver 按 ANNOUNCE 协商出的编码创建解包器。
 // external 是已发布流的帧源（拉流端也要订阅同一个）；为空时退回私有源，
 // 兼容不经过 ANNOUNCE 注册发布的直接调用（单测）。
-func newPushReceiver(encoding, fmtp string, external *source.ExternalSource) (*pushReceiver, error) {
+func newPushReceiver(encoding, fmtp string, framerate float64, external *source.ExternalSource) (*pushReceiver, error) {
 	rx := &pushReceiver{
 		external:    external,
 		jbuf:        rtpbuf.New(rtpbuf.DefaultDelay),
 		nack:        rtcp.NewNACKTracker(),
 		videoPLC:    plc.NewVideo(plc.DefaultMaxRepeat),
 		pliInterval: defaultPLIInterval,
+	}
+	if framerate > 0 {
+		rx.frameDur = 90000 / framerate
 	}
 	switch strings.ToUpper(encoding) {
 	case "H264":
@@ -146,7 +157,7 @@ func (t *mediaTrack) ensurePushReceiver() (*pushReceiver, error) {
 	if t.pushRx != nil {
 		return t.pushRx, nil
 	}
-	rx, err := newPushReceiver(t.encoding, t.fmtp, t.external)
+	rx, err := newPushReceiver(t.encoding, t.fmtp, t.framerate, t.external)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +460,8 @@ func (rx *pushReceiver) flushAU(track *mediaTrack, mediaSSRC uint32) {
 
 	if !corrupt && len(nalus) > 0 {
 		rx.videoPLC.Observe(nalus)
-		rx.writeNALUs(track, nalus, ts)
+		_, cts := rx.videoDTS(ts)
+		rx.writeNALUs(track, nalus, ts, cts)
 		return
 	}
 
@@ -458,20 +470,47 @@ func (rx *pushReceiver) flushAU(track *mediaTrack, mediaSSRC uint32) {
 	rx.plcDropped++
 	rx.requestKeyframe(track, mediaSSRC)
 	if rep, ok := rx.videoPLC.Conceal(); ok {
-		rx.writeNALUs(track, rep, ts)
+		_, cts := rx.videoDTS(ts)
+		rx.writeNALUs(track, rep, ts, cts)
 		rx.plcRepeats++
 	}
 }
 
+// videoDTS 按帧率给一个视频 AU 分配解码时间，返回 DTS 和 CTS（PTS−DTS）。
+// 无帧率信息时 DTS=PTS、CTS=0，保持旧行为。
+func (rx *pushReceiver) videoDTS(pts uint32) (uint32, int32) {
+	if rx.frameDur <= 0 {
+		return pts, 0
+	}
+	if !rx.dtsSet {
+		rx.dts = float64(pts)
+		rx.dtsSet = true
+		rx.lastDTS = pts
+		return pts, 0
+	}
+	rx.dts += rx.frameDur
+	dts := uint32(rx.dts + 0.5)
+	if dts <= rx.lastDTS {
+		// 浮点取整或时间戳异常时也不让 DTS 倒退。
+		dts = rx.lastDTS + 1
+	}
+	rx.lastDTS = dts
+	return dts, int32(pts - dts)
+}
+
 // writeNALUs 把同一时间戳的一组 NALU 写入共享源。
-func (rx *pushReceiver) writeNALUs(track *mediaTrack, nalus [][]byte, ts uint32) {
-	for _, nalu := range nalus {
+// cts 是这组 NALU 共用的组成时间偏移（90kHz），首 NALU 标记为 AUStart。
+func (rx *pushReceiver) writeNALUs(track *mediaTrack, nalus [][]byte, ts uint32, cts int32) {
+	for i, nalu := range nalus {
 		typ, _ := media.VideoNALType(track.encoding, nalu)
 		class := media.ClassifyVideoNAL(track.encoding, nalu)
 		rx.external.Write(source.Frame{
-			Data:      nalu,
-			Timestamp: ts,
-			Keyframe:  class.IsIDR,
+			Data:            nalu,
+			Timestamp:       ts,
+			CompositionTime: cts,
+			Keyframe:        class.IsIDR,
+			AUStart:         i == 0,
+			AUEnd:           i == len(nalus)-1,
 		})
 		if frames := track.recordFrame(); frames == 1 {
 			fmt.Printf("push frame recv (%s): first frame type=%d ts=%d %d bytes\n",

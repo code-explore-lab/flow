@@ -30,6 +30,12 @@ type ExternalSource struct {
 	// H.264 没有 VPS，vps 为 nil。在 Write 里写、在 Subscribe 里读，都拿 mu 串行化。
 	vps, sps, pps, idr *Frame
 
+	// GOP 缓存：最近一个 IDR 起的所有帧。只补 IDR 而不补它后面的帧，
+	// 中途加入的订阅者会缺参考帧（解码器报 POC 错误、时间戳乱序），
+	// 所以订阅时按顺序把整个 GOP 先发一遍，再接实时帧。
+	gop      []Frame
+	gopBytes int
+
 	// rate 音频 RTP 时钟（= AAC 采样率），从 ANNOUNCE 的 rtpmap 带过来。
 	// 拉流端 streamAAC 用它设置 RTCP SR 的 RTP 时钟。
 	rate uint32
@@ -98,12 +104,22 @@ func newExternalSource(cacheParamSets bool) *ExternalSource {
 	}
 }
 
-// Write 写入一帧。视频轨按 NAL 类型缓存 SPS/PPS/IDR，供中途加入的订阅者预热。
-// 任意 goroutine 都可以调用；源 Close 之后写入会被忽略。
+// GOP 缓存上限：只保留最近一个关键帧起的有限窗口，防止长 GOP 无限增长。
+const (
+	maxGOPFrames = 256
+	maxGOPBytes  = 1 << 20
+)
+
+// Write 写入一帧。视频轨按 NAL 类型缓存 SPS/PPS/IDR 和最近一个 GOP，
+// 供中途加入的订阅者预热。任意 goroutine 都可以调用；源 Close 之后写入会被忽略。
+//
+// 缓存更新和 ring 写入在同一把锁里完成，Subscribe 快照到的 GOP 一定已经
+// 写进 ring（读者从当前写位置开始读，不会重复收到缓存帧）。
 func (s *ExternalSource) Write(f Frame) {
 	if s.cacheParamSets {
-		c := f
 		s.mu.Lock()
+		defer s.mu.Unlock()
+		c := f
 		class := media.ClassifyVideoNAL(s.codec, f.Data)
 		switch {
 		case class.IsVPS:
@@ -114,13 +130,23 @@ func (s *ExternalSource) Write(f Frame) {
 			s.pps = &c
 		case class.IsIDR:
 			s.idr = &c
+			// 新关键帧开始新 GOP，旧帧不再需要。
+			s.gop = s.gop[:0]
+			s.gopBytes = 0
 		}
-		s.mu.Unlock()
+		// 关键帧之后的帧都属于当前 GOP；IDR 之前的参数集不入缓存。
+		if len(s.gop) > 0 || class.IsIDR {
+			if len(s.gop) < maxGOPFrames && s.gopBytes+len(f.Data) <= maxGOPBytes {
+				s.gop = append(s.gop, c)
+				s.gopBytes += len(f.Data)
+			}
+		}
 	}
 	s.ring.Write(f)
 }
 
-// Subscribe 订阅帧。中途加入的订阅者会先收到缓存的 SPS/PPS/IDR，再跟实时帧。
+// Subscribe 订阅帧。中途加入的订阅者会先收到缓存的 SPS/PPS 和最近一个
+// GOP（关键帧及其后续帧），再跟实时帧——只补关键帧会让解码器缺参考帧。
 // 返回的 cancel 只退订，不会停止源本身。
 func (s *ExternalSource) Subscribe() (*Reader[Frame], func()) {
 	s.mu.Lock()
@@ -137,7 +163,11 @@ func (s *ExternalSource) Subscribe() (*Reader[Frame], func()) {
 		if s.pps != nil {
 			preload = append(preload, *s.pps)
 		}
-		preload = append(preload, *s.idr)
+		if len(s.gop) > 0 {
+			preload = append(preload, s.gop...)
+		} else {
+			preload = append(preload, *s.idr)
+		}
 	}
 	rd := s.ring.Subscribe(preload...)
 	return rd, rd.Close

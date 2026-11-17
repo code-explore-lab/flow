@@ -483,6 +483,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	payloadType := 0
 	encoding := ""
 	fmtp := ""
+	framerate := 0.0
 	switch {
 	case push:
 		if at, ok := rtspSess.announcedTrack(req.URI); ok {
@@ -491,6 +492,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			payloadType = at.PayloadType
 			encoding = at.Encoding
 			fmtp = at.FMTP
+			framerate = at.Framerate
 		}
 	case pub != nil:
 		if at, ok := trackByControl(pub, req.URI); ok {
@@ -499,6 +501,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			payloadType = at.PayloadType
 			encoding = at.Encoding
 			fmtp = at.FMTP
+			framerate = at.Framerate
 		}
 	}
 	if kind == "" {
@@ -517,6 +520,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 			payloadType = at.PayloadType
 			encoding = at.Encoding
 			fmtp = at.FMTP
+			framerate = at.Framerate
 		}
 	}
 
@@ -554,6 +558,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		payloadType:   payloadType,
 		encoding:      encoding,
 		fmtp:          fmtp,
+		framerate:     framerate,
 	}
 	// 推流端写这个源、拉流端订阅同一个源；本地文件/live 模式保持 nil。
 	pubForTrack := pub

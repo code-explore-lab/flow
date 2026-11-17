@@ -26,14 +26,15 @@ var (
 
 // announcedTrack 从 ANNOUNCE SDP 解析出的一条媒体轨。
 type announcedTrack struct {
-	Kind        string // "video" / "audio"
-	Control     string // 规范化后的 a=control，如 "streamid=0"；缺失时为 "trackID=<n>"
-	TrackID     string // control 里的值，如 "0"
-	PayloadType int    // SDP 动态 payload type
-	Encoding    string // rtpmap 的编码名，如 "H264" / "MPEG4-GENERIC"
-	ClockRate   int    // RTP 时钟频率
-	Channels    int    // 音频声道数，视频为 0
-	FMTP        string // a=fmtp 的原始参数串
+	Kind        string  // "video" / "audio"
+	Control     string  // 规范化后的 a=control，如 "streamid=0"；缺失时为 "trackID=<n>"
+	TrackID     string  // control 里的值，如 "0"
+	PayloadType int     // SDP 动态 payload type
+	Encoding    string  // rtpmap 的编码名，如 "H264" / "MPEG4-GENERIC"
+	ClockRate   int     // RTP 时钟频率
+	Channels    int     // 音频声道数，视频为 0
+	FMTP        string  // a=fmtp 的原始参数串
+	Framerate   float64 // a=framerate（帧/秒），缺失或非法时为 0
 }
 
 // String 用于 ANNOUNCE 日志。
@@ -51,11 +52,12 @@ func (t announcedTrack) String() string {
 
 // sdpMedia 一个 m= 段的解析中间状态。
 type sdpMedia struct {
-	kind    string
-	formats []string // 规范化后的 payload type 列表
-	rtpmap  map[string]sdpRTPMap
-	fmtp    map[string]string
-	control string
+	kind      string
+	formats   []string // 规范化后的 payload type 列表
+	rtpmap    map[string]sdpRTPMap
+	fmtp      map[string]string
+	control   string
+	framerate float64 // a=framerate，用于 RTSP 推流侧重建 DTS
 }
 
 type sdpRTPMap struct {
@@ -194,8 +196,40 @@ func (m *sdpMedia) addAttribute(attr string) error {
 		m.fmtp[pt] = params
 	case "control":
 		m.control = strings.TrimSpace(val)
+	case "framerate":
+		if fps := parseFramerate(val); fps > 0 {
+			m.framerate = fps
+		}
 	}
 	return nil
+}
+
+// parseFramerate 解析 a=framerate 的值，支持 "25"、"29.97"、"30000/1001"。
+// 非法值返回 0（调用方按“无帧率信息”处理）。
+func parseFramerate(val string) float64 {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return 0
+	}
+	var fps float64
+	if num, den, ok := strings.Cut(val, "/"); ok {
+		n, err1 := strconv.ParseFloat(strings.TrimSpace(num), 64)
+		d, err2 := strconv.ParseFloat(strings.TrimSpace(den), 64)
+		if err1 != nil || err2 != nil || d <= 0 {
+			return 0
+		}
+		fps = n / d
+	} else {
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return 0
+		}
+		fps = f
+	}
+	if fps <= 0 || fps > 240 {
+		return 0
+	}
+	return fps
 }
 
 // parseRTPMap 解析 "<pt> <encoding>/<clock>[/<channels>]"。
@@ -278,6 +312,7 @@ func (m *sdpMedia) resolve(index int) (announcedTrack, error) {
 		ClockRate:   rm.clockRate,
 		Channels:    rm.channels,
 		FMTP:        m.fmtp[pt],
+		Framerate:   m.framerate,
 	}, nil
 }
 

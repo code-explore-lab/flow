@@ -98,7 +98,7 @@ func TestHEVCAnnouncePublishAndDescribe(t *testing.T) {
 func TestHEVCPushFeedsExternalSource(t *testing.T) {
 	ext := source.NewExternalSource()
 	ext.SetCodec("H265")
-	rx, err := newPushReceiver("H265", "", ext)
+	rx, err := newPushReceiver("H265", "", 0, ext)
 	if err != nil {
 		t.Fatalf("newPushReceiver: %v", err)
 	}

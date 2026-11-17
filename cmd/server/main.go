@@ -87,6 +87,10 @@ func main() {
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
 	tlsKey := flag.String("tls-key", "", "E-6/T-2: TLS private key file for RTSPS/RTMPS (requires -tls-cert)")
+	// T-10：明文 RTSP/RTMP 监听地址可配置，方便 e2e 用空闲端口起服、
+	// 与本机已占用 8554/1935 的进程共存。
+	rtspAddr := flag.String("rtsp-addr", ":8554", "RTSP listen address")
+	rtmpAddr := flag.String("rtmp-addr", ":1935", "RTMP listen address")
 	// T-2：RTMPS 独立监听端口，明文 RTMP :1935 继续可用。
 	rtmpsAddr := flag.String("rtmps-addr", ":1936", "T-2: RTMPS listen address (only used with -tls-cert/-tls-key)")
 	flag.Parse()
@@ -301,8 +305,8 @@ func main() {
 			stop()
 		}
 	}
-	go serve("rtsp", ":8554", rtspSrv.Serve)
-	go serve("rtmp", ":1935", rtmpSrv.Serve)
+	go serve("rtsp", *rtspAddr, rtspSrv.Serve)
+	go serve("rtmp", *rtmpAddr, rtmpSrv.Serve)
 	if rtmpsSrv != nil {
 		go serve("rtmps", *rtmpsAddr, rtmpsSrv.Serve)
 	}

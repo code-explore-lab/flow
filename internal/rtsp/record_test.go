@@ -411,6 +411,80 @@ func TestPushVideoBFramesKeepAllAUs(t *testing.T) {
 	}
 }
 
+// TestVideoDTSReconstruction a=framerate 给出帧率后，RTSP 推流侧按固定
+// 帧间隔重建 DTS（RTP 只带 PTS），并用 PTS−DTS 得到前后可为负的 CTS。
+func TestVideoDTSReconstruction(t *testing.T) {
+	rx, err := newPushReceiver("H264", "", 25, source.NewExternalSource())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rx.frameDur != 3600 {
+		t.Fatalf("frameDur = %v, want 3600", rx.frameDur)
+	}
+
+	// 到达顺序 I(0) P(3) B(1) B(2) P(6)，单位 90kHz ticks。
+	ptsOrder := []uint32{0, 3 * 3600, 3600, 2 * 3600, 6 * 3600}
+	want := []struct {
+		dts uint32
+		cts int32
+	}{
+		{0, 0},
+		{3600, 7200},
+		{7200, -3600},
+		{10800, -3600},
+		{14400, 7200},
+	}
+	var last uint32
+	for i, pts := range ptsOrder {
+		dts, cts := rx.videoDTS(pts)
+		if dts != want[i].dts || cts != want[i].cts {
+			t.Fatalf("au %d (pts=%d) = dts %d cts %d, want dts %d cts %d",
+				i, pts, dts, cts, want[i].dts, want[i].cts)
+		}
+		if i > 0 && dts <= last {
+			t.Fatalf("au %d dts %d not increasing after %d", i, dts, last)
+		}
+		last = dts
+	}
+}
+
+// TestVideoDTSReconstructionRounding 29.97fps 的帧间隔不是整数 tick，
+// 用浮点累加避免每帧取整造成的漂移，DTS 仍严格递增。
+func TestVideoDTSReconstructionRounding(t *testing.T) {
+	rx, err := newPushReceiver("H264", "", 30000.0/1001, source.NewExternalSource())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last uint32
+	for i := 0; i <= 10; i++ {
+		pts := uint32(float64(i) * 90000 / (30000.0 / 1001))
+		dts, _ := rx.videoDTS(pts)
+		if i > 0 && dts <= last {
+			t.Fatalf("frame %d dts %d not increasing after %d", i, dts, last)
+		}
+		last = dts
+	}
+	// 10 个帧间隔的总步长应接近 10 × 90000/29.97 ≈ 30030。
+	if last < 30025 || last > 30035 {
+		t.Fatalf("dts after 10 intervals = %d, want ~30030", last)
+	}
+}
+
+// TestVideoDTSWithoutFramerate 没有 a=framerate 时不重建 DTS：原样返回
+// PTS、CTS=0（无 B 帧素材的行为保持不变）。
+func TestVideoDTSWithoutFramerate(t *testing.T) {
+	rx, err := newPushReceiver("H264", "", 0, source.NewExternalSource())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pts := range []uint32{0, 3600, 7200} {
+		dts, cts := rx.videoDTS(pts)
+		if dts != pts || cts != 0 {
+			t.Fatalf("pts %d -> dts %d cts %d, want passthrough", pts, dts, cts)
+		}
+	}
+}
+
 // TestPushAACFillsSilence 音频时间戳出现缺口时补 AAC-LC 静音 AU。
 func TestPushAACFillsSilence(t *testing.T) {
 	s := New(nil, nil, false)

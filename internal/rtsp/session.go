@@ -90,9 +90,10 @@ type mediaTrack struct {
 	// 推流（ANNOUNCE/RECORD）方向：客户端把 RTP 发到服务端，服务端只接收。
 	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
 	isPush      bool
-	payloadType int    // ANNOUNCE SDP 协商出的 RTP payload type
-	encoding    string // "H264" / "H265" / "MPEG4-GENERIC"
-	fmtp        string // ANNOUNCE SDP 的 a=fmtp（AAC 解包位宽用）
+	payloadType int     // ANNOUNCE SDP 协商出的 RTP payload type
+	encoding    string  // "H264" / "H265" / "MPEG4-GENERIC"
+	fmtp        string  // ANNOUNCE SDP 的 a=fmtp（AAC 解包位宽用）
+	framerate   float64 // ANNOUNCE SDP 的 a=framerate（推流侧重建 DTS 用，0 表示未知）
 
 	// external 这条轨对应的推流源：
 	//   - 推流端 SETUP 时指向已发布流（stream.Stream）的源（解包后写进去）；

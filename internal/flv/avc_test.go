@@ -154,6 +154,29 @@ func TestVideoTagMultiNALU(t *testing.T) {
 	}
 }
 
+// TestVideoTagMultiNALUWithCTS 多 NALU 的访问单元共用一个（可为负的）
+// CompositionTime；B 帧的 PTS 早于 DTS 时 CTS 是负数。
+func TestVideoTagMultiNALUWithCTS(t *testing.T) {
+	sei := []byte{0x06, 0x05, 0x01}
+	idr := []byte{0x65, 0x88, 0x84}
+	for _, cts := range []int32{80, -80} {
+		body := BuildVideoTagNALUs([][]byte{sei, idr}, true, cts)
+		if body[0] != 0x17 || body[1] != AVCNALU {
+			t.Fatalf("header = %#x/%d", body[0], body[1])
+		}
+		vt, err := ParseVideoTag(body)
+		if err != nil {
+			t.Fatalf("cts=%d: %v", cts, err)
+		}
+		if !vt.Keyframe || vt.CTS != cts {
+			t.Fatalf("cts=%d: key=%v cts=%d", cts, vt.Keyframe, vt.CTS)
+		}
+		if len(vt.NALUs) != 2 || !bytes.Equal(vt.NALUs[0], sei) || !bytes.Equal(vt.NALUs[1], idr) {
+			t.Fatalf("cts=%d: nalus = %x", cts, vt.NALUs)
+		}
+	}
+}
+
 func TestParseVideoTagErrors(t *testing.T) {
 	if _, err := ParseVideoTag([]byte{0x17}); err == nil {
 		t.Fatal("accepted too-short tag")

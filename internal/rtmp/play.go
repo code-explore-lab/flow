@@ -643,8 +643,60 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		dropped bool
 		rebase  bool
 	)
+	// 同一访问单元的 NALU 合并成一个 FLV tag：一个 tag 只有一个 DTS/CTS。
+	// 多 slice / 带 SEI 的帧如果拆成多个 tag，会被解码器当成多帧。
+	var (
+		au    []source.Frame
+		auPTS uint32
+		auCTS int32
+	)
+	sendAU := func() bool {
+		if len(au) == 0 {
+			return true
+		}
+		// 参数集可能晚于第一帧：等参数集齐了再发媒体帧。
+		if !headerSent {
+			if err := sendHeader(); err != nil {
+				return false
+			}
+			if !headerSent {
+				au = au[:0]
+				return true
+			}
+		}
+
+		nalus := make([][]byte, 0, len(au))
+		key := false
+		for _, f := range au {
+			nalus = append(nalus, f.Data)
+			key = key || f.Keyframe
+		}
+		// FLV tag 时间戳 = DTS；CompositionTime = PTS−DTS（毫秒）。
+		dtsMS := ticksToMillis(int64(auPTS) - int64(auCTS))
+		if dtsMS < 0 {
+			dtsMS = 0
+		}
+		ctsMS := int32(ticksToMillis(int64(auCTS)))
+		if rebase {
+			clock.rebase(uint32(dtsMS))
+			rebase = false
+		}
+		var payload []byte
+		if isHEVC {
+			payload = flv.BuildHEVCVideoTagNALUs(nalus, key, ctsMS)
+		} else {
+			payload = flv.BuildVideoTagNALUs(nalus, key, ctsMS)
+		}
+		au = au[:0]
+		return c.writeMessage(&Message{
+			TypeID:    msgVideo,
+			StreamID:  ps.streamID,
+			Timestamp: clock.relative(uint32(dtsMS)) + ps.tsOffset,
+			Payload:   payload,
+		}, videoCSID) == nil
+	}
 	send := func(f source.Frame) bool {
-		// 参数集只进序列头，不单独发 tag。
+		// 参数集只进序列头，不单独发 tag，也不打断当前 AU。
 		if class := media.ClassifyVideoNAL(codec, f.Data); class.IsVPS || class.IsSPS || class.IsPPS {
 			switch {
 			case class.IsVPS:
@@ -657,38 +709,30 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 			return true
 		}
 
-		// 参数集可能晚于第一帧：等参数集齐了再发媒体帧。
-		if !headerSent {
-			if err := sendHeader(); err != nil {
-				return false
+		if len(au) > 0 && !f.AUStart && f.Timestamp == auPTS && f.CompositionTime == auCTS {
+			au = append(au, f)
+			if f.AUEnd {
+				return sendAU()
 			}
-			if !headerSent {
-				return true
-			}
+			return true
 		}
-
-		ms := uint32(uint64(f.Timestamp) * 1000 / 90000)
-		if rebase {
-			clock.rebase(ms)
-			rebase = false
+		if !sendAU() {
+			return false
 		}
-		var payload []byte
-		if isHEVC {
-			payload = flv.BuildHEVCVideoTag(f.Data, f.Keyframe, 0)
-		} else {
-			payload = flv.BuildVideoTag(f.Data, f.Keyframe, 0)
+		auPTS, auCTS = f.Timestamp, f.CompositionTime
+		au = append(au, f)
+		// AUEnd 明确标了帧尾；没带任何 AU 边界信息的老源沿用旧行为：
+		// 一帧一个 tag，收到就发，避免凭空多一帧延迟。
+		if f.AUEnd || !f.AUStart {
+			return sendAU()
 		}
-		return c.writeMessage(&Message{
-			TypeID:    msgVideo,
-			StreamID:  ps.streamID,
-			Timestamp: clock.relative(ms) + ps.tsOffset,
-			Payload:   payload,
-		}, videoCSID) == nil
+		return true
 	}
 
 	for {
 		f, ok := nextPlayFrame(ps, rd, &pending, &dropped)
 		if !ok {
+			sendAU()
 			return
 		}
 		if dropped {
@@ -699,6 +743,14 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 			return
 		}
 	}
+}
+
+// ticksToMillis 把 90kHz 时基换算成毫秒（四舍五入，负数向零取整）。
+func ticksToMillis(ticks int64) int64 {
+	if ticks >= 0 {
+		return (ticks*1000 + 45000) / 90000
+	}
+	return (ticks*1000 - 45000) / 90000
 }
 
 // playAudio 把音频帧转成 FLV audio tag 发送。

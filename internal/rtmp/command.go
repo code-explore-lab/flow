@@ -330,8 +330,15 @@ func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
 	// Registry、也保证发布计数不会只增不减。
 	c.stopPublish()
 
-	// 同一个名字重复 publish 视为重新发布，Registry 会替换并关闭旧流。
-	st := c.srv.registry.Publish(name, &stream.Stream{})
+	// 同名推流按 Registry 的策略处理：默认替换旧流；reject / reject-if-active
+	// 返回 ErrPublishRejected，此时旧流保持不变，本连接不进入发布状态。
+	st, err := c.srv.registry.Publish(name, &stream.Stream{})
+	if err != nil {
+		fmt.Printf("rtmp: reject publish %q (app %q) from %s: %v\n",
+			name, appBase(c.app), c.RemoteAddr(), err)
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("error", "NetStream.Publish.BadName", "Already Publishing"))
+	}
 	c.publish = &publishState{stream: st, audioRate: defaultAACRate}
 	c.streamName = name
 	c.srv.metrics.IncPublish()

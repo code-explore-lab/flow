@@ -13,11 +13,21 @@ import (
 	"flow/internal/stream"
 )
 
+// mustPublish 在测试里登记一路流；默认 replace 策略下不会失败。
+func mustPublish(t *testing.T, reg *stream.Registry, name string) *stream.Stream {
+	t.Helper()
+	st, err := reg.Publish(name, &stream.Stream{})
+	if err != nil {
+		t.Fatalf("Publish(%q): %v", name, err)
+	}
+	return st
+}
+
 // newPublishConn 构造一条已处于推流状态的 Conn（不经过网络）。
 func newPublishConn(t *testing.T) (*Server, *Conn, *stream.Stream) {
 	t.Helper()
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("push", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "push")
 	c := &Conn{
 		srv:     srv,
 		publish: &publishState{stream: st, audioRate: defaultAACRate},

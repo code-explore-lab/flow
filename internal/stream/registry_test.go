@@ -2,6 +2,9 @@ package stream
 
 import (
 	"bytes"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,5 +160,153 @@ func TestSourceFor(t *testing.T) {
 	}
 	if got := s.SourceFor("data"); got != nil {
 		t.Fatal("SourceFor(data) != nil")
+	}
+}
+
+func TestParsePublishPolicy(t *testing.T) {
+	valid := map[string]PublishPolicy{
+		"":                  PublishReplace,
+		"replace":           PublishReplace,
+		" REPLACE ":         PublishReplace,
+		"reject":            PublishReject,
+		"reject-if-active":  PublishRejectIfActive,
+		"Reject-If-Active ": PublishRejectIfActive,
+	}
+	for in, want := range valid {
+		got, err := ParsePublishPolicy(in)
+		if err != nil {
+			t.Fatalf("ParsePublishPolicy(%q): %v", in, err)
+		}
+		if got != want {
+			t.Fatalf("ParsePublishPolicy(%q) = %v, want %v", in, got, want)
+		}
+	}
+	for _, in := range []string{"drop", "reject_if_active", "replace-all"} {
+		if _, err := ParsePublishPolicy(in); err == nil {
+			t.Fatalf("ParsePublishPolicy(%q) accepted an invalid policy", in)
+		}
+	}
+}
+
+// expectStreamStillWritable 确认旧源没有被关闭：写入一帧后订阅者能读到。
+func expectStreamStillWritable(t *testing.T, s *Stream, rd *source.Reader[source.Frame]) {
+	t.Helper()
+	s.VideoTrack().Src.Write(source.Frame{Data: []byte{0x01, 0x02}})
+
+	done := make(chan struct{})
+	defer close(done)
+	result := make(chan bool, 1)
+	go func() {
+		_, ok := rd.Next(done)
+		result <- ok
+	}()
+	select {
+	case ok := <-result:
+		if !ok {
+			t.Fatal("reader ended: old source was closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader did not receive a frame from the old source")
+	}
+}
+
+func TestPublishPolicyReject(t *testing.T) {
+	r := NewRegistry()
+	r.SetPublishPolicy(PublishReject)
+
+	old := &Stream{}
+	old.EnsureVideo()
+	rd, cancel := old.VideoTrack().Src.Subscribe()
+	defer cancel()
+	if _, err := r.Publish("live", old); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+
+	newer := &Stream{}
+	if _, err := r.Publish("live", newer); !errors.Is(err, ErrPublishRejected) {
+		t.Fatalf("second publish err = %v, want ErrPublishRejected", err)
+	}
+	if got := r.Get("live"); got != old {
+		t.Fatal("rejected publish replaced the old stream")
+	}
+	expectStreamStillWritable(t, old, rd)
+}
+
+func TestPublishPolicyRejectIfActive(t *testing.T) {
+	t.Run("active stream rejected", func(t *testing.T) {
+		r := NewRegistry()
+		r.SetPublishPolicy(PublishRejectIfActive)
+
+		old := &Stream{}
+		old.EnsureVideo()
+		rd, cancel := old.VideoTrack().Src.Subscribe()
+		defer cancel()
+		if _, err := r.Publish("live", old); err != nil {
+			t.Fatalf("first publish: %v", err)
+		}
+		old.VideoTrack().Src.Write(source.Frame{Data: []byte{0x01}})
+
+		if _, err := r.Publish("live", &Stream{}); !errors.Is(err, ErrPublishRejected) {
+			t.Fatalf("publish err = %v, want ErrPublishRejected", err)
+		}
+		if got := r.Get("live"); got != old {
+			t.Fatal("reject-if-active replaced an active stream")
+		}
+		expectStreamStillWritable(t, old, rd)
+	})
+
+	t.Run("inactive stream replaced", func(t *testing.T) {
+		r := NewRegistry()
+		r.SetPublishPolicy(PublishRejectIfActive)
+		r.activeWindow = time.Millisecond
+
+		old := &Stream{}
+		old.EnsureVideo()
+		rd, cancel := old.VideoTrack().Src.Subscribe()
+		defer cancel()
+		if _, err := r.Publish("live", old); err != nil {
+			t.Fatalf("first publish: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond) // 旧流超过活跃窗口
+		if old.Active(r.activeWindow) {
+			t.Fatal("old stream still reports active")
+		}
+
+		newer := &Stream{}
+		if _, err := r.Publish("live", newer); err != nil {
+			t.Fatalf("publish over inactive stream: %v", err)
+		}
+		if got := r.Get("live"); got != newer {
+			t.Fatal("inactive old stream was not replaced")
+		}
+		expectReaderEnded(t, rd)
+	})
+}
+
+// TestPublishPolicyRejectConcurrent 并发同名推流只能有一个成功。
+func TestPublishPolicyRejectConcurrent(t *testing.T) {
+	r := NewRegistry()
+	r.SetPublishPolicy(PublishReject)
+
+	const n = 16
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.Publish("live", &Stream{}); err == nil {
+				accepted.Add(1)
+			} else if !errors.Is(err, ErrPublishRejected) {
+				t.Errorf("Publish err = %v, want ErrPublishRejected", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("accepted publishes = %d, want 1", got)
+	}
+	if r.Len() != 1 {
+		t.Fatalf("registry Len = %d, want 1", r.Len())
 	}
 }

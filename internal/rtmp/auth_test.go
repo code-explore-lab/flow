@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"flow/internal/flv"
-	"flow/internal/stream"
 )
 
 func TestAuthAllowPermissions(t *testing.T) {
@@ -192,7 +191,7 @@ func TestHandlePublishAuth(t *testing.T) {
 func TestHandlePlayAuth(t *testing.T) {
 	srv := New(nil, nil, nil)
 	srv.SetAuth(NewAuth(AuthConfig{PlayTokens: []string{"play"}, Apps: []string{"live"}}))
-	st := srv.registry.Publish("live/test", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/test")
 	st.SetVideoParams("H264", nil,
 		[]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()

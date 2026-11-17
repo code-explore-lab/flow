@@ -12,10 +12,11 @@ package rtsp
 //
 // 生命周期：
 //
-//	ANNOUNCE  → publish(name)     创建/替换，旧流关闭
+//	ANNOUNCE  → publish(name)     按 Registry 策略创建/替换；被拒时旧流不变
 //	TEARDOWN  → Session.closeAll → unpublish(name) 删除并关闭源
 //
-// 多路推流靠 URL 路径区分；同一个路径重复 ANNOUNCE 视为重新发布。
+// 多路推流靠 URL 路径区分；同一个路径重复 ANNOUNCE 默认视为重新发布，
+// 配置 reject / reject-if-active 时可以拒绝。
 
 import (
 	"encoding/base64"
@@ -269,13 +270,16 @@ func publishedSDP(p *stream.Stream, mcAddr string, mcTTL int) string {
 	return b.String()
 }
 
-// publish 登记一路已发布流。同名流已存在时整体替换并关闭旧源。
-func (s *Server) publish(name string, tracks []announcedTrack) *stream.Stream {
+// publish 按 Registry 的同名推流策略登记一路流。被拒时返回
+// ErrPublishRejected，旧流不受影响。
+func (s *Server) publish(name string, tracks []announcedTrack) (*stream.Stream, error) {
 	pub := newPublishedStream(name, tracks)
-	s.registry.Publish(name, pub)
+	if _, err := s.registry.Publish(name, pub); err != nil {
+		return nil, err
+	}
 	fmt.Printf("published stream %q: %d track(s), video=%v audio=%v\n",
 		name, len(tracks), pub.VideoTrack() != nil, pub.AudioTrack() != nil)
-	return pub
+	return pub, nil
 }
 
 // unpublish 从注册表删除并关闭源。

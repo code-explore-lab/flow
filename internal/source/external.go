@@ -3,6 +3,7 @@ package source
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"flow/internal/media"
@@ -39,6 +40,10 @@ type ExternalSource struct {
 	// rate 音频 RTP 时钟（= AAC 采样率），从 ANNOUNCE 的 rtpmap 带过来。
 	// 拉流端 streamAAC 用它设置 RTCP SR 的 RTP 时钟。
 	rate uint32
+
+	// lastWrite 是最近一次 Write 的时间（Unix 纳秒）。T-8 用它判断一条
+	// 已发布流是否还在出帧，供 reject-if-active 区分活跃推流和僵尸连接。
+	lastWrite atomic.Int64
 }
 
 // NewExternalSource 创建一个空的视频推流源（缓存参数集/IDR 供预热），
@@ -98,10 +103,19 @@ func (s *ExternalSource) SamplingRate() uint32 {
 }
 
 func newExternalSource(cacheParamSets bool) *ExternalSource {
-	return &ExternalSource{
+	s := &ExternalSource{
 		ring:           newVideoRing(),
 		cacheParamSets: cacheParamSets,
 	}
+	// 刚创建的源先算「活跃”：RTSP 在 ANNOUNCE 就登记流，首帧要等 RECORD
+	// 之后才到，期间不能被当成僵尸流替换掉。
+	s.lastWrite.Store(time.Now().UnixNano())
+	return s
+}
+
+// LastWrite 返回最近一次写入帧的时间；从未写入时返回源的创建时间。
+func (s *ExternalSource) LastWrite() time.Time {
+	return time.Unix(0, s.lastWrite.Load())
 }
 
 // GOP 缓存上限：只保留最近一个关键帧起的有限窗口，防止长 GOP 无限增长。
@@ -116,6 +130,7 @@ const (
 // 缓存更新和 ring 写入在同一把锁里完成，Subscribe 快照到的 GOP 一定已经
 // 写进 ring（读者从当前写位置开始读，不会重复收到缓存帧）。
 func (s *ExternalSource) Write(f Frame) {
+	s.lastWrite.Store(time.Now().UnixNano())
 	if s.cacheParamSets {
 		s.mu.Lock()
 		defer s.mu.Unlock()

@@ -7,7 +7,6 @@ import (
 
 	"flow/internal/flv"
 	"flow/internal/source"
-	"flow/internal/stream"
 )
 
 // readMessageWithin 带超时地读一条消息，避免测试挂死。
@@ -107,7 +106,7 @@ func TestRelativeClockPerTrack(t *testing.T) {
 
 func TestPlayVideoFromRegistry(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/test", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/test")
 	sps := []byte{0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed}
 	pps := []byte{0x68, 0xee, 0x3c, 0x80}
 	st.SetVideoParams("H264", nil, sps, pps)
@@ -181,7 +180,7 @@ func TestPlayVideoFromRegistry(t *testing.T) {
 // 同一访问单元的多个 NALU 合并成一个 tag。
 func TestPlayVideoCompositionTime(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/b", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/b")
 	sps := []byte{0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed}
 	pps := []byte{0x68, 0xee, 0x3c, 0x80}
 	st.SetVideoParams("H264", nil, sps, pps)
@@ -251,7 +250,7 @@ func TestPlayVideoCompositionTime(t *testing.T) {
 func TestPlayCapturesParamSetsFromFrames(t *testing.T) {
 	srv := New(nil, nil, nil)
 	// 没有 SetVideoParams 的流：模拟本地回退源（SPS/PPS 在首帧里）。
-	st := srv.registry.Publish("local", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "local")
 	st.EnsureVideo()
 
 	server, client := pipeConns(t)
@@ -299,7 +298,7 @@ func TestPlayCapturesParamSetsFromFrames(t *testing.T) {
 
 func TestPlayAudio(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("radio", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "radio")
 	asc := []byte{0x12, 0x10} // AAC-LC 44100Hz 立体声
 	st.SetAudioParams(asc, 44100, 2)
 	st.EnsureAudio(44100)
@@ -376,7 +375,7 @@ func TestPlayStreamNotFound(t *testing.T) {
 // TestHandleCommandDispatchesPlay 确认命令层把 play 交给 play.go。
 func TestHandleCommandDispatchesPlay(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/test", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/test")
 	st.SetVideoParams("H264", nil, []byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()
 
@@ -407,7 +406,7 @@ func TestHandleCommandDispatchesPlay(t *testing.T) {
 
 func TestPlayCompleteWhenSourceEnds(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("ending", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "ending")
 	st.SetVideoParams("H264", nil, []byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()
 
@@ -470,7 +469,7 @@ var (
 
 func TestPlayHEVCFromRegistry(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/hevc", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/hevc")
 	st.SetVideoParams("H265", testHEVCVPS, testHEVCSPS, testHEVCPPS)
 	st.EnsureVideo()
 
@@ -517,7 +516,7 @@ func TestPlayHEVCFromRegistry(t *testing.T) {
 // 声明了 fourCcList 但不含 hvc1 的老客户端拉 HEVC 流：回 Play.Failed。
 func TestPlayHEVCRejectsLegacyClient(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/hevc", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/hevc")
 	st.SetVideoParams("H265", testHEVCVPS, testHEVCSPS, testHEVCPPS)
 	st.EnsureVideo()
 
@@ -546,7 +545,7 @@ func TestPlayHEVCRejectsLegacyClient(t *testing.T) {
 // 声明了 hvc1 的客户端正常放行。
 func TestPlayHEVCAcceptsDeclaredClient(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/hevc", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/hevc")
 	st.SetVideoParams("H265", testHEVCVPS, testHEVCSPS, testHEVCPPS)
 	st.EnsureVideo()
 
@@ -572,7 +571,7 @@ func TestPlayHEVCAcceptsDeclaredClient(t *testing.T) {
 // H.264 流不受 fourCcList 影响。
 func TestPlayH264IgnoresLegacyFourCCList(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/avc", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/avc")
 	st.SetVideoParams("H264", nil,
 		[]byte{0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed},
 		[]byte{0x68, 0xee, 0x3c, 0x80})

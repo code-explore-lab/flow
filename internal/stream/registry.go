@@ -9,10 +9,59 @@
 package stream
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"flow/internal/source"
 )
+
+// PublishPolicy 决定同名推流到达时的处理方式。
+type PublishPolicy int
+
+const (
+	// PublishReplace 同名推流整体替换旧流并关闭旧源（默认，保持原有行为）。
+	PublishReplace PublishPolicy = iota
+	// PublishReject 只要同名流已存在就拒绝新推流，旧流保持不变。
+	PublishReject
+	// PublishRejectIfActive 旧流最近仍有媒体写入时拒绝；否则视为僵尸流，
+	// 允许新推流接管并关闭旧源。
+	PublishRejectIfActive
+)
+
+// ErrPublishRejected 表示同名流已存在且当前策略不允许替换。
+var ErrPublishRejected = errors.New("stream: duplicate publish rejected")
+
+// DefaultActiveWindow 是 reject-if-active 判定「旧流仍活跃」的时间窗口：
+// 旧流任意一轨在该窗口内还有 Write 就算活跃。
+const DefaultActiveWindow = 10 * time.Second
+
+// ParsePublishPolicy 解析配置里的策略名。空串按默认的 replace 处理。
+func ParsePublishPolicy(value string) (PublishPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "replace":
+		return PublishReplace, nil
+	case "reject":
+		return PublishReject, nil
+	case "reject-if-active":
+		return PublishRejectIfActive, nil
+	}
+	return PublishReplace, fmt.Errorf("stream: invalid publish policy %q (want replace, reject or reject-if-active)", value)
+}
+
+// String 返回策略的配置名。
+func (p PublishPolicy) String() string {
+	switch p {
+	case PublishReject:
+		return "reject"
+	case PublishRejectIfActive:
+		return "reject-if-active"
+	default:
+		return "replace"
+	}
+}
 
 // VideoCodec 视频编码参数：裸 NALU（无 Annex-B 起始码）。
 // Codec 为 "H264" / "H265"；VPS 仅 H.265 使用，H.264 时为空。
@@ -49,6 +98,9 @@ type Stream struct {
 	// metaData 是推流端发来的 onMetaData（RTMP）。any 保持本包不依赖
 	// internal/flv；具体结构由 rtmp 包解释。带锁，因为它可能晚于拉流到达。
 	metaData any
+
+	// createdAt 是流登记到 Registry 的时间，供还没有建轨的流判断活跃度。
+	createdAt time.Time
 
 	mu sync.Mutex
 }
@@ -216,29 +268,84 @@ func (s *Stream) Close() {
 type Registry struct {
 	mu sync.RWMutex
 	m  map[string]*Stream
+
+	// policy 是同名推流策略；activeWindow 是 reject-if-active 的活跃窗口。
+	policy       PublishPolicy
+	activeWindow time.Duration
 }
 
-// NewRegistry 创建一个空注册表。
+// NewRegistry 创建一个空注册表，默认替换同名流。
 func NewRegistry() *Registry {
-	return &Registry{m: make(map[string]*Stream)}
+	return &Registry{
+		m:            make(map[string]*Stream),
+		activeWindow: DefaultActiveWindow,
+	}
 }
 
-// Publish 登记一路流并返回它。同名流已存在时整体替换，并关闭旧源。
-func (r *Registry) Publish(name string, s *Stream) *Stream {
+// SetPublishPolicy 设置同名推流策略。必须在 Serve 之前调用；
+// 默认是 PublishReplace。
+func (r *Registry) SetPublishPolicy(p PublishPolicy) {
+	r.mu.Lock()
+	r.policy = p
+	r.mu.Unlock()
+}
+
+// Active 报告这条流在 window 内是否还有媒体写入。音视频任一轨在窗口内
+// 有 Write 即为活跃；还没建轨（RTMP 首帧之前）时按登记时间判断。
+func (s *Stream) Active(window time.Duration) bool {
+	if window <= 0 {
+		window = DefaultActiveWindow
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	video, audio, created := s.Video, s.Audio, s.createdAt
+	s.mu.Unlock()
+
+	if video == nil && audio == nil {
+		// 刚登记、首帧还没到：按创建时间算，避免把正常启动的流当僵尸。
+		return created.IsZero() || now.Sub(created) <= window
+	}
+	for _, t := range []*Track{video, audio} {
+		if t != nil && t.Src != nil && now.Sub(t.Src.LastWrite()) <= window {
+			return true
+		}
+	}
+	return false
+}
+
+// Publish 按当前策略登记一路流。成功返回登记的流；同名冲突被拒时返回
+// ErrPublishRejected，新流不登记、旧流保持不变，调用方可以直接丢弃 s。
+func (r *Registry) Publish(name string, s *Stream) (*Stream, error) {
 	if s == nil {
-		return nil
+		return nil, nil
 	}
 	s.Name = name
 
+	now := time.Now()
+	s.mu.Lock()
+	if s.createdAt.IsZero() {
+		s.createdAt = now
+	}
+	s.mu.Unlock()
+
 	r.mu.Lock()
 	old := r.m[name]
+	if old != nil && old != s {
+		reject := r.policy == PublishReject ||
+			(r.policy == PublishRejectIfActive && old.Active(r.activeWindow))
+		if reject {
+			r.mu.Unlock()
+			return nil, ErrPublishRejected
+		}
+	}
 	r.m[name] = s
 	r.mu.Unlock()
 
 	if old != nil && old != s {
 		old.Close()
 	}
-	return s
+	return s, nil
 }
 
 // Unpublish 从注册表删除。只有当前登记的仍是 s 时才删，避免旧会话晚到的

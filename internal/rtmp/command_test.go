@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"flow/internal/flv"
+	"flow/internal/stream"
 )
 
 func TestParseCommandRoundTrip(t *testing.T) {
@@ -246,6 +247,51 @@ func TestHandlePublish(t *testing.T) {
 	}
 }
 
+// TestHandlePublishRejectedByPolicy 同名流存在且策略为 reject 时回
+// NetStream.Publish.BadName / Already Publishing，不进入发布状态。
+func TestHandlePublishRejectedByPolicy(t *testing.T) {
+	srv := New(nil, nil, nil)
+	srv.registry.SetPublishPolicy(stream.PublishReject)
+	old := mustPublish(t, srv.registry, "push")
+
+	server, client := pipeConns(t)
+	server.srv = srv
+
+	cmd, err := parseCommand(buildCommand("publish", 5, flv.Null(), flv.Str("push"), flv.Str("live")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- server.handlePublish(1, cmd) }()
+
+	m, err := client.readMessage()
+	if err != nil {
+		t.Fatalf("readMessage: %v", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("handlePublish: %v", err)
+	}
+	status, err := parseCommand(m.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Name != "onStatus" {
+		t.Fatalf("command = %q, want onStatus", status.Name)
+	}
+	if code := commandCode(status); code != "NetStream.Publish.BadName" {
+		t.Fatalf("code = %q, want NetStream.Publish.BadName", code)
+	}
+	if desc := commandField(status, "description"); desc != "Already Publishing" {
+		t.Fatalf("description = %q, want Already Publishing", desc)
+	}
+	if server.publish != nil {
+		t.Fatal("rejected publish still set connection publish state")
+	}
+	if got := srv.registry.Get("push"); got != old {
+		t.Fatal("rejected publish replaced the old stream")
+	}
+}
+
 func TestHandlePublishEmptyName(t *testing.T) {
 	srv := New(nil, nil, nil)
 	server, client := pipeConns(t)
@@ -295,12 +341,17 @@ func TestSanitizeStreamName(t *testing.T) {
 
 // commandCode 取命令参数里第一个 code 字符串（onStatus/_result 用）。
 func commandCode(cmd *Command) string {
+	return commandField(cmd, "code")
+}
+
+// commandField 取命令参数对象里指定键的字符串值。
+func commandField(cmd *Command, key string) string {
 	for _, a := range cmd.Args {
 		if a.Type != flv.TypeObject && a.Type != flv.TypeECMAArray {
 			continue
 		}
 		for _, m := range a.Object {
-			if m.Key == "code" && m.Value.Type == flv.TypeString {
+			if m.Key == key && m.Value.Type == flv.TypeString {
 				return m.Value.String
 			}
 		}

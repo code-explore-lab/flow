@@ -9,6 +9,8 @@ import (
 	"net"
 	"strings"
 	"testing"
+
+	"flow/internal/stream"
 )
 
 // ffmpegAnnounceSDP 是 ffmpeg 推流时 ANNOUNCE 携带的典型 SDP。
@@ -323,6 +325,67 @@ func TestHandleAnnounceStatuses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestHandleAnnounceRejectedByPolicy 同名流存在且策略为 reject 时回 453，
+// 旧流保持不变，本次新建的空会话被回收。
+func TestHandleAnnounceRejectedByPolicy(t *testing.T) {
+	s := New(nil, nil, false)
+	s.registry.SetPublishPolicy(stream.PublishReject)
+
+	tracks, err := parseAnnounceSDP([]byte(ffmpegAnnounceSDP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := s.publish("live", tracks)
+	if err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	conn := &Conn{Conn: serverConn}
+
+	respCh := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		tmp := make([]byte, 4096)
+		for {
+			n, err := clientConn.Read(tmp)
+			if n > 0 {
+				buf.Write(tmp[:n])
+			}
+			if err != nil {
+				respCh <- buf.String()
+				return
+			}
+		}
+	}()
+
+	req := &Request{
+		Method:  "ANNOUNCE",
+		URI:     "rtsp://127.0.0.1:8554/live",
+		Version: "RTSP/1.0",
+		CSeq:    2,
+		Headers: map[string]string{"CSeq": "2"},
+		Body:    []byte(ffmpegAnnounceSDP),
+	}
+	hd := map[string]string{"CSeq": "2"}
+	if err := s.handleAnnounce(conn, req, hd); err != nil {
+		t.Fatalf("handleAnnounce: %v", err)
+	}
+	clientConn.Close()
+
+	resp := <-respCh
+	if !strings.HasPrefix(resp, "RTSP/1.0 453 Not Enough Bandwidth\r\n") {
+		t.Fatalf("response status = %q", firstLine(resp))
+	}
+	if got := s.publishedStreamByName("live"); got != old {
+		t.Fatal("rejected ANNOUNCE replaced the old stream")
+	}
+	if n := s.sessions.Len(); n != 0 {
+		t.Fatalf("sessions = %d, want 0 (rejected ANNOUNCE session not reclaimed)", n)
 	}
 }
 

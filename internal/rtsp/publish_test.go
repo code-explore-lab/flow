@@ -93,7 +93,10 @@ func TestPullSetupUsesPublishedTrack(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, conn, finish := newTestPipe(t)
-		pub := s.publish("push", tracks)
+		pub, err := s.publish("push", tracks)
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
 
 		hd := map[string]string{"CSeq": "3"}
 		req := &Request{
@@ -140,7 +143,10 @@ func TestPullSetupUsesPublishedTrack(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, conn, finish := newTestPipe(t)
-		pub := s.publish("push", tracks)
+		pub, err := s.publish("push", tracks)
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
 
 		hd := map[string]string{"CSeq": "4"}
 		req := &Request{
@@ -353,7 +359,10 @@ func TestPullSourceEndClosesSessionAndConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub := s.publish("live", tracks)
+	pub, err := s.publish("live", tracks)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
 
 	serverConn, clientConn := net.Pipe()
 	conn := &Conn{Conn: serverConn}

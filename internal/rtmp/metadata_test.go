@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"flow/internal/flv"
-	"flow/internal/stream"
 )
 
 // buildMetaData 构造一条 onMetaData 数据消息负载（ECMA Array 体）。
@@ -125,7 +124,7 @@ func TestHandleDataIgnores(t *testing.T) {
 // TestPlayForwardsMetaData 验证 Play.Start 之后、视频序列头之前先收到 onMetaData。
 func TestPlayForwardsMetaData(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/meta", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/meta")
 	st.SetVideoParams("H264", nil,
 		[]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()
@@ -181,7 +180,7 @@ func TestPlayForwardsMetaData(t *testing.T) {
 // TestPlayNoMetaData 注册表流没有 onMetaData 时不下发数据消息，直接进序列头。
 func TestPlayNoMetaData(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/nometa", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/nometa")
 	st.SetVideoParams("H264", nil,
 		[]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()

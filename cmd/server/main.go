@@ -84,6 +84,7 @@ func main() {
 	rtmpAuthFile := flag.String("rtmp-auth-file", "", "T-3: RTMP token file, lines publish:TOKEN / play:TOKEN / all:TOKEN / app:NAME (also FLOW_RTMP_AUTH_FILE)")
 	rtmpApps := flag.String("rtmp-app-whitelist", "", "T-3: comma-separated RTMP app whitelist (also FLOW_RTMP_APPS)")
 	rtmpChunkSize := flag.Uint("rtmp-chunk-size", 4096, "T-7: RTMP outbound chunk size advertised to peers (bytes, 1..16777215)")
+	publishPolicyFlag := flag.String("publish-policy", "replace", "T-8: duplicate publish policy: replace|reject|reject-if-active (applies to RTSP and RTMP)")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -142,6 +143,11 @@ func main() {
 	}
 	if (*tlsCert == "") != (*tlsKey == "") {
 		fmt.Fprintln(os.Stderr, "-tls-cert and -tls-key must be set together")
+		os.Exit(2)
+	}
+	publishPolicy, err := stream.ParsePublishPolicy(*publishPolicyFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 
@@ -221,8 +227,10 @@ func main() {
 		}
 	}
 
-	// 两个协议共用一份注册表，实现互通。
+	// 两个协议共用一份注册表，实现互通。同名推流策略在这里统一配置，
+	// RTSP / RTMP / RTMPS 三个 Server 同时生效。
 	reg := stream.NewRegistry()
+	reg.SetPublishPolicy(publishPolicy)
 	// E-4：两个协议共用一个指标注册表，/metrics 与两个服务器都读它。
 	flowMetrics := metrics.New()
 	// E-5：每个协议各自一份连接限流器（per-protocol 独立计数）。

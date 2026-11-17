@@ -6,7 +6,6 @@ import (
 
 	"flow/internal/flv"
 	"flow/internal/source"
-	"flow/internal/stream"
 )
 
 // sendPlayCommand 在 server 上执行一条播放控制命令并读回下一条 onStatus。
@@ -32,7 +31,7 @@ func sendPlayCommand(t *testing.T, server, client *Conn, streamID uint32, payloa
 // 补发，DTS 连续（无重复、无跳变）。
 func TestPauseResumeKeepsTimestamps(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/pause", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/pause")
 	st.SetVideoParams("H264", nil,
 		[]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()
@@ -96,7 +95,7 @@ func TestPauseResumeKeepsTimestamps(t *testing.T) {
 // 不影响正在进行的播放。
 func TestSeekLiveFails(t *testing.T) {
 	srv := New(nil, nil, nil)
-	st := srv.registry.Publish("live/seek", &stream.Stream{})
+	st := mustPublish(t, srv.registry, "live/seek")
 	st.SetVideoParams("H264", nil,
 		[]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()

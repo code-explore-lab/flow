@@ -369,6 +369,7 @@ func (s *Server) handleAnnounce(conn *Conn, req *Request, hd map[string]string) 
 			sess = found
 		}
 	}
+	created := false
 	if sess == nil {
 		var err error
 		sess, err = s.newClientSession(conn)
@@ -376,15 +377,24 @@ func (s *Server) handleAnnounce(conn *Conn, req *Request, hd map[string]string) 
 			fmt.Printf("ANNOUNCE rejected (503): %v\n", err)
 			return writeResponse(conn, "503 Service Unavailable", hd, nil)
 		}
+		created = true
 	}
 
 	rtspSess := sess.Data.(*Session)
 	rtspSess.setAnnounced(tracks)
 
 	// 按 URL 路径登记已发布流：拉流端 DESCRIBE/SETUP 用同一个路径找到它。
-	// 同一个会话重复 ANNOUNCE 时替换旧流；会话关闭时再从注册表摘掉。
+	// 同名流由 Registry 策略处理；被拒时旧流不变，也不能绑定这次 ANNOUNCE。
 	name := streamKeyFromURI(req.URI)
-	pub := s.publish(name, tracks)
+	pub, err := s.publish(name, tracks)
+	if err != nil {
+		fmt.Printf("ANNOUNCE rejected (453): %v\n", err)
+		if created {
+			s.sessions.Delete(sess.ID)
+			sess.Close()
+		}
+		return writeResponse(conn, "453 Not Enough Bandwidth", hd, nil)
+	}
 	rtspSess.setPublished(pub, func() { s.unpublish(name, pub) })
 
 	conn.bindSession(sess.ID)

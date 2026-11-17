@@ -46,6 +46,10 @@ type Stream struct {
 	Audio *Track
 	Meta  any // 协议自定义描述；RTSP 存 *rtspStreamMeta，RTMP 为 nil
 
+	// metaData 是推流端发来的 onMetaData（RTMP）。any 保持本包不依赖
+	// internal/flv；具体结构由 rtmp 包解释。带锁，因为它可能晚于拉流到达。
+	metaData any
+
 	mu sync.Mutex
 }
 
@@ -136,6 +140,20 @@ func (s *Stream) VideoParams() (*VideoCodec, bool) {
 		SPS:   append([]byte(nil), s.Video.Video.SPS...),
 		PPS:   append([]byte(nil), s.Video.Video.PPS...),
 	}, true
+}
+
+// SetMetaData 记录推流端发来的 onMetaData。后到的覆盖先到的。
+func (s *Stream) SetMetaData(v any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metaData = v
+}
+
+// MetaData 返回推流端发来的 onMetaData，没有时为 nil。
+func (s *Stream) MetaData() any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.metaData
 }
 
 // AudioParams 返回音频编码参数的副本。还没收到 ASC 时返回 false。

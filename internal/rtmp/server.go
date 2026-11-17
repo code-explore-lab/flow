@@ -285,8 +285,11 @@ func (s *Server) handleConn(conn *Conn) {
 			conn.handleVideo(m)
 		case msgAudio:
 			conn.handleAudio(m)
+		case msgDataAMF0:
+			conn.handleData(m)
 		default:
-			// onMetaData（type 18）等数据消息与未知类型暂不处理。
+			// msgDataAMF3(15)、msgCommandAMF3(17) 等不支持的 AMF3 消息
+			// 与未知类型忽略。
 		}
 	}
 }

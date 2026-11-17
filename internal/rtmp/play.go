@@ -123,7 +123,8 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		audioCh   uint8
 	)
 
-	if st := c.srv.registry.Get(name); st != nil {
+	var st *stream.Stream
+	if st = c.srv.registry.Get(name); st != nil {
 		if t := st.VideoTrack(); t != nil && t.Src != nil {
 			video = t.Src
 		}
@@ -197,6 +198,23 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 
 	c.srv.metrics.IncPlay()
 	c.srv.metrics.IncPlayTotal()
+
+	// T-4：Play.Start 之后、音视频序列头之前转发 onMetaData。序列头由
+	// playVideo/playAudio 的 goroutine 异步发，这里必须在启动 goroutine 前
+	// 同步写，保证客户端先拿到元数据。仅注册表流有（本地回退源无）。
+	if st != nil {
+		if md, ok := st.MetaData().(*metaData); ok && len(md.payload) > 0 {
+			if err := c.writeMessage(&Message{
+				TypeID:   msgDataAMF0,
+				StreamID: streamID,
+				Payload:  md.payload,
+			}, dataCSID); err != nil {
+				vcancelPlay(vcancel, acancel)
+				c.play = nil
+				return err
+			}
+		}
+	}
 
 	if video != nil {
 		ps.wg.Add(1)

@@ -14,9 +14,17 @@ type RingBuffer[T any] struct {
 	mu      sync.Mutex
 	buf     []T
 	nextSeq uint64 // 下一帧的序号，同时也是累计写入数
+	oldest  uint64 // 还能读到的最老序号
 	closed  bool
 	subs    map[int]*Reader[T] // key=reader.id, value = *Reader[T]
 	nextID  int
+
+	// 可选的字节预算：weigh 返回一帧的字节数，maxBytes 是缓冲上限。
+	// 多 slice 的一帧包含多个 NALU，只按个数限制会让缓冲的时间窗口
+	// 随 slice 数成比例缩短；按字节限制才能稳定保留同样的时长。
+	weigh    func(T) int
+	maxBytes int
+	bytes    int
 }
 
 // NewRingBuffer 创建指定容量的环形缓冲区。容量 <= 0 时用默认值 64。
@@ -28,6 +36,16 @@ func NewRingBuffer[T any](capacity int) *RingBuffer[T] {
 		buf:  make([]T, capacity),
 		subs: make(map[int]*Reader[T]),
 	}
+}
+
+// NewRingBufferWithBudget 创建同时受帧数和字节数限制的环形缓冲区。
+// capacity 是硬上限（防止极小帧吃掉过多槽位），maxBytes 是主窗口；
+// 超过字节预算时从最老的帧开始淘汰，读者会把这部分计入 Dropped。
+func NewRingBufferWithBudget[T any](capacity, maxBytes int, weigh func(T) int) *RingBuffer[T] {
+	r := NewRingBuffer[T](capacity)
+	r.maxBytes = maxBytes
+	r.weigh = weigh
+	return r
 }
 
 // Capacity 返回环形缓冲区能保留的帧数。
@@ -43,9 +61,28 @@ func (r *RingBuffer[T]) Write(v T) {
 	if r.closed {       // ② 已关闭就丢弃
 		return
 	}
-	r.buf[r.nextSeq%uint64(len(r.buf))] = v // ③ 写入槽位
-	r.nextSeq++                             // ④ 序号自增
-	for _, rd := range r.subs {             // ⑥ 遍历所有读者
+	capn := uint64(len(r.buf))
+	slot := r.nextSeq % capn
+	if r.nextSeq >= capn {
+		// 覆盖的槽位如果已经被字节预算淘汰过，就不能再重复扣减。
+		if s := r.nextSeq - capn; s >= r.oldest {
+			r.releaseLocked(r.buf[slot])
+		}
+	}
+	r.buf[slot] = v // ③ 写入槽位
+	r.nextSeq++     // ④ 序号自增
+	r.retainLocked(v)
+	if r.nextSeq > capn && r.nextSeq-capn > r.oldest {
+		r.oldest = r.nextSeq - capn
+	}
+	// ⑤ 字节预算：从最老的帧开始淘汰，直到回到预算内。
+	// 至少保留刚写入的帧：单个超大 IDR 超过预算时也不能立刻丢掉，
+	// 否则所有读者都拿不到关键帧。
+	for r.bytes > r.maxBytes && r.oldest+1 < r.nextSeq {
+		r.releaseLocked(r.buf[r.oldest%capn])
+		r.oldest++
+	}
+	for _, rd := range r.subs { // ⑥ 遍历所有读者
 		select {
 		case rd.notify <- struct{}{}: // ⑦ 尝试发信号
 		default: // ⑧ 发不进就跳过
@@ -94,10 +131,23 @@ func (r *RingBuffer[T]) Close() {
 
 // oldestLocked 返回缓冲区里还能读到的最老序号。
 func (r *RingBuffer[T]) oldestLocked() uint64 {
-	if r.nextSeq > uint64(len(r.buf)) {
-		return r.nextSeq - uint64(len(r.buf))
+	return r.oldest
+}
+
+// retainLocked / releaseLocked 维护字节预算计数；没有配置预算时是空操作。
+func (r *RingBuffer[T]) retainLocked(v T) {
+	if r.weigh != nil {
+		r.bytes += r.weigh(v)
 	}
-	return 0
+}
+
+func (r *RingBuffer[T]) releaseLocked(v T) {
+	if r.weigh != nil {
+		r.bytes -= r.weigh(v)
+	}
+	if r.bytes < 0 {
+		r.bytes = 0
+	}
 }
 
 // Reader 是某个消费者在环形缓冲区上的读游标。

@@ -57,4 +57,48 @@ func IsHEVCCodec(codec string) bool {
 	return strings.EqualFold(codec, "H265") || strings.EqualFold(codec, "HEVC")
 }
 
+// StartsVideoAU 判断 nalu 是否是一个新访问单元（一帧）的第一个 NALU。
+//
+// 编码器开 sliced threads 时，一帧会被切成多个 VCL NALU。只有首 slice
+// 的 first_mb_in_slice / first_slice_segment_in_pic_flag 标记为新帧，
+// 其余 slice 属于同一帧，必须共用同一个 RTP 时间戳并作为同一个 AU 封包。
+//
+// H.264：VCL NAL（类型 1/2/5）的 first_mb_in_slice 是 ue(v)，
+// 编码值 0 表示首 slice，而 ue(v)=0 的码字就是单个比特 1，所以只需看
+// NAL 头之后第一个比特。类型 3/4 是 slice data partition B/C，首元素不是
+// first_mb_in_slice，保守地按非首 slice 处理。
+//
+// H.265：VCL NAL（类型 0..31）的 first_slice_segment_in_pic_flag 是
+// 2 字节 NAL 头之后 slice segment header 的第一个比特。
+//
+// 非 VCL、过短或无法识别的 NALU 返回 false。
+func StartsVideoAU(codec string, nalu []byte) bool {
+	if isH265(codec) {
+		return hevcStartsAU(nalu)
+	}
+	return h264StartsAU(nalu)
+}
+
+func h264StartsAU(nalu []byte) bool {
+	if len(nalu) < 2 {
+		return false
+	}
+	switch nalu[0] & 0x1F {
+	case 1, 2, 5: // non-IDR / slice partition A / IDR：首个语法元素是 first_mb_in_slice
+		return nalu[1]&0x80 != 0
+	default: // 3/4 分区 B/C、参数集、SEI 等
+		return false
+	}
+}
+
+func hevcStartsAU(nalu []byte) bool {
+	if len(nalu) < 3 {
+		return false
+	}
+	if (nalu[0]>>1)&0x3F > 31 { // 非 VCL（VPS=32 / SPS=33 / PPS=34 等）
+		return false
+	}
+	return nalu[2]&0x80 != 0
+}
+
 func isH265(codec string) bool { return IsHEVCCodec(codec) }

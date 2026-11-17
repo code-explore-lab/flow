@@ -16,14 +16,43 @@ type Frame struct {
 	Data      []byte // H.264：一个 NALU（已去 Annex-B 起始码）；AAC：一个 AU（已去 ADTS 头）
 	Timestamp uint32 // 相对流起点的 RTP 时间戳（视频 90kHz，音频按采样率）
 	Keyframe  bool   // 视频：IDR；音频恒为 true，方便统一处理
+	// AUStart 表示该 NALU 是一个新访问单元（一帧）的首个 NALU。
+	// 一帧被切成多个 slice 时，只有首 slice 为 true，其余 slice 共用
+	// 首 slice 的时间戳。拉流端据此把整帧聚合进同一个 RTP AU，
+	// 保证 marker 只打在最后一个包上。源不提供该信息时按时间戳划分 AU。
+	AUStart bool
 }
 
 const (
 	videoClockRate     = 90000                 // H.264 RTP 时钟 90kHz
 	videoFrameInterval = 40 * time.Millisecond // 文件模式按 25fps 播放
 	videoTimestampStep = videoClockRate / 25   // 90000/25 = 3600
-	videoRingCapacity  = 64                    // ring buffer 保留最近 64 帧（约 2.5s）
+	// 视频 ring 同时受帧数和字节数限制。实时模式一次可能从 64KB 管道
+	// 读出一大批 NALU，多 slice 时一帧就有多个 NALU（x264 默认切片线程
+	// 约 7 个），只按 64 个 NALU 计容会让一个读突发就覆盖整个缓冲。
+	// 字节预算保留原来的时间窗口（约几百 KB，30fps 下数秒）。
+	videoRingCapacity = 4096      // 硬上限，防止极小 NALU 占满槽位
+	videoRingBytes    = 512 << 10 // ring 的字节预算
 )
+
+// newVideoRing 建视频帧的 ring buffer：帧数硬上限 + 字节预算。
+// 字节按 NALU 负载计算，多个 slice 共用同一个 AU 预算。
+func newVideoRing() *RingBuffer[Frame] {
+	return NewRingBufferWithBudget(videoRingCapacity, videoRingBytes,
+		func(f Frame) int { return len(f.Data) })
+}
+
+// nextLiveAUTS 计算实时源一个新访问单元的 RTP 时间戳。
+//
+// 时间戳主体跟随墙上时钟（与 RTCP SR 的 NTP↔RTP 映射一致），但 64KB
+// 管道一次可能读出多帧，几帧的墙上时钟可能落在同一个 90kHz 刻度上。
+// 这里强制严格递增，保证不同 AU 不会共用时间戳、被下游聚合进同一帧。
+func nextLiveAUTS(now, last uint32, seen bool) uint32 {
+	if seen && now <= last {
+		return last + 1
+	}
+	return now
+}
 
 // H264Source 单源视频：一个 goroutine 读 Annex-B H.264，往 ring buffer 写 NALU。
 //   - 文件模式：按 25fps 节奏读 test.h264，读完自动结束，下一次 Subscribe 重新读；
@@ -80,7 +109,7 @@ func NewH264SourceFromReader(r io.Reader) *H264Source {
 func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
 	s.mu.Lock()
 	if s.cur == nil {
-		run := &h264Run{ring: NewRingBuffer[Frame](videoRingCapacity)}
+		run := &h264Run{ring: newVideoRing()}
 		s.cur = run
 		// 先注册读者再启动 goroutine，否则源可能先把开头的 SPS/PPS 写进去，新客户端漏掉
 		rd := run.ring.Subscribe()
@@ -129,7 +158,7 @@ func (s *H264Source) SubscribeFrom(start time.Duration, scale float64) (*Reader[
 		}
 	}
 
-	ring := NewRingBuffer[Frame](videoRingCapacity)
+	ring := newVideoRing()
 	rd := ring.Subscribe()
 	done := make(chan struct{})
 	var once sync.Once
@@ -168,6 +197,7 @@ func (s *H264Source) buildSeekIndex() error {
 		}
 		var lastSPS, lastPPS []byte
 		frameIdx := 0
+		seenAU := false
 		for {
 			nalu, off, err := demux.NextNALUWithOffset()
 			if err != nil {
@@ -189,7 +219,10 @@ func (s *H264Source) buildSeekIndex() error {
 			if typ < rtp.NALUTypeNonIDR || typ > rtp.NALUTypeIDR {
 				continue
 			}
-			if typ == rtp.NALUTypeIDR {
+			// 帧号按访问单元计：一帧的多个 slice 只算一帧，
+			// 否则 seek 的时间轴会被 slice 数放大。
+			startsAU := media.StartsVideoAU("H264", nalu) || !seenAU
+			if typ == rtp.NALUTypeIDR && startsAU {
 				s.seekPoints = append(s.seekPoints, h264SeekPoint{
 					offset:   off,
 					frameIdx: frameIdx,
@@ -198,7 +231,10 @@ func (s *H264Source) buildSeekIndex() error {
 					pps:      lastPPS,
 				})
 			}
-			frameIdx++
+			if startsAU {
+				frameIdx++
+				seenAU = true
+			}
 		}
 	})
 	return s.indexErr
@@ -246,7 +282,7 @@ func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h
 	defer ticker.Stop()
 
 	ts := sp.ts
-	firstVCL := true
+	seenAU := false
 	for {
 		select {
 		case <-done:
@@ -263,18 +299,26 @@ func (s *H264Source) runFrom(ring *RingBuffer[Frame], done <-chan struct{}, sp h
 			continue
 		}
 		isVCL := typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR
-		if isVCL && !firstVCL {
-			select {
-			case <-ticker.C:
-			case <-done:
-				return
+		// 一帧可能有多个 slice：只在首 slice 推进时间戳和播放节奏，
+		// 后续 slice 复用当前 AU 的时间戳。
+		startsAU := isVCL && (media.StartsVideoAU("H264", nalu) || !seenAU)
+		if startsAU {
+			if seenAU {
+				select {
+				case <-ticker.C:
+				case <-done:
+					return
+				}
+				ts += videoTimestampStep
 			}
+			seenAU = true
 		}
-		ring.Write(Frame{Data: nalu, Timestamp: ts, Keyframe: typ == rtp.NALUTypeIDR})
-		if isVCL {
-			ts += videoTimestampStep
-			firstVCL = false
-		}
+		ring.Write(Frame{
+			Data:      nalu,
+			Timestamp: ts,
+			Keyframe:  typ == rtp.NALUTypeIDR,
+			AUStart:   startsAU,
+		})
 	}
 }
 
@@ -320,8 +364,8 @@ func (s *H264Source) run(run *h264Run) {
 	start := time.Now()
 
 	var (
-		ts       uint32
-		firstVCL = true
+		ts     uint32
+		seenAU bool
 	)
 	for {
 		nalu, err := demux.NextNALU()
@@ -333,20 +377,33 @@ func (s *H264Source) run(run *h264Run) {
 		if err != nil {
 			continue
 		}
-		// VCL NALU（type 1~5）才代表一帧；SPS/PPS 不占节奏、不推进时间戳
+		// VCL NALU（type 1~5）才代表图像数据；SPS/PPS 不占节奏、不推进时间戳。
 		isVCL := typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR
-		if live {
-			if isVCL {
+		// 一帧可能有多个 slice：只在首 slice 推进时间戳和播放节奏，
+		// 后续 slice 复用当前 AU 的时间戳。
+		startsAU := isVCL && (media.StartsVideoAU("H264", nalu) || !seenAU)
+		if startsAU {
+			if live {
 				// 实时流不额外限速：ffmpeg 已经按摄像头节奏产出。
 				// 时间戳跟随墙上时钟，避免固定 25fps 步进和实际帧率不一致，
 				// 也保证和 RTCP SR 里的 NTP↔RTP 映射一致。
-				ts = uint32(time.Since(start).Seconds() * float64(videoClockRate))
+				now := uint32(time.Since(start).Seconds() * float64(videoClockRate))
+				// 64KB 管道一次可能读出多帧，墙上时钟可能相同或回退；
+				// 强制严格递增，避免下游把两帧当成同一个 AU。
+				ts = nextLiveAUTS(now, ts, seenAU)
+			} else if seenAU {
+				<-ticker.C
+				ts += videoTimestampStep
 			}
-		} else if isVCL && !firstVCL {
-			<-ticker.C
+			seenAU = true
 		}
 
-		f := Frame{Data: nalu, Timestamp: ts, Keyframe: typ == rtp.NALUTypeIDR}
+		f := Frame{
+			Data:      nalu,
+			Timestamp: ts,
+			Keyframe:  typ == rtp.NALUTypeIDR,
+			AUStart:   startsAU,
+		}
 
 		s.mu.Lock()
 		switch typ {
@@ -363,11 +420,6 @@ func (s *H264Source) run(run *h264Run) {
 		s.mu.Unlock()
 
 		run.ring.Write(f)
-
-		if isVCL {
-			ts += videoTimestampStep
-			firstVCL = false
-		}
 	}
 	s.finish(run)
 }

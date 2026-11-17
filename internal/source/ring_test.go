@@ -43,6 +43,108 @@ func TestRingBufferWriteReadWrapOrder(t *testing.T) {
 	}
 }
 
+// TestRingBufferByteBudgetEvictsOldest 字节预算比帧数先触顶时，从最老的帧
+// 开始淘汰；读者只拿到预算内的最后几帧，并把跳过的计入 Dropped。
+func TestRingBufferByteBudgetEvictsOldest(t *testing.T) {
+	// 每帧 1 字节，预算 4 字节：帧数上限 100 不生效，字节预算生效。
+	r := NewRingBufferWithBudget(100, 4, func(int) int { return 1 })
+	rd := r.Subscribe()
+	defer rd.Close()
+
+	for i := 0; i < 10; i++ {
+		r.Write(i)
+	}
+	r.Close()
+
+	got := drain(t, rd)
+	want := []int{6, 7, 8, 9}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if d := rd.Dropped(); d != 6 {
+		t.Fatalf("dropped = %d, want 6", d)
+	}
+}
+
+// TestRingBufferByteBudgetSizes 用变长帧验证按字节而不是按帧数淘汰：
+// 两个 60 字节的帧就该挤掉一个 100 字节的帧。
+func TestRingBufferByteBudgetSizes(t *testing.T) {
+	r := NewRingBufferWithBudget(100, 200, func(n int) int { return n })
+	rd := r.Subscribe()
+	defer rd.Close()
+
+	r.Write(100)
+	r.Write(60) // 160 <= 200，都还在
+	r.Write(60) // 总量 220 > 200，最老的 100 被淘汰
+	r.Close()
+
+	got := drain(t, rd)
+	want := []int{60, 60}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if d := rd.Dropped(); d != 1 {
+		t.Fatalf("dropped = %d, want 1", d)
+	}
+}
+
+// TestRingBufferByteBudgetCapacityStillBinds 极小帧先把槽位写满时，
+// 帧数上限仍然生效，且字节计数不会因此变成负数。
+func TestRingBufferByteBudgetCapacityStillBinds(t *testing.T) {
+	r := NewRingBufferWithBudget(4, 1000, func(int) int { return 1 })
+	rd := r.Subscribe()
+	defer rd.Close()
+
+	for i := 0; i < 10; i++ {
+		r.Write(i)
+	}
+	r.Close()
+
+	got := drain(t, rd)
+	want := []int{6, 7, 8, 9}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if d := rd.Dropped(); d != 6 {
+		t.Fatalf("dropped = %d, want 6", d)
+	}
+}
+
+// TestRingBufferByteBudgetKeepsNewestOversizedFrame 单帧超过预算时仍要
+// 保留最新一帧，不能写进去就被自己的预算淘汰。
+func TestRingBufferByteBudgetKeepsNewestOversizedFrame(t *testing.T) {
+	r := NewRingBufferWithBudget(4, 10, func(int) int { return 1 })
+	rd := r.Subscribe()
+	defer rd.Close()
+
+	for i := 0; i < 20; i++ {
+		r.Write(i) // 每帧 1 字节，预算 10 字节
+	}
+	// 再写一个 100 字节的“IDR”，远超预算。
+	r.Write(100)
+	r.Close()
+
+	got := drain(t, rd)
+	if len(got) == 0 || got[len(got)-1] != 100 {
+		t.Fatalf("got %v, want the oversized frame retained last", got)
+	}
+}
+
 func TestRingBufferSlowReaderDropsOldFrames(t *testing.T) {
 	r := NewRingBuffer[int](4)
 	rd := r.Subscribe()

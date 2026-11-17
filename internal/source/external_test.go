@@ -119,19 +119,24 @@ func TestExternalSourceSlowReaderDrops(t *testing.T) {
 	rd, cancel := src.Subscribe()
 	defer cancel()
 
-	const n = 70 // 容量 64，最后只保留最近 64 帧（seq 6..69）
+	// 视频 ring 按字节预算淘汰：每帧 4KB，写满预算后再多写 50 帧，
+	// 最老的 50 帧应该被覆盖。
+	const frameSize = 4096
+	n := videoRingBytes/frameSize + 50
 	for i := 0; i < n; i++ {
-		src.Write(Frame{Data: []byte{0x41, byte(i)}, Timestamp: uint32(i)})
+		data := make([]byte, frameSize)
+		data[0] = 0x41
+		src.Write(Frame{Data: data, Timestamp: uint32(i)})
 	}
 
 	f, ok := nextWithTimeout(t, rd)
 	if !ok {
 		t.Fatal("expected a frame")
 	}
-	if f.Timestamp != 6 {
-		t.Fatalf("first frame ts = %d, want 6 (oldest retained)", f.Timestamp)
+	if f.Timestamp != 50 {
+		t.Fatalf("first frame ts = %d, want 50 (oldest retained)", f.Timestamp)
 	}
-	if d := rd.Dropped(); d != 6 {
-		t.Fatalf("Dropped = %d, want 6", d)
+	if d := rd.Dropped(); d != 50 {
+		t.Fatalf("Dropped = %d, want 50", d)
 	}
 }

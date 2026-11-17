@@ -67,6 +67,64 @@ func TestClassifyVideoNALShortInput(t *testing.T) {
 	}
 }
 
+func TestStartsVideoAUH264(t *testing.T) {
+	cases := []struct {
+		name string
+		nalu []byte
+		want bool
+	}{
+		{"idr first slice", []byte{0x65, 0x88, 0x84}, true},
+		{"idr continuation slice", []byte{0x65, 0x00, 0x11}, false},
+		{"non-idr first slice", []byte{0x41, 0x9A, 0x00}, true},
+		{"non-idr continuation slice", []byte{0x41, 0x1A, 0x00}, false},
+		{"partition A first slice", []byte{0x62, 0x80, 0x00}, true},
+		{"partition B", []byte{0x63, 0x80, 0x00}, false},
+		{"partition C", []byte{0x64, 0x80, 0x00}, false},
+		{"sps", []byte{0x67, 0x80}, false},
+		{"pps", []byte{0x68, 0x80}, false},
+		{"sei", []byte{0x06, 0x80}, false},
+		{"short idr", []byte{0x65}, false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, codec := range []string{"", "H264", "h264"} {
+				if got := StartsVideoAU(codec, tc.nalu); got != tc.want {
+					t.Errorf("codec %q: got %v, want %v", codec, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestStartsVideoAUH265(t *testing.T) {
+	first := func(typ uint8) []byte { return append(hevcHeader(typ), 0x80, 0xAA) }
+	cont := func(typ uint8) []byte { return append(hevcHeader(typ), 0x00, 0xAA) }
+	cases := []struct {
+		name string
+		nalu []byte
+		want bool
+	}{
+		{"idr first slice", first(HEVCNALTypeIDRWRADL), true},
+		{"idr continuation slice", cont(HEVCNALTypeIDRWRADL), false},
+		{"trail first slice", first(1), true},
+		{"trail continuation slice", cont(1), false},
+		{"vps", first(HEVCNALTypeVPS), false},
+		{"sps", first(HEVCNALTypeSPS), false},
+		{"short vcl", hevcHeader(1), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, codec := range []string{"H265", "HEVC", "h265"} {
+				if got := StartsVideoAU(codec, tc.nalu); got != tc.want {
+					t.Errorf("codec %q: got %v, want %v", codec, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestVideoNALType(t *testing.T) {
 	typ, err := VideoNALType("H265", hevcHeader(HEVCNALTypeSPS))
 	if err != nil || typ != HEVCNALTypeSPS {

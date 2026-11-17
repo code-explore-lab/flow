@@ -152,6 +152,57 @@ func TestStreamH264DoesNotAggregateAcrossFrames(t *testing.T) {
 	}
 }
 
+// TestStreamH264GroupsMultiSliceAU 一帧有多个 slice 时，服务端必须把
+// 它们聚合进同一个 RTP AU：共用时间戳，marker 只落在最后一个包上。
+func TestStreamH264GroupsMultiSliceAU(t *testing.T) {
+	idr0 := []byte{0x65, 0x88, 0x84, 0x00} // 首 slice
+	idr1 := []byte{0x65, 0x00, 0x84, 0x00} // 后续 slice
+	p0 := []byte{0x41, 0x9A, 0x00}
+	p1 := []byte{0x41, 0x00, 0x00}
+	src := &framesSource{frames: []source.Frame{
+		{Data: idr0, Timestamp: 9000, Keyframe: true, AUStart: true},
+		{Data: idr1, Timestamp: 9000},
+		{Data: p0, Timestamp: 12000, AUStart: true},
+		{Data: p1, Timestamp: 12000},
+	}}
+
+	pkts := runVideoStream(t, src, 2)
+	for i, wantTS := range []uint32{9000, 12000} {
+		pkt := pkts[i]
+		if pkt.Header.Timestamp != wantTS {
+			t.Fatalf("packet %d ts = %d, want %d", i, pkt.Header.Timestamp, wantTS)
+		}
+		if !pkt.Header.Marker {
+			t.Fatalf("packet %d should be the last (and only) packet of its AU", i)
+		}
+		if got := pkt.Payload[0] & 0x1F; got != rtp.NALUTypeSTAPA {
+			t.Fatalf("packet %d type = %d, want STAP-A(24)", i, got)
+		}
+		if nalus := parseSTAPANALUs(t, pkt.Payload); len(nalus) != 2 {
+			t.Fatalf("packet %d STAP-A contains %d NALUs, want 2", i, len(nalus))
+		}
+	}
+}
+
+// TestStreamH264AUStartSplitsEqualTimestamp 源显式标记 AUStart 时，即使
+// 两帧时间戳相同也必须拆成两个 AU，不能吞帧。
+func TestStreamH264AUStartSplitsEqualTimestamp(t *testing.T) {
+	src := &framesSource{frames: []source.Frame{
+		{Data: []byte{0x41, 0x9A, 0x00}, Timestamp: 9000, AUStart: true},
+		{Data: []byte{0x41, 0x9A, 0x11}, Timestamp: 9000, AUStart: true},
+	}}
+
+	pkts := runVideoStream(t, src, 2)
+	for i, pkt := range pkts {
+		if pkt.Header.Timestamp != 9000 {
+			t.Fatalf("packet %d ts = %d, want 9000", i, pkt.Header.Timestamp)
+		}
+		if !pkt.Header.Marker {
+			t.Fatalf("packet %d should end its own AU", i)
+		}
+	}
+}
+
 // TestStreamH264MarkerOnLastPacket 大 IDR 回退 FU-A 后，整帧只有
 // 最后一个分片带 marker。
 func TestStreamH264MarkerOnLastPacket(t *testing.T) {

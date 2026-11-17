@@ -100,13 +100,14 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 	// SSRC 和 seq 从 track 取，跨 PAUSE/PLAY 连续。
 	ssrc := track.ensureSSRC()
 
-	// R-2：同一帧（时间戳相同）的 NALU 先攒在一起再封包，SPS/PPS 这类
-	// 小 NALU 就能和同帧数据一起进 STAP-A。批次在时间戳变化、超过 MTU
-	// 或流结束时结算，不跨帧聚合。
+	// R-2：同一访问单元（一帧）的所有 NALU 先攒在一起再封包，SPS/PPS
+	// 和同一帧的多个 slice 就能一起进 STAP-A，整帧只有一个 marker。
+	// 源的帧带 AUStart（本地 H.264 源）时，批次在下一个 AU 首 slice
+	// 到达时结算；不带 AUStart 的推流源沿用原来的逐步转发行为。
 	var (
-		pending     [][]byte
-		pendingTS   uint32
-		pendingSize int // 1 字节 STAP-A 头 + 每个 NALU 的 2 字节长度
+		pending   [][]byte
+		pendingTS uint32
+		auOpen    bool // 正在攒一个可能还有后续 slice 的 AU
 	)
 	// 发包回调，NALU 类型判断、降码丢弃、RTP 封装、写连接、缓存 PLI 关键帧
 	sendFrame := func(nalus [][]byte, ts uint32) bool {
@@ -166,13 +167,13 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		}
 		return true
 	}
-	// 把pending缓冲区里， 属于同一个ts的一批NALU， 交去给sendFrame发送，发完清空pending
+	// 把 pending 里属于同一个 AU 的 NALU 交给 sendFrame 封包发送。
 	flush := func() bool {
 		if len(pending) == 0 {
 			return true
 		}
 		ok := sendFrame(pending, pendingTS)
-		pending, pendingSize = nil, 0
+		pending = nil
 		return ok
 	}
 
@@ -198,39 +199,66 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			continue
 		}
 
-		isVCL := media.ClassifyVideoNAL(codec, f.Data).IsVCL
-		if !isVCL {
-			// 先攒着等同一帧的 slice；时间戳变了或批次放不下就立即发出。
-			if len(pending) > 0 && (f.Timestamp != pendingTS || pendingSize+2+len(f.Data) > mtu) {
+		// 正在攒一个 AU：下一个首 slice 或时间戳变化说明上一帧已经完整。
+		if auOpen {
+			if f.AUStart || f.Timestamp != pendingTS {
 				if !flush() {
 					return false
 				}
+				auOpen = false
+			} else {
+				// 同一帧的后续 slice，共用首 slice 的时间戳。
+				pending = append(pending, f.Data)
+				continue
 			}
-			if len(pending) == 0 {
-				pendingTS = f.Timestamp
-				pendingSize = 1
-			}
+		}
+
+		// 源标注了 AU 首 NALU：开始攒整帧。若 pending 里已有前面攒下的
+		// 参数集，它们随本 AU 一起封包（STAP-A 里 SPS/PPS + 首 slice）。
+		if f.AUStart {
+			auOpen = true
+			pendingTS = f.Timestamp
 			pending = append(pending, f.Data)
-			pendingSize += 2 + len(f.Data)
 			continue
 		}
 
-		if len(pending) > 0 && f.Timestamp == pendingTS {
+		// 兼容不带 AUStart 的源（RTMP/RTSP 推流）：沿用原来的行为，
+		// 非 VCL 按时间戳攒批，VCL 帧立即封包发送，避免源空闲时
+		// 最后一帧一直压在 pending 里。
+		if media.ClassifyVideoNAL(codec, f.Data).IsVCL {
+			if len(pending) == 0 {
+				if !sendFrame([][]byte{f.Data}, f.Timestamp) {
+					return false
+				}
+				continue
+			}
+			if f.Timestamp != pendingTS {
+				if !flush() {
+					return false
+				}
+				if !sendFrame([][]byte{f.Data}, f.Timestamp) {
+					return false
+				}
+				continue
+			}
 			batch := append(pending, f.Data)
 			ts := pendingTS
-			pending, pendingSize = nil, 0
+			pending = nil
 			if !sendFrame(batch, ts) {
 				return false
 			}
 			continue
 		}
-		// 时间戳不同：pending 属于前一帧，先单独结算，当前 slice 再单独发。
-		if !flush() {
-			return false
+
+		if len(pending) > 0 && f.Timestamp != pendingTS {
+			if !flush() {
+				return false
+			}
 		}
-		if !sendFrame([][]byte{f.Data}, f.Timestamp) {
-			return false
+		if len(pending) == 0 {
+			pendingTS = f.Timestamp
 		}
+		pending = append(pending, f.Data)
 	}
 }
 

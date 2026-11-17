@@ -93,7 +93,7 @@ func (s *ExternalSource) SamplingRate() uint32 {
 
 func newExternalSource(cacheParamSets bool) *ExternalSource {
 	return &ExternalSource{
-		ring:           NewRingBuffer[Frame](videoRingCapacity),
+		ring:           newVideoRing(),
 		cacheParamSets: cacheParamSets,
 	}
 }

@@ -111,6 +111,23 @@ func dialRTMPS(t *testing.T, addr string) *tls.Conn {
 	}
 }
 
+// dialPlainRTMP 重试明文 TCP 拨号。Serve 在 goroutine 里启动，测试直接
+// Dial 可能早于 listener 就绪，重试几轮消除这个启动竞态。
+func dialPlainRTMP(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			return c
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestServeRTMPS 验证 RTMPS 监听复用现有 RTMP 处理逻辑：TLS 握手成功后
 // 完成 RTMP 握手并收到 connect 的 _result。
 func TestServeRTMPS(t *testing.T) {
@@ -195,10 +212,7 @@ func TestRTMPSHandshakeTimesOut(t *testing.T) {
 	}
 	addr := startRTMPSServer(t)
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	conn := dialPlainRTMP(t, addr)
 	defer conn.Close()
 	if err := conn.SetReadDeadline(time.Now().Add(tlsHandshakeTimeout + 3*time.Second)); err != nil {
 		t.Fatal(err)
@@ -206,7 +220,7 @@ func TestRTMPSHandshakeTimesOut(t *testing.T) {
 
 	// 什么都不发，服务端握手应超时并关闭连接。
 	buf := make([]byte, 1)
-	_, err = conn.Read(buf)
+	_, err := conn.Read(buf)
 	if err == nil {
 		t.Fatal("server accepted a silent TLS client (read succeeded)")
 	}
@@ -220,10 +234,7 @@ func TestRTMPSHandshakeTimesOut(t *testing.T) {
 func TestRTMPSBadTLSRecord(t *testing.T) {
 	addr := startRTMPSServer(t)
 
-	bad, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	bad := dialPlainRTMP(t, addr)
 	if _, err := bad.Write([]byte("not tls at all")); err != nil {
 		t.Fatalf("write: %v", err)
 	}

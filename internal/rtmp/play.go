@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"flow/internal/flv"
 	"flow/internal/media"
@@ -32,14 +33,185 @@ type frameSource interface {
 	Subscribe() (*source.Reader[source.Frame], func())
 }
 
+// seekSource 可选接口：能从指定时间点重新订阅。文件源（H264Source /
+// AACSource）实现它；实时推流源（ExternalSource）没有可回退的 ring，
+// 因此不支持 seek。
+type seekSource interface {
+	SubscribeFrom(start time.Duration, scale float64) (*source.Reader[source.Frame], func(), error)
+}
+
+// maxPausedFrames 暂停期间每条轨最多缓存的帧数。暂停时继续消费源（避免
+// 环形缓冲覆盖导致丢帧），超过上限才丢弃最老的帧。25fps 下 256 帧约 10s，
+// 足够覆盖 P2 要求的两秒暂停，同时给内存一个硬上限。
+const maxPausedFrames = 256
+
 // playState 一次播放的生命周期。
 type playState struct {
 	streamID uint32
 	cancel   chan struct{}
 	wg       sync.WaitGroup
+
+	// 已解析的帧源与编码参数，seek 时按原样重新订阅。
+	video     frameSource
+	audio     frameSource
+	vparams   *stream.VideoCodec
+	aparams   *stream.AudioCodec
+	audioRate uint32
+	audioCh   uint8
+	codec     string
+
+	// 每条轨一个播放时钟；seek 重启 goroutine 后由同一个 playState 延续，
+	// 保证 DTS 不回退。只有对应轨的播放 goroutine 访问（重启前已 wg.Wait）。
+	vclock relativeClock
+	aclock relativeClock
+
+	// tsOffset 在 seek 后叠加到相对时间戳上，使新位置首帧的 DTS 不小于
+	// seek 前的最后一帧；回退 seek 也不会让时间戳倒退。
+	tsOffset uint32
+
+	// 暂停门闩：paused 为真时播放 goroutine 停止发送，但继续消费源并把
+	// 帧缓存到本地，恢复后按原顺序补发。
+	pauseMu sync.Mutex
+	paused  bool
+	resume  chan struct{}
 }
 
-// relativeClock 一条轨的播放时间基准，由该轨的播放 goroutine 独占，无需加锁。
+// stop 取消播放并等所有轨的 goroutine 退出。只能调用一次。
+func (ps *playState) stop() {
+	close(ps.cancel)
+	ps.wg.Wait()
+}
+
+// setPaused 切换暂停状态。恢复时关闭 resume 唤醒所有等待的轨。
+func (ps *playState) setPaused(paused bool) {
+	ps.pauseMu.Lock()
+	defer ps.pauseMu.Unlock()
+	if ps.paused == paused {
+		return
+	}
+	if paused {
+		// 切到暂停：新建resume通道，播放协程后续会阻塞在这个chan上
+		ps.resume = make(chan struct{})
+	} else {
+		// 切到恢复：关闭通道，唤醒所有等待的音视频协程
+		close(ps.resume)
+		ps.resume = nil
+	}
+	ps.paused = paused
+}
+
+func (ps *playState) isPaused() bool {
+	ps.pauseMu.Lock()
+	defer ps.pauseMu.Unlock()
+	return ps.paused
+}
+
+// waitUnpaused 阻塞到恢复播放；cancel 关闭时返回 false。
+func (ps *playState) waitUnpaused(cancel <-chan struct{}) bool {
+	for {
+		//快照，锁只抓一瞬间
+		ps.pauseMu.Lock()
+		paused, resume := ps.paused, ps.resume
+		ps.pauseMu.Unlock()
+		// 已经不在暂停，直接返回成功
+		if !paused {
+			return true
+		}
+		select {
+		case <-resume:
+			// resume被close（setPaused(false)），进入下一轮循环
+			// 循环回去再快照一次状态，确认paused=false再return
+		case <-cancel:
+			// 收到停止信号，直接返回false，播放协程退出
+			return false
+		}
+	}
+}
+
+// seekable 判断这次播放的所有轨是否都支持定位。实时源只要有一轨不支持
+// 就整体拒绝，避免音视频不同步。
+func (ps *playState) seekable() bool {
+	if ps.video == nil && ps.audio == nil {
+		return false
+	}
+	if ps.video != nil {
+		if _, ok := ps.video.(seekSource); !ok {
+			return false
+		}
+	}
+	if ps.audio != nil {
+		if _, ok := ps.audio.(seekSource); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// seekOffset 返回 seek 后新时间线的起点：两条轨最后已发 DTS 的较大者 + 1。
+func (ps *playState) seekOffset() uint32 {
+	var last uint32
+	set := false
+	if ps.vclock.set {
+		last, set = ps.vclock.last, true
+	}
+	if ps.aclock.set && (!set || ps.aclock.last > last) {
+		last, set = ps.aclock.last, true
+	}
+	if !set {
+		return 0
+	}
+	return last + 1
+}
+
+// nextPlayFrame 取下一帧交给播放循环。暂停期间继续从源读帧并缓存到
+// pending，避免暂停时间超过环形缓冲窗口后丢帧；恢复后按原顺序补发。
+// dropped 表示缓存超过上限、丢弃过最老的帧（调用方需要重设时间基准）。
+func nextPlayFrame(ps *playState, rd *source.Reader[source.Frame],
+	pending *[]source.Frame, dropped *bool) (source.Frame, bool) {
+	for {
+		if ps.isPaused() {
+			f, ok := rd.Next(ps.cancel)
+			if !ok {
+				// 源在暂停期间结束：有缓存就先等恢复，把缓存发完再收尾。
+				if len(*pending) == 0 || !ps.waitUnpaused(ps.cancel) {
+					return source.Frame{}, false
+				}
+				f = (*pending)[0]
+				*pending = (*pending)[1:]
+				return f, true
+			}
+			if len(*pending) >= maxPausedFrames {
+				*pending = (*pending)[1:]
+				*dropped = true
+			}
+			*pending = append(*pending, f)
+			continue
+		}
+		if len(*pending) > 0 {
+			f := (*pending)[0]
+			*pending = (*pending)[1:]
+			return f, true
+		}
+		f, ok := rd.Next(ps.cancel)
+		if !ok {
+			return source.Frame{}, false
+		}
+		// 等帧期间可能刚好进入暂停：把这一帧也放进缓存，避免
+		// Pause.Notify 之后还漏发一帧。
+		if ps.isPaused() {
+			if len(*pending) >= maxPausedFrames {
+				*pending = (*pending)[1:]
+				*dropped = true
+			}
+			*pending = append(*pending, f)
+			continue
+		}
+		return f, true
+	}
+}
+
+// relativeClock 一条轨的播放时间基准，由该轨的播放 goroutine 独占，无需加锁；
+// seek 时在旧 goroutine 退出（wg.Wait）之后读取。
 //
 // 音视频各用一个：RTSP 源的音频/视频 RTP 时钟互不相关（可能相差上亿），
 // 共用一个基准会让其中一轨的相对毫秒远超 0xFFFFFF，触发扩展时间戳并让
@@ -69,6 +241,22 @@ func (rc *relativeClock) relative(ms uint32) uint32 {
 	}
 	rc.last = rel
 	return rel
+}
+
+// rebase 把 ms 映射成 last+1，抹掉暂停期间因缓存上限丢弃帧造成的时间空洞，
+// 让恢复后的 DTS 继续单调递增。未建立基准时等价于普通首帧。
+func (rc *relativeClock) rebase(ms uint32) {
+	if !rc.set {
+		rc.base = ms
+		rc.last = 0
+		rc.set = true
+		return
+	}
+	if ms > rc.last+1 {
+		rc.base = ms - rc.last - 1
+	} else {
+		rc.base = 0
+	}
 }
 
 // supportsHEVC 判断客户端能否解 Enhanced RTMP 的 HEVC 标签。
@@ -178,7 +366,17 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		ard, acancel = audio.Subscribe()
 	}
 
-	ps := &playState{streamID: streamID, cancel: make(chan struct{})}
+	ps := &playState{
+		streamID:  streamID,
+		cancel:    make(chan struct{}),
+		video:     video,
+		audio:     audio,
+		vparams:   vparams,
+		aparams:   aparams,
+		audioRate: audioRate,
+		audioCh:   audioCh,
+		codec:     codec,
+	}
 	c.play = ps
 
 	fmt.Printf("rtmp: play %q (app %q) from %s\n", name, appBase(c.app), c.RemoteAddr())
@@ -246,8 +444,125 @@ func (c *Conn) stopPlay() {
 	if c.srv != nil {
 		c.srv.metrics.DecPlay()
 	}
-	close(ps.cancel)
-	ps.wg.Wait()
+	ps.stop()
+}
+
+// handlePause 处理 pause 命令：暂停后停止发送但保留订阅。
+// RTMP 的 pause 参数是（命令对象, 布尔暂停标志, 毫秒位置）；位置只用于
+// 客户端自己的续播提示，这里按要求忽略，恢复后从暂停处继续。
+func (c *Conn) handlePause(streamID uint32, cmd *Command) error {
+	ps := c.play
+	if ps == nil || ps.streamID != streamID {
+		return nil
+	}
+	paused := cmd.boolArg(0)
+	action := "pause"
+	code, desc := "NetStream.Pause.Notify", "Paused"
+	if !paused {
+		action = "unpause"
+		code, desc = "NetStream.Unpause.Notify", "Unpaused"
+	}
+	fmt.Printf("rtmp: %s stream %d from %s\n", action, streamID, c.RemoteAddr())
+	status := func() error {
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("status", code, desc))
+	}
+	if !paused {
+		// 先回状态再唤醒播放 goroutine，客户端保证先看到 Unpause.Notify。
+		if err := status(); err != nil {
+			return err
+		}
+		ps.setPaused(false)
+		return nil
+	}
+	ps.setPaused(true)
+	return status()
+}
+
+// handleSeek 处理 seek 命令：文件源按 G-2 的索引从目标附近的前置 IDR
+// 重新订阅，实时源返回 Seek.Failed。时间戳从 seek 前的最后一帧继续，
+// 回退 seek 也不会倒退。
+func (c *Conn) handleSeek(streamID uint32, cmd *Command) error {
+	ps := c.play
+	if ps == nil || ps.streamID != streamID {
+		return nil
+	}
+	ms, ok := cmd.numberArg(0)
+	if !ok || ms < 0 {
+		ms = 0
+	}
+	if !ps.seekable() {
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("error", "NetStream.Seek.Failed", "stream is not seekable"))
+	}
+	start := time.Duration(ms * float64(time.Millisecond))
+
+	// 先为新位置建订阅，再停旧播放：订阅失败时旧播放不受影响。
+	var (
+		vrd, ard         *source.Reader[source.Frame]
+		vcancel, acancel func()
+	)
+	if ps.video != nil {
+		var err error
+		vrd, vcancel, err = ps.video.(seekSource).SubscribeFrom(start, 1)
+		if err != nil {
+			return c.seekFailed(streamID, err)
+		}
+	}
+	if ps.audio != nil {
+		var err error
+		ard, acancel, err = ps.audio.(seekSource).SubscribeFrom(start, 1)
+		if err != nil {
+			vcancelPlay(vcancel)
+			return c.seekFailed(streamID, err)
+		}
+	}
+
+	ps.stop()
+
+	np := &playState{
+		streamID:  streamID,
+		cancel:    make(chan struct{}),
+		video:     ps.video,
+		audio:     ps.audio,
+		vparams:   ps.vparams,
+		aparams:   ps.aparams,
+		audioRate: ps.audioRate,
+		audioCh:   ps.audioCh,
+		codec:     ps.codec,
+		tsOffset:  ps.seekOffset(),
+	}
+	c.play = np
+
+	// 先回 Seek.Notify 再启动新 goroutine，客户端收到的下一批媒体消息
+	// 一定来自 seek 后的新订阅。
+	if err := c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+		statusObj("status", "NetStream.Seek.Notify",
+			fmt.Sprintf("Seeking to %dms", int64(ms)))); err != nil {
+		vcancelPlay(vcancel, acancel)
+		c.play = nil
+		c.srv.metrics.DecPlay()
+		return err
+	}
+	fmt.Printf("rtmp: seek %dms (stream %d) from %s\n", int64(ms), streamID, c.RemoteAddr())
+
+	if np.video != nil {
+		np.wg.Add(1)
+		go c.playVideo(np, vrd, vcancel, np.vparams, np.codec)
+	}
+	if np.audio != nil {
+		np.wg.Add(1)
+		go c.playAudio(np, ard, acancel, np.aparams, np.audioRate, np.audioCh)
+	}
+	go c.watchPlay(np)
+	return nil
+}
+
+// seekFailed 记日志并回 NetStream.Seek.Failed。
+func (c *Conn) seekFailed(streamID uint32, err error) error {
+	fmt.Printf("rtmp: seek stream %d from %s: %v\n", streamID, c.RemoteAddr(), err)
+	return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+		statusObj("error", "NetStream.Seek.Failed", err.Error()))
 }
 
 // watchPlay 等所有轨播完：自然结束就发 Play.Complete 并关闭连接，
@@ -296,7 +611,7 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		}
 		return len(sps) > 0 && len(pps) > 0
 	}
-	var clock relativeClock
+	clock := &ps.vclock
 	headerSent := false
 	sendHeader := func() error {
 		if headerSent || !haveParams() {
@@ -323,12 +638,12 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		return
 	}
 
-	for {
-		f, ok := rd.Next(ps.cancel)
-		if !ok {
-			return
-		}
-
+	var (
+		pending []source.Frame
+		dropped bool
+		rebase  bool
+	)
+	send := func(f source.Frame) bool {
 		// 参数集只进序列头，不单独发 tag。
 		if class := media.ClassifyVideoNAL(codec, f.Data); class.IsVPS || class.IsSPS || class.IsPPS {
 			switch {
@@ -339,32 +654,48 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 			default:
 				pps = f.Data
 			}
-			continue
+			return true
 		}
 
 		// 参数集可能晚于第一帧：等参数集齐了再发媒体帧。
 		if !headerSent {
 			if err := sendHeader(); err != nil {
-				return
+				return false
 			}
 			if !headerSent {
-				continue
+				return true
 			}
 		}
 
 		ms := uint32(uint64(f.Timestamp) * 1000 / 90000)
+		if rebase {
+			clock.rebase(ms)
+			rebase = false
+		}
 		var payload []byte
 		if isHEVC {
 			payload = flv.BuildHEVCVideoTag(f.Data, f.Keyframe, 0)
 		} else {
 			payload = flv.BuildVideoTag(f.Data, f.Keyframe, 0)
 		}
-		if err := c.writeMessage(&Message{
+		return c.writeMessage(&Message{
 			TypeID:    msgVideo,
 			StreamID:  ps.streamID,
-			Timestamp: clock.relative(ms),
+			Timestamp: clock.relative(ms) + ps.tsOffset,
 			Payload:   payload,
-		}, videoCSID); err != nil {
+		}, videoCSID) == nil
+	}
+
+	for {
+		f, ok := nextPlayFrame(ps, rd, &pending, &dropped)
+		if !ok {
+			return
+		}
+		if dropped {
+			// 暂停超过缓存上限丢了帧：恢复后的首帧重设基准，DTS 保持连续。
+			rebase, dropped = true, false
+		}
+		if !send(f) {
 			return
 		}
 	}
@@ -389,19 +720,35 @@ func (c *Conn) playAudio(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		}
 	}
 
-	var clock relativeClock
+	clock := &ps.aclock
+	var (
+		pending []source.Frame
+		dropped bool
+		rebase  bool
+	)
+	send := func(f source.Frame) bool {
+		ms := uint32(uint64(f.Timestamp) * 1000 / uint64(rate))
+		if rebase {
+			clock.rebase(ms)
+			rebase = false
+		}
+		return c.writeMessage(&Message{
+			TypeID:    msgAudio,
+			StreamID:  ps.streamID,
+			Timestamp: clock.relative(ms) + ps.tsOffset,
+			Payload:   flv.BuildAudioTag(f.Data, rate, ch),
+		}, audioCSID) == nil
+	}
+
 	for {
-		f, ok := rd.Next(ps.cancel)
+		f, ok := nextPlayFrame(ps, rd, &pending, &dropped)
 		if !ok {
 			return
 		}
-		ms := uint32(uint64(f.Timestamp) * 1000 / uint64(rate))
-		if err := c.writeMessage(&Message{
-			TypeID:    msgAudio,
-			StreamID:  ps.streamID,
-			Timestamp: clock.relative(ms),
-			Payload:   flv.BuildAudioTag(f.Data, rate, ch),
-		}, audioCSID); err != nil {
+		if dropped {
+			rebase, dropped = true, false
+		}
+		if !send(f) {
 			return
 		}
 	}

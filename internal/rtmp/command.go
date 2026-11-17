@@ -101,6 +101,39 @@ func (c *Command) stringArg(i int) string {
 	return ""
 }
 
+// boolArg 返回第 i 个布尔参数（跳过 Null/Object 等非布尔参数）。
+// pause 命令的参数布局是（命令对象, 暂停标志, 毫秒位置）。
+// 过滤掉所有不是布尔类型的参数，只看布尔值，取出里面第 i 个布尔；找不到就返回 false。
+func (c *Command) boolArg(i int) bool {
+	n := 0
+	for _, a := range c.Args {
+		if a.Type != flv.TypeBoolean {
+			continue
+		}
+		if n == i {
+			return a.Boolean
+		}
+		n++
+	}
+	return false
+}
+
+// numberArg 返回第 i 个数字参数（跳过 Null/Object 等非数字参数）。
+// pause 的毫秒位置和 seek 的目标时间都用它取。
+func (c *Command) numberArg(i int) (float64, bool) {
+	n := 0
+	for _, a := range c.Args {
+		if a.Type != flv.TypeNumber {
+			continue
+		}
+		if n == i {
+			return a.Number, true
+		}
+		n++
+	}
+	return 0, false
+}
+
 // objectString 取命令对象（Args[0]）里的字符串字段。
 func (c *Command) objectString(key string) (string, bool) {
 	if len(c.Args) == 0 {
@@ -197,6 +230,10 @@ func (c *Conn) handleCommand(m *Message) error {
 		return nil
 	case "play":
 		return c.handlePlay(m.StreamID, cmd)
+	case "pause":
+		return c.handlePause(m.StreamID, cmd)
+	case "seek":
+		return c.handleSeek(m.StreamID, cmd)
 	}
 	// 未知命令（如 onBWDone 之类的通知）直接忽略。
 	return nil

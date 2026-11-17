@@ -61,6 +61,9 @@ type H264Depacketizer struct {
 	Dropped uint64
 }
 
+// DroppedCount 返回丢弃的半成品数量（供统一的视频解包接口使用）。
+func (d *H264Depacketizer) DroppedCount() uint64 { return d.Dropped }
+
 // Depacketize 消费一个 RTP 包，返回其中已经完整的 NALU（可能为 0 个或多个）。
 //
 //   - 单 NALU / STAP-A 立即返回；

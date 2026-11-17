@@ -57,7 +57,7 @@ func TestSetParamsCopiesSlices(t *testing.T) {
 	s := &Stream{}
 	sps := []byte{0x67, 0x42}
 	pps := []byte{0x68, 0xCE}
-	s.SetVideoParams(sps, pps)
+	s.SetVideoParams("H264", nil, sps, pps)
 	sps[0] = 0xFF
 	pps[0] = 0xFF
 
@@ -74,6 +74,30 @@ func TestSetParamsCopiesSlices(t *testing.T) {
 	vc2, _ := s.VideoParams()
 	if vc2.SPS[0] != 0x67 {
 		t.Fatal("VideoParams exposed internal slice")
+	}
+}
+
+func TestSetVideoParamsHEVC(t *testing.T) {
+	s := &Stream{}
+	vps := []byte{0x40, 0x01}
+	sps := []byte{0x42, 0x01}
+	pps := []byte{0x44, 0x01}
+	s.SetVideoParams("H265", vps, sps, pps)
+	vps[0] = 0xFF
+
+	vc, ok := s.VideoParams()
+	if !ok {
+		t.Fatal("VideoParams not ok after SetVideoParams")
+	}
+	if vc.Codec != "H265" {
+		t.Fatalf("Codec = %q, want H265", vc.Codec)
+	}
+	if !bytes.Equal(vc.VPS, []byte{0x40, 0x01}) {
+		t.Fatalf("VPS changed through caller buffer: %x", vc.VPS)
+	}
+	// 编码要同步给帧源，推流端解包时会按它分类 NAL。
+	if got := s.VideoTrack().Src.Codec(); got != "H265" {
+		t.Fatalf("source codec = %q, want H265", got)
 	}
 }
 

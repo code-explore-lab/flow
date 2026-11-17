@@ -69,6 +69,10 @@ type Conn struct {
 	nextStreamID uint32
 	publish      *publishState
 	play         *playState
+
+	// fourCCs 是 connect 命令里客户端声明的 fourCcList（Enhanced RTMP）。
+	// nil 表示客户端没声明，按支持 HEVC 的新客户端处理。
+	fourCCs []string
 }
 
 // countingReader 统计底层连接读到的字节总数，用于周期性回 Ack。

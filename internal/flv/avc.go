@@ -36,11 +36,12 @@ const (
 
 // VideoTag 解析出的一个视频 tag 负载。
 type VideoTag struct {
+	Codec      string   // "H264" / "H265"
 	Keyframe   bool     // FrameType == 1
-	PacketType uint8    // AVCPacketType
+	PacketType uint8    // AVCPacketType（HEVC 复用同一组 0/1/2 语义）
 	CTS        int32    // 组成时间偏移（毫秒级实际以 1/90kHz 计，仅原样搬运）
 	NALUs      [][]byte // PacketType == AVCNALU 时的裸 NALU 列表
-	Config     []byte   // PacketType == AVCSeqHeader 时的 AVCDecoderConfigurationRecord
+	Config     []byte   // PacketType == AVCSeqHeader 时的解码器配置记录
 }
 
 // BuildAVCDecoderConfig 由 SPS/PPS 生成 AVCDecoderConfigurationRecord。
@@ -143,16 +144,22 @@ func BuildVideoTag(nalu []byte, key bool, cts int32) []byte {
 	return body
 }
 
-// ParseVideoTag 解析一个视频 tag 的 Data。只支持 AVC（CodecID=7）。
+// ParseVideoTag 解析一个视频 tag 的 Data。
+// 首字节 bit7 置位时是 Enhanced RTMP（FourCC 模式，支持 HEVC）；
+// 否则按传统 AVC（CodecID=7）解析。
 func ParseVideoTag(data []byte) (*VideoTag, error) {
 	if len(data) < 5 {
 		return nil, fmt.Errorf("avc: video tag too short: %d", len(data))
+	}
+	if data[0]&exHeaderFlag != 0 {
+		return parseExVideoTag(data)
 	}
 	if codecID := data[0] & 0x0F; codecID != codecIDAVC {
 		return nil, fmt.Errorf("avc: unsupported codec id %d", codecID)
 	}
 
 	vt := &VideoTag{
+		Codec:      "H264",
 		Keyframe:   data[0]>>4 == frameTypeKey,
 		PacketType: data[1],
 		CTS:        getCTS24(data[2:5]),
@@ -164,18 +171,11 @@ func ParseVideoTag(data []byte) (*VideoTag, error) {
 		vt.Config = append([]byte(nil), payload...)
 	case AVCNALU:
 		// 逐个拆「4 字节长度前缀 + NALU」，多 NALU 一个 tag 内连续排列。
-		for off := 0; off < len(payload); {
-			if off+4 > len(payload) {
-				return nil, errors.New("avc: truncated nalu length")
-			}
-			l := int(binary.BigEndian.Uint32(payload[off : off+4]))
-			off += 4
-			if l == 0 || off+l > len(payload) {
-				return nil, errors.New("avc: truncated nalu")
-			}
-			vt.NALUs = append(vt.NALUs, append([]byte(nil), payload[off:off+l]...))
-			off += l
+		nalus, err := splitLengthPrefixed(payload)
+		if err != nil {
+			return nil, err
 		}
+		vt.NALUs = nalus
 	case AVCEndSeq:
 		// 无 NALU 负载。
 	default:

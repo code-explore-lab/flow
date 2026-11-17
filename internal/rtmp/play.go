@@ -17,11 +17,11 @@ package rtmp
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"flow/internal/flv"
 	"flow/internal/media"
-	"flow/internal/rtp"
 	"flow/internal/source"
 	"flow/internal/stream"
 )
@@ -69,6 +69,20 @@ func (rc *relativeClock) relative(ms uint32) uint32 {
 	}
 	rc.last = rel
 	return rel
+}
+
+// supportsHEVC 判断客户端能否解 Enhanced RTMP 的 HEVC 标签。
+// 没声明 fourCcList 的按新客户端处理；声明了清单就要含 hvc1（或 hev1）。
+func (c *Conn) supportsHEVC() bool {
+	if c.fourCCs == nil {
+		return true
+	}
+	for _, f := range c.fourCCs {
+		if strings.EqualFold(f, "hvc1") || strings.EqualFold(f, "hev1") {
+			return true
+		}
+	}
+	return false
 }
 
 // handlePlay 处理 play 命令：选定帧源、订阅、回状态并启动播放 goroutine。
@@ -127,6 +141,16 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 			statusObj("error", "NetStream.Play.StreamNotFound", "no stream named "+name))
 	}
 
+	// HEVC 只能通过 Enhanced RTMP（FourCC 模式）下发。客户端在 connect 的
+	// fourCcList 里声明了支持哪些 FourCC；声明了清单却不含 hvc1 的是老客户端，
+	// 明确拒绝比发它解不了的标签更友好。没声明清单的按新客户端放行。
+	codec := videoCodec(vparams, video)
+	if media.IsHEVCCodec(codec) && !c.supportsHEVC() {
+		fmt.Printf("rtmp: reject HEVC play for legacy client %s\n", c.RemoteAddr())
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("error", "NetStream.Play.Failed", "H.265 stream requires hvc1 support"))
+	}
+
 	// 先订阅再回 Play.Start：客户端收到状态时源已挂好，不会漏掉开头几帧。
 	var vrd, ard *source.Reader[source.Frame]
 	var vcancel, acancel func()
@@ -160,7 +184,7 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 
 	if video != nil {
 		ps.wg.Add(1)
-		go c.playVideo(ps, vrd, vcancel, vparams)
+		go c.playVideo(ps, vrd, vcancel, vparams, codec)
 	}
 	if audio != nil {
 		ps.wg.Add(1)
@@ -207,26 +231,53 @@ func (c *Conn) watchPlay(ps *playState) {
 	c.Close()
 }
 
+// videoCodec 推断一条视频轨的编码：注册表参数优先，其次看帧源自己
+// 记的编码（推流源在收到序列头时就设置了），最后按 H.264 处理。
+func videoCodec(params *stream.VideoCodec, src frameSource) string {
+	if params != nil && params.Codec != "" {
+		return params.Codec
+	}
+	if ext, ok := src.(*source.ExternalSource); ok {
+		return ext.Codec()
+	}
+	return "H264"
+}
+
 // playVideo 把视频帧转成 FLV video tag 发送。
-// 编码参数优先用注册表里的；没有就从前几帧（SPS/PPS）捕获，对应本地源。
-func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubscribe func(), params *stream.VideoCodec) {
+// 编码参数优先用注册表里的；没有就从前几帧（SPS/PPS，HEVC 含 VPS）捕获，
+// 对应本地源。codec 决定序列头/媒体标签用传统 AVC 还是 Enhanced HEVC 格式。
+func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubscribe func(),
+	params *stream.VideoCodec, codec string) {
 	defer ps.wg.Done()
 	defer unsubscribe()
 
-	var sps, pps []byte
+	isHEVC := media.IsHEVCCodec(codec)
+	var vps, sps, pps []byte
 	if params != nil {
-		sps, pps = params.SPS, params.PPS
+		vps, sps, pps = params.VPS, params.SPS, params.PPS
+	}
+	haveParams := func() bool {
+		if isHEVC {
+			return len(vps) > 0 && len(sps) > 0 && len(pps) > 0
+		}
+		return len(sps) > 0 && len(pps) > 0
 	}
 	var clock relativeClock
 	headerSent := false
 	sendHeader := func() error {
-		if headerSent || len(sps) == 0 || len(pps) == 0 {
+		if headerSent || !haveParams() {
 			return nil
+		}
+		var payload []byte
+		if isHEVC {
+			payload = flv.BuildHEVCVideoSequenceHeader(vps, sps, pps)
+		} else {
+			payload = flv.BuildVideoSequenceHeader(sps, pps)
 		}
 		if err := c.writeMessage(&Message{
 			TypeID:   msgVideo,
 			StreamID: ps.streamID,
-			Payload:  flv.BuildVideoSequenceHeader(sps, pps),
+			Payload:  payload,
 		}, videoCSID); err != nil {
 			return err
 		}
@@ -244,19 +295,20 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 			return
 		}
 
-		// SPS/PPS 只进序列头，不单独发 tag。
-		if typ, err := media.NALType(f.Data); err == nil {
-			switch typ {
-			case rtp.NALUTypeSPS:
+		// 参数集只进序列头，不单独发 tag。
+		if class := media.ClassifyVideoNAL(codec, f.Data); class.IsVPS || class.IsSPS || class.IsPPS {
+			switch {
+			case class.IsVPS:
+				vps = f.Data
+			case class.IsSPS:
 				sps = f.Data
-				continue
-			case rtp.NALUTypePPS:
+			default:
 				pps = f.Data
-				continue
 			}
+			continue
 		}
 
-		// 参数集可能晚于第一帧：等 SPS/PPS 齐了再发媒体帧。
+		// 参数集可能晚于第一帧：等参数集齐了再发媒体帧。
 		if !headerSent {
 			if err := sendHeader(); err != nil {
 				return
@@ -267,11 +319,17 @@ func (c *Conn) playVideo(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		}
 
 		ms := uint32(uint64(f.Timestamp) * 1000 / 90000)
+		var payload []byte
+		if isHEVC {
+			payload = flv.BuildHEVCVideoTag(f.Data, f.Keyframe, 0)
+		} else {
+			payload = flv.BuildVideoTag(f.Data, f.Keyframe, 0)
+		}
 		if err := c.writeMessage(&Message{
 			TypeID:    msgVideo,
 			StreamID:  ps.streamID,
 			Timestamp: clock.relative(ms),
-			Payload:   flv.BuildVideoTag(f.Data, f.Keyframe, 0),
+			Payload:   payload,
 		}, videoCSID); err != nil {
 			return
 		}

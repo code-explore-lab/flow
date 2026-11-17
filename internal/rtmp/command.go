@@ -114,6 +114,31 @@ func (c *Command) objectString(key string) (string, bool) {
 	return "", false
 }
 
+// objectStringArray 取命令对象（Args[0]）里的字符串数组字段，如 fourCcList。
+// 字段不存在或不是 strict array 时返回 ok=false。
+func (c *Command) objectStringArray(key string) ([]string, bool) {
+	if len(c.Args) == 0 {
+		return nil, false
+	}
+	obj := c.Args[0]
+	if obj.Type != flv.TypeObject && obj.Type != flv.TypeECMAArray {
+		return nil, false
+	}
+	for _, m := range obj.Object {
+		if m.Key != key || m.Value.Type != flv.TypeStrictArray {
+			continue
+		}
+		out := make([]string, 0, len(m.Value.Array))
+		for _, e := range m.Value.Array {
+			if e.Type == flv.TypeString {
+				out = append(out, e.String)
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
 // buildCommand 序列化一条命令消息的负载。
 func buildCommand(name string, txID float64, args ...flv.Value) []byte {
 	var buf bytes.Buffer
@@ -177,6 +202,9 @@ func (c *Conn) handleCommand(m *Message) error {
 func (c *Conn) handleConnect(cmd *Command) error {
 	if app, ok := cmd.objectString("app"); ok {
 		c.app = app
+	}
+	if list, ok := cmd.objectStringArray("fourCcList"); ok {
+		c.fourCCs = list
 	}
 
 	if err := c.writeWindowAckSize(ackWindow); err != nil {

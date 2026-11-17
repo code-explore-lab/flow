@@ -40,6 +40,7 @@ const defaultPLIInterval = 500 * time.Millisecond
 type pushReceiver struct {
 	external *source.ExternalSource
 	h264     *rtp.H264Depacketizer
+	h265     *rtp.H265Depacketizer
 	aac      *rtp.AACDepacketizer
 
 	// 接收侧 jitter buffer 与 NACK 缺口跟踪（R-6）。
@@ -105,6 +106,12 @@ func newPushReceiver(encoding, fmtp string, external *source.ExternalSource) (*p
 			rx.external = source.NewExternalSource()
 		}
 		rx.h264 = &rtp.H264Depacketizer{}
+	case "H265", "HEVC":
+		if rx.external == nil {
+			rx.external = source.NewExternalSource()
+		}
+		rx.external.SetCodec("H265")
+		rx.h265 = &rtp.H265Depacketizer{}
 	case "MPEG4-GENERIC":
 		if rx.external == nil {
 			rx.external = source.NewExternalAudioSource()
@@ -281,6 +288,9 @@ func (rx *pushReceiver) deliver(track *mediaTrack, pkt *rtp.RTPPacket, rawLen in
 	case rx.h264 != nil:
 		rx.handleH264(track, pkt, ev)
 
+	case rx.h265 != nil:
+		rx.handleH265(track, pkt, ev)
+
 	case rx.aac != nil:
 		rx.handleAAC(track, pkt, ev)
 	}
@@ -359,8 +369,24 @@ func (rx *pushReceiver) scheduleDrainLocked(track *mediaTrack) {
 	})
 }
 
-// handleH264 解包一个视频 RTP 包，按 AU 组装后发布；丢包时做 PLC。
+// videoDepacketizer 视频 RTP 解包器的公共接口，屏蔽 H.264 / H.265 的差异。
+type videoDepacketizer interface {
+	Depacketize(pkt *rtp.RTPPacket) ([][]byte, error)
+	DroppedCount() uint64
+}
+
+// handleH264 解包一个 H.264 RTP 包，按 AU 组装后发布；丢包时做 PLC。
 func (rx *pushReceiver) handleH264(track *mediaTrack, pkt *rtp.RTPPacket, ev recvEvent) {
+	rx.handleVideo(track, pkt, ev, rx.h264, "H.264")
+}
+
+// handleH265 解包一个 H.265 RTP 包，AU 组装/PLC 逻辑与 H.264 相同。
+func (rx *pushReceiver) handleH265(track *mediaTrack, pkt *rtp.RTPPacket, ev recvEvent) {
+	rx.handleVideo(track, pkt, ev, rx.h265, "H.265")
+}
+
+// handleVideo 按 AU 组装视频 RTP 包；dep 是本轨的编码相关解包器。
+func (rx *pushReceiver) handleVideo(track *mediaTrack, pkt *rtp.RTPPacket, ev recvEvent, dep videoDepacketizer, codecName string) {
 	if ev.ssrcChanged {
 		// 换了同步源：旧 SSRC 的半成品和上一帧缓存都不再适用。
 		rx.au.reset()
@@ -375,18 +401,18 @@ func (rx *pushReceiver) handleH264(track *mediaTrack, pkt *rtp.RTPPacket, ev rec
 		rx.au.corrupt = true
 	}
 
-	before := rx.h264.Dropped
-	nalus, err := rx.h264.Depacketize(pkt)
+	before := dep.DroppedCount()
+	nalus, err := dep.Depacketize(pkt)
 	if err != nil {
-		fmt.Printf("push H.264 depacketize (%s): %v\n", track.kind, err)
+		fmt.Printf("push %s depacketize (%s): %v\n", codecName, track.kind, err)
 		return
 	}
-	if lost := rx.h264.Dropped - before; lost > 0 {
-		// 解包器丢弃了不完整 FU-A：当前 AU 不可解码。
+	if lost := dep.DroppedCount() - before; lost > 0 {
+		// 解包器丢弃了不完整 FU：当前 AU 不可解码。
 		if rx.au.has {
 			rx.au.corrupt = true
 		}
-		fmt.Printf("push H.264 incomplete NALU dropped (%s): %d\n", track.kind, lost)
+		fmt.Printf("push %s incomplete NALU dropped (%s): %d\n", codecName, track.kind, lost)
 	}
 
 	if rx.au.has && rx.au.ts != ts {
@@ -440,11 +466,12 @@ func (rx *pushReceiver) flushAU(track *mediaTrack, mediaSSRC uint32) {
 // writeNALUs 把同一时间戳的一组 NALU 写入共享源。
 func (rx *pushReceiver) writeNALUs(track *mediaTrack, nalus [][]byte, ts uint32) {
 	for _, nalu := range nalus {
-		typ, _ := media.NALType(nalu)
+		typ, _ := media.VideoNALType(track.encoding, nalu)
+		class := media.ClassifyVideoNAL(track.encoding, nalu)
 		rx.external.Write(source.Frame{
 			Data:      nalu,
 			Timestamp: ts,
-			Keyframe:  typ == rtp.NALUTypeIDR,
+			Keyframe:  class.IsIDR,
 		})
 		if frames := track.recordFrame(); frames == 1 {
 			fmt.Printf("push frame recv (%s): first frame type=%d ts=%d %d bytes\n",

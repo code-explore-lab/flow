@@ -81,6 +81,41 @@ func TestVideoSequenceHeader(t *testing.T) {
 	}
 }
 
+func TestHEVCVideoSequenceHeaderPublish(t *testing.T) {
+	_, c, st := newPublishConn(t)
+	vps := []byte{0x40, 0x01, 0x0C, 0x01}
+	sps := []byte{0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5D}
+	pps := []byte{0x44, 0x01, 0xC0, 0x73}
+
+	st.EnsureVideo()
+	src := st.SourceFor("video")
+	rd, cancel := src.Subscribe()
+	defer cancel()
+
+	c.handleVideo(&Message{TypeID: msgVideo, Payload: flv.BuildHEVCVideoSequenceHeader(vps, sps, pps)})
+
+	params, ok := st.VideoParams()
+	if !ok {
+		t.Fatal("VideoParams not set after HEVC sequence header")
+	}
+	if params.Codec != "H265" {
+		t.Fatalf("Codec = %q, want H265", params.Codec)
+	}
+	if !bytes.Equal(params.VPS, vps) || !bytes.Equal(params.SPS, sps) || !bytes.Equal(params.PPS, pps) {
+		t.Fatalf("params = %x/%x/%x", params.VPS, params.SPS, params.PPS)
+	}
+	if got := src.Codec(); got != "H265" {
+		t.Fatalf("source codec = %q, want H265", got)
+	}
+
+	// 参数集按 VPS → SPS → PPS 的顺序预热给订阅者。
+	for i, want := range [][]byte{vps, sps, pps} {
+		if f := nextFrame(t, rd); !bytes.Equal(f.Data, want) {
+			t.Fatalf("frame %d = %x, want %x", i, f.Data, want)
+		}
+	}
+}
+
 func TestVideoNALUFrames(t *testing.T) {
 	_, c, st := newPublishConn(t)
 	st.EnsureVideo()

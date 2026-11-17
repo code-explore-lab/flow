@@ -45,8 +45,12 @@ func newPublishedStream(name string, tracks []announcedTrack) *stream.Stream {
 		switch t.Kind {
 		case "video":
 			p.EnsureVideo()
-			if sps, pps, ok := parseSpropParameterSets(t.FMTP); ok {
-				p.SetVideoParams(sps, pps)
+			if isHEVCEncoding(t.Encoding) {
+				if vps, sps, pps, ok := parseSpropHEVC(t.FMTP); ok {
+					p.SetVideoParams("H265", vps, sps, pps)
+				}
+			} else if sps, pps, ok := parseSpropParameterSets(t.FMTP); ok {
+				p.SetVideoParams("H264", nil, sps, pps)
 			}
 		case "audio":
 			p.EnsureAudio(uint32(t.ClockRate))
@@ -56,6 +60,33 @@ func newPublishedStream(name string, tracks []announcedTrack) *stream.Stream {
 		}
 	}
 	return p
+}
+
+// isHEVCEncoding 判断 SDP rtpmap 里的编码名是否为 H.265。
+func isHEVCEncoding(encoding string) bool {
+	return strings.EqualFold(encoding, "H265") || strings.EqualFold(encoding, "HEVC")
+}
+
+// parseSpropHEVC 从 H.265 fmtp 里解出 sprop-vps/sprop-sps/sprop-pps。
+// 每个键的值可能是逗号分隔的多组，取第一组。缺失或非法时返回 false。
+func parseSpropHEVC(fmtp string) (vps, sps, pps []byte, ok bool) {
+	decode := func(key string) []byte {
+		value := fmtpParam(fmtp, key)
+		if value == "" {
+			return nil
+		}
+		first, _, _ := strings.Cut(value, ",")
+		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(first))
+		if err != nil || len(b) == 0 {
+			return nil
+		}
+		return b
+	}
+	vps, sps, pps = decode("sprop-vps"), decode("sprop-sps"), decode("sprop-pps")
+	if len(vps) == 0 || len(sps) == 0 || len(pps) == 0 {
+		return nil, nil, nil, false
+	}
+	return vps, sps, pps, true
 }
 
 // parseSpropParameterSets 从 H.264 fmtp 里解出 sprop-parameter-sets
@@ -122,17 +153,25 @@ func rtspTracks(p *stream.Stream) []announcedTrack {
 func synthesizeTracks(p *stream.Stream) []announcedTrack {
 	var out []announcedTrack
 	if p.VideoTrack() != nil {
+		vc, hasParams := p.VideoParams()
 		at := announcedTrack{
 			Kind:        "video",
 			PayloadType: 96,
-			Encoding:    "H264",
 			ClockRate:   90000,
 		}
-		at.FMTP = "packetization-mode=1"
-		if vc, ok := p.VideoParams(); ok && len(vc.PPS) > 0 {
-			at.FMTP += "; sprop-parameter-sets=" +
-				base64.StdEncoding.EncodeToString(vc.SPS) + "," +
-				base64.StdEncoding.EncodeToString(vc.PPS)
+		if hasParams && isHEVCEncoding(vc.Codec) {
+			at.Encoding = "H265"
+			at.FMTP = "sprop-vps=" + base64.StdEncoding.EncodeToString(vc.VPS) +
+				";sprop-sps=" + base64.StdEncoding.EncodeToString(vc.SPS) +
+				";sprop-pps=" + base64.StdEncoding.EncodeToString(vc.PPS)
+		} else {
+			at.Encoding = "H264"
+			at.FMTP = "packetization-mode=1"
+			if hasParams && len(vc.PPS) > 0 {
+				at.FMTP += "; sprop-parameter-sets=" +
+					base64.StdEncoding.EncodeToString(vc.SPS) + "," +
+					base64.StdEncoding.EncodeToString(vc.PPS)
+			}
 		}
 		out = append(out, at)
 	}

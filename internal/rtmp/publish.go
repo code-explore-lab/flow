@@ -59,21 +59,36 @@ func (c *Conn) handleVideo(m *Message) {
 	}
 
 	switch vt.PacketType {
-	// AVC序列头， 里面放SPS/PPS
+	// 序列头：AVC 放 SPS/PPS，HEVC 放 VPS/SPS/PPS
 	case flv.AVCSeqHeader:
-		sps, pps, err := flv.ParseAVCDecoderConfig(vt.Config)
-		if err != nil {
-			fmt.Printf("rtmp: bad avc config: %v\n", err)
-			return
+		switch {
+		case media.IsHEVCCodec(vt.Codec):
+			vps, sps, pps, err := flv.ParseHEVCDecoderConfigRecord(vt.Config)
+			if err != nil {
+				fmt.Printf("rtmp: bad hevc config: %v\n", err)
+				return
+			}
+			p.stream.SetVideoParams("H265", vps, sps, pps)
+			if src := p.stream.SourceFor("video"); src != nil {
+				// 参数集也作为帧写入：ExternalSource 按 NAL 类型缓存参数集，
+				// 中途加入的订阅者订阅时会先收到它们。
+				src.Write(source.Frame{Data: vps, Timestamp: 0})
+				src.Write(source.Frame{Data: sps, Timestamp: 0})
+				src.Write(source.Frame{Data: pps, Timestamp: 0})
+			}
+		default:
+			sps, pps, err := flv.ParseAVCDecoderConfig(vt.Config)
+			if err != nil {
+				fmt.Printf("rtmp: bad avc config: %v\n", err)
+				return
+			}
+			p.stream.SetVideoParams("H264", nil, sps, pps)
+			if src := p.stream.SourceFor("video"); src != nil {
+				src.Write(source.Frame{Data: sps, Timestamp: 0})
+				src.Write(source.Frame{Data: pps, Timestamp: 0})
+			}
 		}
-		p.stream.SetVideoParams(sps, pps)
-		if src := p.stream.SourceFor("video"); src != nil {
-			// 参数集也作为帧写入：ExternalSource 按 NAL 类型缓存 SPS/PPS，
-			// 中途加入的订阅者订阅时会先收到它们。
-			src.Write(source.Frame{Data: sps, Timestamp: 0})
-			src.Write(source.Frame{Data: pps, Timestamp: 0})
-		}
-		// 普通H264 NALU帧
+		// 普通编码帧（H.264 / H.265）
 	case flv.AVCNALU:
 		src := p.stream.SourceFor("video")
 		if src == nil {

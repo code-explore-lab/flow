@@ -91,7 +91,7 @@ type mediaTrack struct {
 	// 与拉流共用 mediaTrack，但 SETUP 的语义相反，靠 isPush 区分。
 	isPush      bool
 	payloadType int    // ANNOUNCE SDP 协商出的 RTP payload type
-	encoding    string // "H264" / "MPEG4-GENERIC"
+	encoding    string // "H264" / "H265" / "MPEG4-GENERIC"
 	fmtp        string // ANNOUNCE SDP 的 a=fmtp（AAC 解包位宽用）
 
 	// external 这条轨对应的推流源：

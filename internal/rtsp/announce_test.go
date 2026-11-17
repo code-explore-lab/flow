@@ -126,7 +126,7 @@ func TestParseAnnounceSDPErrors(t *testing.T) {
 			body:    "v=0\r\nm=text 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n",
 			wantErr: errUnsupportedCodec,
 		},
-		{name: "视频编码不支持", body: minVideoSDP("H265"), wantErr: errUnsupportedCodec},
+		{name: "视频编码不支持", body: minVideoSDP("VP8"), wantErr: errUnsupportedCodec},
 		{
 			name:    "音频编码不支持",
 			body:    "v=0\r\nm=audio 0 RTP/AVP 98\r\na=rtpmap:98 OPUS/48000/2\r\n",
@@ -251,7 +251,7 @@ func TestHandleAnnounceStatuses(t *testing.T) {
 	}{
 		{name: "合法 SDP", body: ffmpegAnnounceSDP, status: "200 OK"},
 		{name: "非法 SDP", body: "not an sdp", status: "400 Bad Request"},
-		{name: "不支持的编码", body: minVideoSDP("H265"), status: "415 Unsupported Media Type"},
+		{name: "不支持的编码", body: minVideoSDP("VP8"), status: "415 Unsupported Media Type"},
 		{
 			name:    "未知会话",
 			body:    ffmpegAnnounceSDP,

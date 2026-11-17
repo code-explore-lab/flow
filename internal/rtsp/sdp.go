@@ -281,11 +281,13 @@ func (m *sdpMedia) resolve(index int) (announcedTrack, error) {
 	}, nil
 }
 
-// checkCodec 只接受本服务能处理的编码：视频 H.264，音频 RFC 3640 AAC。
+// checkCodec 只接受本服务能处理的编码：视频 H.264 / H.265，音频 RFC 3640 AAC。
 func checkCodec(kind, encoding string) error {
 	switch kind {
 	case "video":
-		if strings.EqualFold(encoding, "H264") {
+		if strings.EqualFold(encoding, "H264") ||
+			strings.EqualFold(encoding, "H265") ||
+			strings.EqualFold(encoding, "HEVC") {
 			return nil
 		}
 	case "audio":

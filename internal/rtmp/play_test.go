@@ -110,7 +110,7 @@ func TestPlayVideoFromRegistry(t *testing.T) {
 	st := srv.registry.Publish("live/test", &stream.Stream{})
 	sps := []byte{0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed}
 	pps := []byte{0x68, 0xee, 0x3c, 0x80}
-	st.SetVideoParams(sps, pps)
+	st.SetVideoParams("H264", nil, sps, pps)
 	st.EnsureVideo()
 
 	server, client := pipeConns(t)
@@ -305,7 +305,7 @@ func TestPlayStreamNotFound(t *testing.T) {
 func TestHandleCommandDispatchesPlay(t *testing.T) {
 	srv := New(nil, nil, nil)
 	st := srv.registry.Publish("live/test", &stream.Stream{})
-	st.SetVideoParams([]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
+	st.SetVideoParams("H264", nil, []byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()
 
 	server, client := pipeConns(t)
@@ -336,7 +336,7 @@ func TestHandleCommandDispatchesPlay(t *testing.T) {
 func TestPlayCompleteWhenSourceEnds(t *testing.T) {
 	srv := New(nil, nil, nil)
 	st := srv.registry.Publish("ending", &stream.Stream{})
-	st.SetVideoParams([]byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
+	st.SetVideoParams("H264", nil, []byte{0x67, 0x42, 0x00, 0x1f}, []byte{0x68, 0xee})
 	st.EnsureVideo()
 
 	server, client := pipeConns(t)
@@ -383,5 +383,144 @@ func TestLocalAudioParams(t *testing.T) {
 	// 参数缺失的文件只打印日志、返回 nil，不 panic。
 	if got := localAudioParams(source.NewAACSource("../../testdata/missing.aac")); got != nil {
 		t.Fatalf("missing file returned %+v", got)
+	}
+}
+
+// 常见 HEVC 参数集（裸 NALU）。
+var (
+	testHEVCVPS = []byte{0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF}
+	testHEVCSPS = []byte{
+		0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5D,
+	}
+	testHEVCPPS = []byte{0x44, 0x01, 0xC0, 0x73}
+)
+
+func TestPlayHEVCFromRegistry(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := srv.registry.Publish("live/hevc", &stream.Stream{})
+	st.SetVideoParams("H265", testHEVCVPS, testHEVCSPS, testHEVCPPS)
+	st.EnsureVideo()
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	startPlay(t, server, client, "live/hevc")
+	defer stopPlayer(t, server, client)
+
+	src := st.SourceFor("video")
+	idr := []byte{0x26, 0x01, 0xAF, 0x12}
+	src.Write(source.Frame{Data: idr, Timestamp: 9000, Keyframe: true})
+
+	// 1. Enhanced RTMP 序列头（FourCC = hvc1）。
+	m := readMessageWithin(t, client)
+	tag, err := flv.ParseVideoTag(m.Payload)
+	if err != nil {
+		t.Fatalf("ParseVideoTag(seq header): %v", err)
+	}
+	if tag.Codec != "H265" || tag.PacketType != flv.AVCSeqHeader {
+		t.Fatalf("header codec/type = %q/%d", tag.Codec, tag.PacketType)
+	}
+	vps, sps, pps, err := flv.ParseHEVCDecoderConfigRecord(tag.Config)
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if !bytes.Equal(vps, testHEVCVPS) || !bytes.Equal(sps, testHEVCSPS) || !bytes.Equal(pps, testHEVCPPS) {
+		t.Fatalf("config = %x/%x/%x", vps, sps, pps)
+	}
+
+	// 2. CodedFrames 标签。
+	m = readMessageWithin(t, client)
+	tag, err = flv.ParseVideoTag(m.Payload)
+	if err != nil {
+		t.Fatalf("ParseVideoTag(frame): %v", err)
+	}
+	if tag.Codec != "H265" || !tag.Keyframe || len(tag.NALUs) != 1 || !bytes.Equal(tag.NALUs[0], idr) {
+		t.Fatalf("frame = codec %q key %v nalus %x", tag.Codec, tag.Keyframe, tag.NALUs)
+	}
+	if m.Timestamp != 0 {
+		t.Fatalf("idr ts = %d, want 0", m.Timestamp)
+	}
+}
+
+// 声明了 fourCcList 但不含 hvc1 的老客户端拉 HEVC 流：回 Play.Failed。
+func TestPlayHEVCRejectsLegacyClient(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := srv.registry.Publish("live/hevc", &stream.Stream{})
+	st.SetVideoParams("H265", testHEVCVPS, testHEVCSPS, testHEVCPPS)
+	st.EnsureVideo()
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	server.fourCCs = []string{"avc1", "mp4a"}
+
+	cmd, err := parseCommand(buildCommand("play", 0, flv.Null(), flv.Str("live/hevc")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- server.handlePlay(1, cmd) }()
+
+	if code := readStatusWithin(t, client); code != "NetStream.Play.Failed" {
+		t.Fatalf("status = %q, want NetStream.Play.Failed", code)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("handlePlay: %v", err)
+	}
+	if server.play != nil {
+		t.Fatal("play state left behind after rejection")
+	}
+}
+
+// 声明了 hvc1 的客户端正常放行。
+func TestPlayHEVCAcceptsDeclaredClient(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := srv.registry.Publish("live/hevc", &stream.Stream{})
+	st.SetVideoParams("H265", testHEVCVPS, testHEVCSPS, testHEVCPPS)
+	st.EnsureVideo()
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	server.fourCCs = []string{"hvc1", "avc1"}
+
+	startPlay(t, server, client, "live/hevc")
+	defer stopPlayer(t, server, client)
+
+	src := st.SourceFor("video")
+	src.Write(source.Frame{Data: []byte{0x02, 0x01, 0xAA}, Timestamp: 9000})
+	m := readMessageWithin(t, client)
+	tag, err := flv.ParseVideoTag(m.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.Codec != "H265" {
+		t.Fatalf("codec = %q, want H265", tag.Codec)
+	}
+}
+
+// H.264 流不受 fourCcList 影响。
+func TestPlayH264IgnoresLegacyFourCCList(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := srv.registry.Publish("live/avc", &stream.Stream{})
+	st.SetVideoParams("H264", nil,
+		[]byte{0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed},
+		[]byte{0x68, 0xee, 0x3c, 0x80})
+	st.EnsureVideo()
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	server.fourCCs = []string{"avc1"}
+
+	startPlay(t, server, client, "live/avc")
+	defer stopPlayer(t, server, client)
+
+	src := st.SourceFor("video")
+	src.Write(source.Frame{Data: []byte{0x41, 0x9a, 0x02}, Timestamp: 9000})
+	m := readMessageWithin(t, client)
+	tag, err := flv.ParseVideoTag(m.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.Codec != "H264" {
+		t.Fatalf("codec = %q, want H264", tag.Codec)
 	}
 }

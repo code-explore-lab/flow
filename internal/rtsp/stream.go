@@ -4,9 +4,16 @@ import (
 	"fmt"
 	"time"
 
+	"flow/internal/media"
 	"flow/internal/rtp"
 	"flow/internal/source"
 )
+
+// videoPacker 是 H.264/H.265 封包器的共同接口：把一批同帧 NALU
+// 封成 RTP 包。两层都只用到 PackFrame。
+type videoPacker interface {
+	PackFrame(nalus [][]byte) ([]*rtp.RTPPacket, error)
+}
 
 // videoFrameSource 拉流端订阅的帧源抽象。
 // 本地文件/live 模式的 *source.H264Source 和推流场景的 *source.ExternalSource
@@ -50,7 +57,8 @@ func (s *Server) audioSourceFor(t *mediaTrack) audioFrameSource {
 }
 
 // streamH264 每个客户端一条订阅 goroutine：
-// 从共享视频源拿 Frame → 封 RTP → 发送。
+// 从共享视频源拿 Frame → 封 RTP → 发送。函数名沿用历史命名，
+// 实际按 track.encoding 选 H.264 或 H.265 的封包器（空编码按 H.264）。
 // 源只读一次，多个客户端各自从自己的 Reader 取同一批 NALU；
 // seq/SSRC 仍然每个客户端独立，时间戳由源统一打好，保证多路一致。
 //
@@ -70,11 +78,23 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		return false
 	}
 	defer cancel()
-	// 初始化打包器， SSRC 缓存变量
-	packer := rtp.NewH264Packer(1400)
-	// 推流场景沿用 ANNOUNCE 的 payload type，保证和 DESCRIBE 一致。
-	if track.payloadType > 0 {
-		packer.PT = uint8(track.payloadType)
+	// 初始化打包器， SSRC 缓存变量。按编码选 H.264 / H.265 封包器；
+	// 未协商编码（本地文件源/测试）按 H.264 处理。
+	codec := track.encoding
+	const mtu = 1400
+	var packer videoPacker
+	if media.IsHEVCCodec(codec) {
+		p := rtp.NewH265Packer(mtu)
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer = p
+	} else {
+		p := rtp.NewH264Packer(mtu)
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer = p
 	}
 	var dropped uint64
 	// SSRC 和 seq 从 track 取，跨 PAUSE/PLAY 连续。
@@ -97,16 +117,10 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			if len(n) == 0 {
 				continue
 			}
-			typ := n[0] & 0x1F
-			switch typ {
-			case rtp.NALUTypeIDR:
-				isIDR = true
-			case rtp.NALUTypeSPS, rtp.NALUTypePPS:
-				hasParams = true
-			}
-			if typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR {
-				hasVCL = true
-			}
+			class := media.ClassifyVideoNAL(codec, n)
+			isIDR = isIDR || class.IsIDR
+			hasParams = hasParams || class.IsVPS || class.IsSPS || class.IsPPS
+			hasVCL = hasVCL || class.IsVCL
 		}
 		// C-6：降级期间只放行参数集和 IDR，整 AU 丢弃非关键帧。
 		// 只丢整个 AU，不拆 NALU，seq/timestamp 不会错乱。
@@ -184,11 +198,10 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			continue
 		}
 
-		typ := f.Data[0] & 0x1F
-		isVCL := typ >= rtp.NALUTypeNonIDR && typ <= rtp.NALUTypeIDR
+		isVCL := media.ClassifyVideoNAL(codec, f.Data).IsVCL
 		if !isVCL {
 			// 先攒着等同一帧的 slice；时间戳变了或批次放不下就立即发出。
-			if len(pending) > 0 && (f.Timestamp != pendingTS || pendingSize+2+len(f.Data) > packer.MTU) {
+			if len(pending) > 0 && (f.Timestamp != pendingTS || pendingSize+2+len(f.Data) > mtu) {
 				if !flush() {
 					return false
 				}

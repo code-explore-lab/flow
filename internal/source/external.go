@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"flow/internal/media"
-	"flow/internal/rtp"
 )
 
 // ExternalSource 一个由外部写入的媒体源（RTSP 推流端用）。
@@ -18,23 +17,49 @@ type ExternalSource struct {
 	mu   sync.Mutex
 	ring *RingBuffer[Frame]
 
-	// cacheParamSets 为 true 时（视频轨）按 NAL 类型缓存 SPS/PPS/IDR，
+	// cacheParamSets 为 true 时（视频轨）按 NAL 类型缓存参数集/IDR，
 	// 中途加入的订阅者先补齐再解码。音频帧没有 NAL 头，必须关掉，
 	// 否则 AU 首字节会被误判成 SPS/PPS/IDR。
 	cacheParamSets bool
 
-	// 参数集缓存：中途加入的订阅者先补 SPS/PPS + 最近一个 IDR，收到就能解码。
-	// 在 Write 里写、在 Subscribe 里读，都拿 mu 串行化。
-	sps, pps, idr *Frame
+	// codec 是视频编码（"H264" / "H265"），决定 NAL 头按哪套语法解析。
+	// 音频轨不使用，保持空值。
+	codec string
+
+	// 参数集缓存：中途加入的订阅者先补 VPS/SPS/PPS + 最近一个 IDR，收到就能解码。
+	// H.264 没有 VPS，vps 为 nil。在 Write 里写、在 Subscribe 里读，都拿 mu 串行化。
+	vps, sps, pps, idr *Frame
 
 	// rate 音频 RTP 时钟（= AAC 采样率），从 ANNOUNCE 的 rtpmap 带过来。
 	// 拉流端 streamAAC 用它设置 RTCP SR 的 RTP 时钟。
 	rate uint32
 }
 
-// NewExternalSource 创建一个空的视频推流源（缓存 SPS/PPS/IDR 供预热）。
+// NewExternalSource 创建一个空的视频推流源（缓存参数集/IDR 供预热），
+// 默认按 H.264 解析 NAL；H.265 流由 SetCodec 切换。
 func NewExternalSource() *ExternalSource {
 	return newExternalSource(true)
+}
+
+// SetCodec 设置视频编码（"H264" / "H265"）。空串按 H.264 处理。
+// 一般由 stream.SetVideoParams 在拿到编码参数时调用；必须在写入帧之前设置。
+func (s *ExternalSource) SetCodec(codec string) {
+	if codec == "" {
+		codec = "H264"
+	}
+	s.mu.Lock()
+	s.codec = codec
+	s.mu.Unlock()
+}
+
+// Codec 返回当前视频编码；未设置时返回 "H264"。
+func (s *ExternalSource) Codec() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.codec == "" {
+		return "H264"
+	}
+	return s.codec
 }
 
 // NewExternalAudioSource 创建一个空的音频推流源。
@@ -77,19 +102,20 @@ func newExternalSource(cacheParamSets bool) *ExternalSource {
 // 任意 goroutine 都可以调用；源 Close 之后写入会被忽略。
 func (s *ExternalSource) Write(f Frame) {
 	if s.cacheParamSets {
-		if typ, err := media.NALType(f.Data); err == nil {
-			c := f
-			s.mu.Lock()
-			switch typ {
-			case rtp.NALUTypeSPS:
-				s.sps = &c
-			case rtp.NALUTypePPS:
-				s.pps = &c
-			case rtp.NALUTypeIDR:
-				s.idr = &c
-			}
-			s.mu.Unlock()
+		c := f
+		s.mu.Lock()
+		class := media.ClassifyVideoNAL(s.codec, f.Data)
+		switch {
+		case class.IsVPS:
+			s.vps = &c
+		case class.IsSPS:
+			s.sps = &c
+		case class.IsPPS:
+			s.pps = &c
+		case class.IsIDR:
+			s.idr = &c
 		}
+		s.mu.Unlock()
 	}
 	s.ring.Write(f)
 }
@@ -102,6 +128,9 @@ func (s *ExternalSource) Subscribe() (*Reader[Frame], func()) {
 
 	var preload []Frame
 	if s.idr != nil {
+		if s.vps != nil {
+			preload = append(preload, *s.vps)
+		}
 		if s.sps != nil {
 			preload = append(preload, *s.sps)
 		}

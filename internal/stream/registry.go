@@ -15,9 +15,12 @@ import (
 )
 
 // VideoCodec 视频编码参数：裸 NALU（无 Annex-B 起始码）。
+// Codec 为 "H264" / "H265"；VPS 仅 H.265 使用，H.264 时为空。
 type VideoCodec struct {
-	SPS []byte
-	PPS []byte
+	Codec string
+	VPS   []byte
+	SPS   []byte
+	PPS   []byte
 }
 
 // AudioCodec 音频编码参数。Config 是 AudioSpecificConfig（2 字节）。
@@ -58,11 +61,11 @@ func (s *Stream) ensureVideoLocked() *Track {
 		s.Video = &Track{
 			Kind:  "video",
 			Src:   source.NewExternalSource(),
-			Video: &VideoCodec{},
+			Video: &VideoCodec{Codec: "H264"},
 		}
 	}
 	if s.Video.Video == nil {
-		s.Video.Video = &VideoCodec{}
+		s.Video.Video = &VideoCodec{Codec: "H264"}
 	}
 	return s.Video
 }
@@ -92,14 +95,21 @@ func (s *Stream) ensureAudioLocked(rate uint32) *Track {
 	return s.Audio
 }
 
-// SetVideoParams 记录 SPS/PPS。切片会复制一份，调用方可复用缓冲区。
-func (s *Stream) SetVideoParams(sps, pps []byte) {
+// SetVideoParams 记录视频编码参数。codec 为 "H264" / "H265"，
+// H.264 传空 vps 即可。切片会复制一份，调用方可复用缓冲区。
+// 同时把编码同步给帧源，供 ExternalSource 按 NAL 类型缓存参数集。
+func (s *Stream) SetVideoParams(codec string, vps, sps, pps []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := s.ensureVideoLocked()
 	t.Video = &VideoCodec{
-		SPS: append([]byte(nil), sps...),
-		PPS: append([]byte(nil), pps...),
+		Codec: codec,
+		VPS:   append([]byte(nil), vps...),
+		SPS:   append([]byte(nil), sps...),
+		PPS:   append([]byte(nil), pps...),
+	}
+	if t.Src != nil {
+		t.Src.SetCodec(codec)
 	}
 }
 
@@ -121,8 +131,10 @@ func (s *Stream) VideoParams() (*VideoCodec, bool) {
 		return nil, false
 	}
 	return &VideoCodec{
-		SPS: append([]byte(nil), s.Video.Video.SPS...),
-		PPS: append([]byte(nil), s.Video.Video.PPS...),
+		Codec: s.Video.Video.Codec,
+		VPS:   append([]byte(nil), s.Video.Video.VPS...),
+		SPS:   append([]byte(nil), s.Video.Video.SPS...),
+		PPS:   append([]byte(nil), s.Video.Video.PPS...),
 	}, true
 }
 

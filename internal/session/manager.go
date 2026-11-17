@@ -181,6 +181,7 @@ type Manager struct {
 	sessions map[string]*Session
 	timeout  time.Duration
 	interval time.Duration
+	max      int // 会话数上限；0 表示不限制
 	seq      uint64
 
 	// OnExpire 可选：Sweep 回收一个超时会话后调用，用来打日志/统计。
@@ -213,14 +214,46 @@ func (m *Manager) Timeout() time.Duration {
 	return m.timeout
 }
 
+// SetMax 设置并发会话数上限，0 表示不限制（E-5）。负数按 0 处理。
+// 上限在 NewSession 里持锁判定，因此检查和创建之间没有竞态。
+func (m *Manager) SetMax(n int) {
+	if n < 0 {
+		n = 0
+	}
+	m.mu.Lock()
+	m.max = n
+	m.mu.Unlock()
+}
+
 // NewSession 创建并登记一个会话，ID 形如 sess-1。
+// 达到 SetMax 设置的上限时返回 nil，调用方应回 503。
 func (m *Manager) NewSession(remoteIP string) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.max > 0 && len(m.sessions) >= m.max {
+		return nil
+	}
 	m.seq++
 	s := newSession(fmt.Sprintf("sess-%d", m.seq), remoteIP, time.Now())
 	m.sessions[s.ID] = s
 	return s
+}
+
+// Range 遍历当前所有会话，fn 返回 false 时提前结束。
+// 先在锁内拷出快照，再在锁外回调，回调里可以安全地调用 Manager 的其他方法。
+func (m *Manager) Range(fn func(*Session) bool) {
+	m.mu.RLock()
+	sessions := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		sessions = append(sessions, s)
+	}
+	m.mu.RUnlock()
+
+	for _, s := range sessions {
+		if !fn(s) {
+			return
+		}
+	}
 }
 
 // Get 按 SessionID 查找会话。

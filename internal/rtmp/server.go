@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"flow/internal/limiter"
+	"flow/internal/metrics"
 	"flow/internal/source"
 	"flow/internal/stream"
 )
@@ -27,6 +29,16 @@ type Server struct {
 	connsMu sync.Mutex
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
+
+	// E-4：进程级指标注册表，与 RTSP 服务器及 /metrics 端点共享。
+	metrics *metrics.Registry
+
+	// E-5：连接数/单 IP 连接数限流。nil 表示不限制。
+	limiter *limiter.ConnLimiter
+
+	// E-5：握手超时与消息读/写空闲超时。0 表示不设超时。
+	handshakeTimeout time.Duration
+	connTimeout      time.Duration
 }
 
 // New 构造一个 RTMP 服务器。reg 为 nil 时自建一份；video/audio 可以为 nil
@@ -36,11 +48,41 @@ func New(reg *stream.Registry, video *source.H264Source, audio *source.AACSource
 		reg = stream.NewRegistry()
 	}
 	return &Server{
-		registry: reg,
-		video:    video,
-		audio:    audio,
-		conns:    make(map[*Conn]struct{}),
+		registry:         reg,
+		video:            video,
+		audio:            audio,
+		conns:            make(map[*Conn]struct{}),
+		metrics:          metrics.New(),
+		handshakeTimeout: 10 * time.Second,
 	}
+}
+
+// SetMetrics 注入进程级指标注册表（E-4）。传 nil 时保留自建的那份。
+// 必须在 Serve 之前调用。
+func (s *Server) SetMetrics(reg *metrics.Registry) {
+	if reg != nil {
+		s.metrics = reg
+	}
+}
+
+// SetLimits 注入连接/单 IP 连接限流器（E-5）。nil 表示不限制。
+// 必须在 Serve 之前调用。
+func (s *Server) SetLimits(l *limiter.ConnLimiter) {
+	s.limiter = l
+}
+
+// SetHandshakeTimeout 设置握手超时（E-5）。<=0 表示不设超时。
+// 必须在 Serve 之前调用。
+func (s *Server) SetHandshakeTimeout(d time.Duration) {
+	if d > 0 {
+		s.handshakeTimeout = d
+	}
+}
+
+// SetConnTimeout 设置消息读/写空闲超时（E-5）。<=0 表示不设超时。
+// 必须在 Serve 之前调用。
+func (s *Server) SetConnTimeout(d time.Duration) {
+	s.connTimeout = d
 }
 
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
@@ -69,21 +111,46 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 			fmt.Printf("rtmp accept err: %v\n", err)
 			continue
 		}
+		// E-5：连接/单 IP 上限。RTMP 没有 503 语义，超限直接断开。
+		ip := remoteIP(conn)
+		if ok, reason := s.limiter.Allow(ip); !ok {
+			fmt.Printf("rtmp: reject client %s: %s\n", ip, reason)
+			_ = conn.Close()
+			continue
+		}
 		fmt.Printf("rtmp: new client %s\n", conn.RemoteAddr())
+		s.metrics.IncConn("rtmp")
+		s.metrics.IncConnTotal("rtmp")
 		s.connWG.Add(1)
-		go func() {
+		go func(c net.Conn, ip string) {
 			defer s.connWG.Done()
-			s.handleConn(newConn(conn))
-		}()
+			defer s.metrics.DecConn("rtmp")
+			defer s.limiter.Release(ip)
+			s.handleConn(newConn(c))
+		}(conn, ip)
 	}
 	s.shutdown()
 	return nil
+}
+
+// remoteIP 取连接的来源 IP（不带端口）。取不到时退回 RemoteAddr 字符串。
+func remoteIP(conn net.Conn) string {
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP.String()
+	}
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return conn.RemoteAddr().String()
+	}
+	return host
 }
 
 // handleConn 处理一条 RTMP 连接：握手 → Chunk Stream 消息循环 → 断开清理。
 func (s *Server) handleConn(conn *Conn) {
 	s.registerConn(conn)
 	conn.srv = s
+	conn.handshakeTimeout = s.handshakeTimeout
+	conn.connTimeout = s.connTimeout
 	// 清理顺序有讲究：先 Close 让阻塞中的写立即失败，再停播（等播放
 	// goroutine 退出），最后注销推流并登记表。
 	defer func() {
@@ -99,6 +166,10 @@ func (s *Server) handleConn(conn *Conn) {
 	}
 
 	for {
+		// E-5：空闲读超时，防止半开连接让读循环永久挂住。
+		if conn.connTimeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(conn.connTimeout))
+		}
 		m, err := conn.readMessage()
 		if err != nil {
 			if err != io.EOF {

@@ -16,6 +16,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // RTMP 默认 chunk size（协议规定 128）。
@@ -35,6 +36,10 @@ type Conn struct {
 	cr *countingReader
 
 	mu sync.Mutex // 串行化写操作
+
+	// E-5 超时配置，由 Server.handleConn 从 Server 下发。
+	handshakeTimeout time.Duration // 握手总超时；0 表示不设
+	connTimeout      time.Duration // 消息读/写空闲超时；0 表示不设
 
 	closeOnce sync.Once
 
@@ -148,6 +153,9 @@ func (st *chunkStream) reset() {
 func (c *Conn) write(b []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.connTimeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.connTimeout))
+	}
 	_, err := c.Conn.Write(b)
 	return err
 }

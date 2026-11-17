@@ -38,6 +38,7 @@ func (c *Conn) stopPublish() {
 	}
 	c.publish = nil
 	if c.srv != nil {
+		c.srv.metrics.DecPublish()
 		c.srv.registry.Unpublish(p.stream.Name, p.stream)
 	} else {
 		p.stream.Close()

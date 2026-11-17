@@ -155,6 +155,9 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		return err
 	}
 
+	c.srv.metrics.IncPlay()
+	c.srv.metrics.IncPlayTotal()
+
 	if video != nil {
 		ps.wg.Add(1)
 		go c.playVideo(ps, vrd, vcancel, vparams)
@@ -182,6 +185,9 @@ func (c *Conn) stopPlay() {
 		return
 	}
 	c.play = nil
+	if c.srv != nil {
+		c.srv.metrics.DecPlay()
+	}
 	close(ps.cancel)
 	ps.wg.Wait()
 }

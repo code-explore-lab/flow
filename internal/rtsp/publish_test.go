@@ -357,7 +357,10 @@ func TestPullSourceEndClosesSessionAndConn(t *testing.T) {
 
 	serverConn, clientConn := net.Pipe()
 	conn := &Conn{Conn: serverConn}
-	sess := s.newClientSession(conn)
+	sess, err := s.newClientSession(conn)
+	if err != nil {
+		t.Fatalf("newClientSession: %v", err)
+	}
 	st := sess.Data.(*Session)
 	st.setPublished(pub, nil)
 

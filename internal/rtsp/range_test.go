@@ -57,7 +57,11 @@ func newPlaySession(t *testing.T, live bool) (s *Server, conn *Conn, sess *sessi
 	t.Helper()
 	s, conn, finish = newTestPipe(t)
 	s.live = live
-	sess = s.newClientSession(conn)
+	var err error
+	sess, err = s.newClientSession(conn)
+	if err != nil {
+		t.Fatalf("newClientSession: %v", err)
+	}
 	return s, conn, sess, finish
 }
 

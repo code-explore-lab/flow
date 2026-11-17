@@ -224,10 +224,16 @@ func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
 		return errors.New("rtmp: publish without server")
 	}
 
+	// 同一条连接上重复 publish：先注销上一次推流，避免旧流残留在
+	// Registry、也保证发布计数不会只增不减。
+	c.stopPublish()
+
 	// 同一个名字重复 publish 视为重新发布，Registry 会替换并关闭旧流。
 	st := c.srv.registry.Publish(name, &stream.Stream{})
 	c.publish = &publishState{stream: st, audioRate: defaultAACRate}
 	c.streamName = name
+	c.srv.metrics.IncPublish()
+	c.srv.metrics.IncPublishTotal()
 
 	fmt.Printf("rtmp: publish %q (app %q) from %s\n", name, c.app, c.RemoteAddr())
 	return c.writeCommand(streamID, "onStatus", 0, flv.Null(),

@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"flow/internal/limiter"
+	"flow/internal/metrics"
 	"flow/internal/session"
 	"flow/internal/source"
 	"flow/internal/stream"
@@ -65,6 +67,12 @@ type Server struct {
 	conns   map[*Conn]struct{}
 	connWG  sync.WaitGroup
 
+	// E-4：进程级指标注册表，与 RTMP 服务器及 /metrics 端点共享。
+	metrics *metrics.Registry
+
+	// E-5：连接数/单 IP 连接数限流。nil 表示不限制。
+	limiter *limiter.ConnLimiter
+
 	// HTTP 隧道（RTSP over HTTP）的 GET/POST 配对表，按 x-sessioncookie 索引。
 	// GET 先登记，POST 到达时按同一个 cookie 找回数据通道。
 	tunnelsMu sync.Mutex
@@ -91,7 +99,28 @@ func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 		multicastTTL:  defaultMulticastTTL,
 		rtcp:          newRTCPScheduler(),
 		degrade:       defaultDegradeConfig,
+		metrics:       metrics.New(),
 	}
+}
+
+// SetMetrics 注入进程级指标注册表（E-4）。传 nil 时保留自建的那份。
+// 必须在 Serve 之前调用。
+func (s *Server) SetMetrics(reg *metrics.Registry) {
+	if reg != nil {
+		s.metrics = reg
+	}
+}
+
+// SetLimits 注入连接/单 IP 连接限流器（E-5）。nil 表示不限制。
+// 必须在 Serve 之前调用。
+func (s *Server) SetLimits(l *limiter.ConnLimiter) {
+	s.limiter = l
+}
+
+// SetMaxSessions 设置并发 RTSP 会话上限（E-5），0 表示不限制。
+// 必须在 Serve 之前调用。
+func (s *Server) SetMaxSessions(n int) {
+	s.sessions.SetMax(n)
 }
 
 // SetRegistry 注入共享的已发布流注册表（main 里让 RTSP 与 RTMP 互通）。
@@ -246,15 +275,47 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 			fmt.Printf("accept err: %v\n", err)
 			continue
 		}
+		// E-5：连接/单 IP 上限。超限的连接在 accept 阶段就拒绝，
+		// 不进入 goroutine，也不影响已建立连接。
+		ip := remoteIP(conn)
+		if ok, reason := s.limiter.Allow(ip); !ok {
+			fmt.Printf("reject client %s: %s\n", ip, reason)
+			rejectRTSPConn(conn)
+			continue
+		}
 		fmt.Printf("new client: %s\n", conn.RemoteAddr())
+		s.metrics.IncConn("rtsp")
+		s.metrics.IncConnTotal("rtsp")
 		s.connWG.Add(1)
-		go func() {
+		go func(c net.Conn, ip string) {
 			defer s.connWG.Done()
-			s.handleConn(&Conn{Conn: conn})
-		}()
+			defer s.metrics.DecConn("rtsp")
+			defer s.limiter.Release(ip)
+			s.handleConn(&Conn{Conn: c})
+		}(conn, ip)
 	}
 	s.shutdown()
 	return nil
+}
+
+// remoteIP 取连接的来源 IP（不带端口）。取不到时退回 RemoteAddr 字符串。
+func remoteIP(conn net.Conn) string {
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP.String()
+	}
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return conn.RemoteAddr().String()
+	}
+	return host
+}
+
+// rejectRTSPConn 对超限连接回一条 503 后关闭。此时还没读到请求，
+// CSeq 填 0；客户端至少能读到协议层错误，而不是无声断开。
+func rejectRTSPConn(conn net.Conn) {
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+	_, _ = conn.Write([]byte("RTSP/1.0 503 Service Unavailable\r\nCSeq: 0\r\nContent-Length: 0\r\n\r\n"))
+	_ = conn.Close()
 }
 
 func (s *Server) registerConn(c *Conn) {

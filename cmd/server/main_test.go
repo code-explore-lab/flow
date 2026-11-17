@@ -2,7 +2,7 @@ package main
 
 import "testing"
 
-func TestPprofListenAddr(t *testing.T) {
+func TestLoopbackListenAddr(t *testing.T) {
 	tests := []struct {
 		in   string
 		want string
@@ -19,19 +19,19 @@ func TestPprofListenAddr(t *testing.T) {
 		{":", "", false},
 	}
 	for _, tt := range tests {
-		got, err := pprofListenAddr(tt.in)
+		got, err := loopbackListenAddr(tt.in)
 		if tt.ok {
 			if err != nil {
-				t.Errorf("pprofListenAddr(%q) 返回错误: %v", tt.in, err)
+				t.Errorf("loopbackListenAddr(%q) 返回错误: %v", tt.in, err)
 				continue
 			}
 			if got != tt.want {
-				t.Errorf("pprofListenAddr(%q) = %q, want %q", tt.in, got, tt.want)
+				t.Errorf("loopbackListenAddr(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 			continue
 		}
 		if err == nil {
-			t.Errorf("pprofListenAddr(%q) = %q, 应当拒绝", tt.in, got)
+			t.Errorf("loopbackListenAddr(%q) = %q, 应当拒绝", tt.in, got)
 		}
 	}
 }

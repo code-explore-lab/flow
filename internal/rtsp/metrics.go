@@ -1,9 +1,12 @@
 package rtsp
 
 import (
+	"fmt"
+	"io"
 	"time"
 
 	"flow/internal/rtcp"
+	"flow/internal/session"
 )
 
 // TrackMetrics 是一条媒体轨在最近一次 RR 之后的服务端视角指标（C-4）。
@@ -127,4 +130,36 @@ func (s *Session) metricsSnapshot(id string) SessionMetrics {
 		sm.LossRate = float64(lost) / float64(sm.ExpectedPackets)
 	}
 	return sm
+}
+
+// WriteLossMetrics 输出「活跃会话累计丢包」相关的 gauge（E-4）。
+//
+// 丢包只能从每条会话最近一次 RR 的累计值算出来，而且会话来了又走，
+// 没法用单调递增的全局 counter 表达，所以每次抓取时遍历活跃会话重新求和。
+// 没收到过 RR 的会话不贡献 ExpectedPackets，输出为 0。
+func (s *Server) WriteLossMetrics(w io.Writer) {
+	var lost uint64
+	var expected uint64
+	s.sessions.Range(func(sess *session.Session) bool {
+		st, ok := sess.Data.(*Session)
+		if !ok || st == nil {
+			return true
+		}
+		m := st.metricsSnapshot(sess.ID)
+		if m.CumulativeLost > 0 {
+			lost += uint64(m.CumulativeLost)
+		}
+		expected += m.ExpectedPackets
+		return true
+	})
+	rate := 0.0
+	if expected > 0 {
+		rate = float64(lost) / float64(expected)
+	}
+	fmt.Fprintln(w, "# HELP flow_rtsp_packets_lost 活跃会话累计丢包数（来自最近一次 RR）")
+	fmt.Fprintln(w, "# TYPE flow_rtsp_packets_lost gauge")
+	fmt.Fprintf(w, "flow_rtsp_packets_lost %d\n", lost)
+	fmt.Fprintln(w, "# HELP flow_rtsp_loss_rate 活跃会话累计丢包率（Σlost/Σexpected）")
+	fmt.Fprintln(w, "# TYPE flow_rtsp_loss_rate gauge")
+	fmt.Fprintf(w, "flow_rtsp_loss_rate %g\n", rate)
 }

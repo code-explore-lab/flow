@@ -535,6 +535,7 @@ func (s *Server) handleIncomingRTCP(track *mediaTrack, sess *session.Session, pk
 	}
 	// RTCP 是保活证据：客户端可能不发 RTSP GET_PARAMETER。
 	sess.TouchRTCP()
+	s.metrics.IncRR()
 	fmt.Printf("RTCP recv %d bytes (%s, pt=%d, session=%s)\n",
 		len(pkt), track.kind, pkt[1], sess.ID)
 

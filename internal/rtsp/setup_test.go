@@ -66,7 +66,10 @@ func newPushSession(t *testing.T, s *Server, conn *Conn) *session.Session {
 	if err != nil {
 		t.Fatalf("parseAnnounceSDP: %v", err)
 	}
-	sess := s.newClientSession(conn)
+	sess, err := s.newClientSession(conn)
+	if err != nil {
+		t.Fatalf("newClientSession: %v", err)
+	}
 	sess.Data.(*Session).setAnnounced(tracks)
 	conn.bindSession(sess.ID)
 	return sess
@@ -402,7 +405,10 @@ func TestHandleRecord(t *testing.T) {
 
 	t.Run("非推流会话返回 455", func(t *testing.T) {
 		s, conn, finish := newTestPipe(t)
-		sess := s.newClientSession(conn)
+		sess, err := s.newClientSession(conn)
+		if err != nil {
+			t.Fatalf("newClientSession: %v", err)
+		}
 
 		hd := map[string]string{"CSeq": "3"}
 		req := &Request{
@@ -429,4 +435,17 @@ func TestHandleRecord(t *testing.T) {
 			t.Fatalf("status = %q, want 454", firstLine(resp))
 		}
 	})
+}
+
+func TestNewClientSessionLimit(t *testing.T) {
+	s, conn, finish := newTestPipe(t)
+	defer finish()
+
+	s.SetMaxSessions(1)
+	if _, err := s.newClientSession(conn); err != nil {
+		t.Fatalf("first session: %v", err)
+	}
+	if _, err := s.newClientSession(conn); err != errSessionLimit {
+		t.Fatalf("second session error = %v, want errSessionLimit", err)
+	}
 }

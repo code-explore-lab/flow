@@ -111,6 +111,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 		// C-6：降级期间只放行参数集和 IDR，整 AU 丢弃非关键帧。
 		// 只丢整个 AU，不拆 NALU，seq/timestamp 不会错乱。
 		if hasVCL && !isIDR && !hasParams && track.dropNonKeyFrame() {
+			s.metrics.AddDropped(track.kind, 1)
 			return true
 		}
 
@@ -134,6 +135,8 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			au = append(au, data)
 			// 给 SR 累计包数/字节数，并记下最后一个时间戳。
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
+			s.metrics.AddPackets(track.kind, 1)
+			s.metrics.AddOctets(track.kind, uint64(len(p.Payload)))
 			// 保留最近的包，NACK 重传（R-7）按 seq 取回。
 			track.cacheSent(p.Header.Seq, data)
 		}
@@ -173,6 +176,7 @@ func (s *Server) streamH264(track *mediaTrack, src videoFrameSource, done <-chan
 			return true
 		}
 		if d := reader.Dropped(); d != dropped {
+			s.metrics.AddDropped("video", d-dropped)
 			fmt.Printf("video stream: dropped %d old frames (slow consumer)\n", d-dropped)
 			dropped = d
 		}
@@ -258,6 +262,7 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 			return true
 		}
 		if d := reader.Dropped(); d != dropped {
+			s.metrics.AddDropped("audio", d-dropped)
 			fmt.Printf("audio stream: dropped %d old frames (slow consumer)\n", d-dropped)
 			dropped = d
 		}
@@ -284,6 +289,8 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 				return false
 			}
 			track.recordSent(p.Header.Timestamp, len(p.Payload))
+			s.metrics.AddPackets(track.kind, 1)
+			s.metrics.AddOctets(track.kind, uint64(len(p.Payload)))
 			track.cacheSent(p.Header.Seq, data)
 		}
 	}
@@ -320,6 +327,7 @@ func (s *Server) sendSenderReports(track *mediaTrack, done <-chan struct{}) {
 				return
 			}
 			s.rtcp.noteSent(len(sr))
+			s.metrics.IncSR()
 			fmt.Printf("RTCP SR sent (%s, ssrc=%08x, %d bytes)\n",
 				track.kind, track.currentSSRC(), len(sr))
 		}

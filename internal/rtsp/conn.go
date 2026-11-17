@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // interleavedMagic 是 RTSP interleaved 二进制帧的起始字节 '$'。
@@ -18,6 +19,10 @@ const interleavedMagic = '$'
 type Conn struct {
 	net.Conn
 	mu sync.Mutex
+
+	// writeTimeout > 0 时，每次写都设置写超时，防止慢客户端/半开连接
+	// 把发送 goroutine 永久阻塞。由 handleConn 按会话超时窗口设置。
+	writeTimeout time.Duration
 
 	// tunnel 表示这条「连接」来自 RTSP over HTTP 的命令通道。
 	// 隧道里只有一条双向字节流，没有独立的 UDP 通道，SETUP 必须走 interleaved。
@@ -41,6 +46,9 @@ type Conn struct {
 func (c *Conn) write(b []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.writeTimeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	}
 	_, err := c.Conn.Write(b)
 	return err
 }

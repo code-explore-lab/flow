@@ -255,3 +255,68 @@ func TestCloseAll(t *testing.T) {
 		t.Fatalf("OnClose called %d times, want 3", got)
 	}
 }
+
+func TestSetMaxRejectsNewSessions(t *testing.T) {
+	m := NewManager(DefaultTimeout)
+	m.SetMax(2)
+
+	if s := m.NewSession("127.0.0.1"); s == nil {
+		t.Fatal("first session rejected")
+	}
+	if s := m.NewSession("127.0.0.1"); s == nil {
+		t.Fatal("second session rejected")
+	}
+	if s := m.NewSession("127.0.0.1"); s != nil {
+		t.Fatalf("third session = %v, want nil at limit", s.ID)
+	}
+
+	// 删除后可再创建。
+	if ok := m.Delete("sess-1"); !ok {
+		t.Fatal("Delete(sess-1) failed")
+	}
+	if s := m.NewSession("127.0.0.1"); s == nil {
+		t.Fatal("session after delete rejected")
+	}
+}
+
+func TestSetMaxZeroUnlimited(t *testing.T) {
+	m := NewManager(DefaultTimeout)
+	m.SetMax(0)
+	for i := 0; i < 10; i++ {
+		if s := m.NewSession("127.0.0.1"); s == nil {
+			t.Fatalf("session %d rejected with unlimited max", i)
+		}
+	}
+}
+
+func TestRangeVisitsAllSessions(t *testing.T) {
+	m := NewManager(DefaultTimeout)
+	want := map[string]bool{"sess-1": true, "sess-2": true, "sess-3": true}
+	for i := 0; i < 3; i++ {
+		m.NewSession("127.0.0.1")
+	}
+
+	seen := map[string]bool{}
+	m.Range(func(s *Session) bool {
+		seen[s.ID] = true
+		return true
+	})
+	if len(seen) != len(want) {
+		t.Fatalf("Range visited %d sessions, want %d", len(seen), len(want))
+	}
+	for id := range want {
+		if !seen[id] {
+			t.Errorf("Range missed %s", id)
+		}
+	}
+
+	// 返回 false 时提前结束。
+	count := 0
+	m.Range(func(*Session) bool {
+		count++
+		return false
+	})
+	if count != 1 {
+		t.Fatalf("Range after early stop visited %d, want 1", count)
+	}
+}

@@ -23,6 +23,11 @@ const publicMethods = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, 
 // handleConn 处理一条 RTSP TCP 连接直到关闭。
 func (s *Server) handleConn(conn *Conn) {
 	s.registerConn(conn)
+	// E-5：写超时窗口与读超时保持一致（会话超时 + 一次扫描周期）。
+	// 只设置一次，之后 Conn.write 每次写都会刷新 deadline。
+	if conn.writeTimeout == 0 {
+		conn.writeTimeout = s.sessions.Timeout() + session.DefaultScanInterval
+	}
 	defer s.unregisterConn(conn)
 	defer func() {
 		conn.Close()
@@ -296,16 +301,29 @@ func (s *Server) buildSDP(uri string) (string, error) {
 	return sdp, nil
 }
 
+// errSessionLimit 表示并发会话数达到 -max-sessions 上限。
+var errSessionLimit = errors.New("session limit reached")
+
 // newClientSession 新建一个 RTSP 会话，并把 RTSP 层的轨道状态挂到 Data 上。
 // 拉流（SETUP 建会话）和推流（ANNOUNCE 建会话）共用。
-func (s *Server) newClientSession(conn *Conn) *session.Session {
+// 达到会话上限时返回 errSessionLimit，调用方回 503。
+func (s *Server) newClientSession(conn *Conn) (*session.Session, error) {
 	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	sess := s.sessions.NewSession(ip)
+	if sess == nil {
+		return nil, errSessionLimit
+	}
 	st := newSession()
 	sess.Data = st
-	sess.OnClose = st.closeAll
+	prevClose := st.closeAll
+	sess.OnClose = func() {
+		prevClose()
+		s.metrics.DecSession()
+	}
+	s.metrics.IncSession()
+	s.metrics.IncSessionTotal()
 	fmt.Printf("new session %s from %s\n", sess.ID, ip)
-	return sess
+	return sess, nil
 }
 
 // handleAnnounce 处理 ANNOUNCE：解析推流端带来的 SDP，记录轨道列表和
@@ -342,7 +360,12 @@ func (s *Server) handleAnnounce(conn *Conn, req *Request, hd map[string]string) 
 		}
 	}
 	if sess == nil {
-		sess = s.newClientSession(conn)
+		var err error
+		sess, err = s.newClientSession(conn)
+		if err != nil {
+			fmt.Printf("ANNOUNCE rejected (503): %v\n", err)
+			return writeResponse(conn, "503 Service Unavailable", hd, nil)
+		}
 	}
 
 	rtspSess := sess.Data.(*Session)
@@ -408,7 +431,12 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		}
 	}
 	if sess == nil {
-		sess = s.newClientSession(conn)
+		var err error
+		sess, err = s.newClientSession(conn)
+		if err != nil {
+			fmt.Printf("SETUP rejected (503): %v\n", err)
+			return writeResponse(conn, "503 Service Unavailable", hd, nil)
+		}
 	}
 	conn.bindSession(sess.ID)
 	rtspSess := sess.Data.(*Session)

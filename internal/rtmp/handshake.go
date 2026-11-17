@@ -20,6 +20,7 @@ package rtmp
 import (
 	"fmt"
 	"io"
+	"time"
 )
 
 // handshakeVersion RTMP 握手版本。
@@ -30,6 +31,15 @@ const handshakeSize = 1536
 
 // handshake 完成一次 RTMP 握手。读走 C2 后返回，后续字节流就是 Chunk Stream。
 func (c *Conn) handshake() error {
+	// E-5：握手超时，防止慢客户端/半开连接一直占着 goroutine。
+	// 握手结束后清掉 deadline，后续由消息循环的读写超时接管。
+	if c.handshakeTimeout > 0 {
+		if err := c.SetDeadline(time.Now().Add(c.handshakeTimeout)); err != nil {
+			return fmt.Errorf("rtmp handshake: set deadline: %w", err)
+		}
+		defer c.SetDeadline(time.Time{})
+	}
+
 	// C0 + C1
 	var c0 [1]byte
 	if _, err := io.ReadFull(c.br, c0[:]); err != nil {

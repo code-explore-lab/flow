@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"flow/internal/limiter"
+	"flow/internal/metrics"
 	"flow/internal/rtmp"
 	"flow/internal/rtsp"
 	"flow/internal/source"
@@ -59,6 +61,14 @@ func main() {
 	degradeRecover := flag.Duration("degrade-recover", 5*time.Second, "C-6: how long loss must stay below threshold before recovering")
 	// E-2：pprof 调试端口，空表示关闭；只允许回环地址。
 	pprofAddr := flag.String("pprof", "", "E-2: pprof listen address, e.g. :6060 (loopback only; empty disables)")
+	// E-4：Prometheus 指标端点，空表示关闭；只允许回环地址。
+	metricsAddr := flag.String("metrics", "", "E-4: Prometheus /metrics listen address, e.g. :9090 (loopback only; empty disables)")
+	// E-5：连接/会话上限与超时。
+	maxConns := flag.Int("max-conns", 0, "E-5: max concurrent TCP connections per protocol (0 = unlimited)")
+	maxSessions := flag.Int("max-sessions", 0, "E-5: max concurrent RTSP sessions (0 = unlimited)")
+	maxIPConns := flag.Int("max-ip-conns", 0, "E-5: max concurrent connections per source IP per protocol (0 = unlimited)")
+	handshakeTimeout := flag.Duration("handshake-timeout", 10*time.Second, "E-5: RTMP handshake timeout")
+	connTimeout := flag.Duration("conn-timeout", 60*time.Second, "E-5: RTMP idle read/write timeout (0 disables)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -79,6 +89,18 @@ func main() {
 	}
 	if *redirect != "" && !strings.HasPrefix(*redirect, "rtsp://") && !strings.HasPrefix(*redirect, "rtsps://") {
 		fmt.Fprintf(os.Stderr, "invalid -redirect %q (want rtsp://host:port/path)\n", *redirect)
+		os.Exit(2)
+	}
+	if *maxConns < 0 || *maxSessions < 0 || *maxIPConns < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -max-conns/-max-sessions/-max-ip-conns (must be >= 0)")
+		os.Exit(2)
+	}
+	if *handshakeTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -handshake-timeout (must be > 0)")
+		os.Exit(2)
+	}
+	if *connTimeout < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -conn-timeout (must be >= 0)")
 		os.Exit(2)
 	}
 
@@ -136,6 +158,12 @@ func main() {
 
 	// 两个协议共用一份注册表，实现互通。
 	reg := stream.NewRegistry()
+	// E-4：两个协议共用一个指标注册表，/metrics 与两个服务器都读它。
+	flowMetrics := metrics.New()
+	// E-5：每个协议各自一份连接限流器（per-protocol 独立计数）。
+	rtspLimiter := limiter.New(*maxConns, *maxIPConns)
+	rtmpLimiter := limiter.New(*maxConns, *maxIPConns)
+
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
 	rtspSrv.SetUsers(users)
@@ -143,11 +171,26 @@ func main() {
 	rtspSrv.SetRedirect(*redirect)
 	rtspSrv.SetMulticast(*multicastAddr, *multicastTTL)
 	rtspSrv.SetDegradePolicy(*degradeLoss, *degradeSustain, *degradeRecover)
+	rtspSrv.SetMetrics(flowMetrics)
+	rtspSrv.SetLimits(rtspLimiter)
+	rtspSrv.SetMaxSessions(*maxSessions)
 	// 切换basic / digest认证
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
 	}
 	rtmpSrv := rtmp.New(reg, video, audio)
+	rtmpSrv.SetMetrics(flowMetrics)
+	rtmpSrv.SetLimits(rtmpLimiter)
+	rtmpSrv.SetHandshakeTimeout(*handshakeTimeout)
+	rtmpSrv.SetConnTimeout(*connTimeout)
+
+	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
+	if *metricsAddr != "" {
+		if err := startMetrics(ctx, *metricsAddr, flowMetrics, rtspSrv); err != nil {
+			fmt.Fprintf(os.Stderr, "metrics: %v\n", err)
+			os.Exit(2)
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -164,23 +207,23 @@ func main() {
 	wg.Wait()
 }
 
-// pprofListenAddr 规范化 -pprof 的监听地址，并强制只监听回环。
+// loopbackListenAddr 规范化调试/指标端点的监听地址，并强制只监听回环。
 // ":6060" 会补成 "127.0.0.1:6060"；"0.0.0.0:6060"、局域网 IP、
-// "localhost" 一律拒绝，避免把 profile 接口暴露到外网。
-func pprofListenAddr(raw string) (string, error) {
+// "localhost" 一律拒绝，避免把调试接口暴露到外网。
+func loopbackListenAddr(raw string) (string, error) {
 	host, port, err := net.SplitHostPort(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid -pprof %q (want :6060 or 127.0.0.1:6060): %w", raw, err)
+		return "", fmt.Errorf("invalid listen address %q (want :6060 or 127.0.0.1:6060): %w", raw, err)
 	}
 	if port == "" {
-		return "", fmt.Errorf("invalid -pprof %q: missing port", raw)
+		return "", fmt.Errorf("invalid listen address %q: missing port", raw)
 	}
 	if host == "" {
 		host = "127.0.0.1"
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return "", fmt.Errorf("-pprof only allows loopback, got %q", host)
+		return "", fmt.Errorf("only loopback is allowed, got %q", host)
 	}
 	return net.JoinHostPort(host, port), nil
 }
@@ -188,7 +231,7 @@ func pprofListenAddr(raw string) (string, error) {
 // startPprof 启动 pprof HTTP 服务，仅回环可达；ctx 取消时优雅关闭。
 // block/mutex 采样只在开启 pprof 时设置，平时没有额外开销。
 func startPprof(ctx context.Context, raw string) error {
-	addr, err := pprofListenAddr(raw)
+	addr, err := loopbackListenAddr(raw)
 	if err != nil {
 		return err
 	}
@@ -203,6 +246,31 @@ func startPprof(ctx context.Context, raw string) error {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
+	if err := serveLoopback(ctx, addr, mux, "pprof"); err != nil {
+		return err
+	}
+	fmt.Printf("pprof endpoints under http://%s/debug/pprof/\n", addr)
+	return nil
+}
+
+// startMetrics 启动 Prometheus 文本端点（E-4），仅回环可达。
+// 全局计数器来自 metrics.Registry，活跃会话的丢包 gauge 来自 rtsp.Server。
+func startMetrics(ctx context.Context, raw string, reg *metrics.Registry, loss *rtsp.Server) error {
+	addr, err := loopbackListenAddr(raw)
+	if err != nil {
+		return err
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		reg.WritePrometheus(w)
+		loss.WriteLossMetrics(w)
+	})
+	return serveLoopback(ctx, addr, mux, "metrics")
+}
+
+// serveLoopback 在 addr 上启动一个小型 HTTP 服务，ctx 取消时优雅关闭。
+func serveLoopback(ctx context.Context, addr string, mux *http.ServeMux, name string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
@@ -216,9 +284,9 @@ func startPprof(ctx context.Context, raw string) error {
 	}()
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Printf("pprof serve: %v\n", err)
+			fmt.Printf("%s serve: %v\n", name, err)
 		}
 	}()
-	fmt.Printf("pprof listen on http://%s/debug/pprof/ (loopback only)\n", addr)
+	fmt.Printf("%s listen on http://%s/ (loopback only)\n", name, addr)
 	return nil
 }

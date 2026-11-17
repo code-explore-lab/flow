@@ -23,6 +23,8 @@ const publicMethods = "OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, PAUSE, RECORD, 
 // handleConn 处理一条 RTSP TCP 连接直到关闭。
 func (s *Server) handleConn(conn *Conn) {
 	s.registerConn(conn)
+	// E-8：失败认证退避按来源 IP 计数（跨连接共享）。
+	ip := remoteIP(conn)
 	// E-5：写超时窗口与读超时保持一致（会话超时 + 一次扫描周期）。
 	// 只设置一次，之后 Conn.write 每次写都会刷新 deadline。
 	if conn.writeTimeout == 0 {
@@ -120,6 +122,11 @@ func (s *Server) handleConn(conn *Conn) {
 		// 客户端会自动换 nonce 重试。401 不泄露请求细节。
 		if req.Method != "OPTIONS" {
 			if res := s.checkRequestAuth(req); !res.ok {
+				// E-8：失败认证退避。连续失败达到阈值后，回 401 前先 sleep
+				// 指数增长的时长，拖慢暴力破解（tarpit）。
+				if d := s.backoff.Fail(ip); d > 0 {
+					time.Sleep(d)
+				}
 				if res.stale {
 					fmt.Printf("auth stale: %s %s\n", req.Method, req.URI)
 				} else {
@@ -133,6 +140,8 @@ func (s *Server) handleConn(conn *Conn) {
 				}
 				continue
 			}
+			// 认证成功清零该 IP 的失败计数。
+			s.backoff.Success(ip)
 		}
 
 		var respErr error
@@ -314,6 +323,7 @@ func (s *Server) newClientSession(conn *Conn) (*session.Session, error) {
 		return nil, errSessionLimit
 	}
 	st := newSession()
+	st.conn = conn
 	sess.Data = st
 	prevClose := st.closeAll
 	sess.OnClose = func() {

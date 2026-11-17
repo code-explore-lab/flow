@@ -1,8 +1,11 @@
 package rtmp
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,6 +94,65 @@ func TestServeAcceptAndShutdown(t *testing.T) {
 	_ = client.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := client.Read(make([]byte, 1)); err == nil {
 		t.Fatal("client connection still open after shutdown")
+	}
+}
+
+// metricValue 从 Registry 的 Prometheus 文本里取指定指标行的值，
+// 行首匹配 sample（形如 `flow_connections{proto="rtmp"}`）。
+func metricValue(t *testing.T, s *Server, sample string) float64 {
+	t.Helper()
+	var buf bytes.Buffer
+	s.metrics.WritePrometheus(&buf)
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if rest, ok := strings.CutPrefix(line, sample+" "); ok {
+			v, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+			if err != nil {
+				t.Fatalf("parse metric %q: %v", line, err)
+			}
+			return v
+		}
+	}
+	t.Fatalf("metric %q not found in:\n%s", sample, buf.String())
+	return 0
+}
+
+// TestConnGaugeFallsBackAfterClientKill 模拟客户端被 kill：RTMP 连接断开后
+// flow_connections{proto="rtmp"} 应回落到 0，对应的连接 goroutine 也退出。
+// 只验证连接账目（E-9 的资源回收在 RTSP 侧有完整覆盖）。
+func TestConnGaugeFallsBackAfterClientKill(t *testing.T) {
+	s := New(nil, nil, nil)
+	addr := freeAddr(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- s.Serve(ctx, addr) }()
+
+	var client net.Conn
+	waitFor(t, 3*time.Second, func() bool {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			return false
+		}
+		client = c
+		return true
+	})
+	defer client.Close()
+
+	const sample = `flow_connections{proto="rtmp"}`
+	waitFor(t, 2*time.Second, func() bool { return metricValue(t, s, sample) == 1 })
+
+	_ = client.Close() // kill -9：连接直接消失
+
+	waitFor(t, 3*time.Second, func() bool { return metricValue(t, s, sample) == 0 })
+
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after ctx cancel")
 	}
 }
 

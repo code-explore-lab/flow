@@ -344,6 +344,11 @@ type Session struct {
 	mu     sync.Mutex
 	tracks map[string]*mediaTrack // key: "video" / "audio"
 
+	// conn 是创建这个会话的控制连接（E-9）。会话因超时被 Sweep 回收时，
+	// 用它关闭对应连接，让半开/断网的 handleConn goroutine 及时退出。
+	// 只在 newClientSession 里写一次，之后只读。
+	conn *Conn
+
 	// ANNOUNCE 带来的推流描述（P1-5）。announcedIndex 把规范化后的
 	// a=control（streamid=0 / trackID=0 / 裸 "0"）映射到 announced 下标，
 	// SETUP 时按 URI 里的 control 找回具体轨道（P1-6 使用）。

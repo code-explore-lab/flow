@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"flow/internal/access"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/rtmp"
@@ -69,6 +70,13 @@ func main() {
 	maxIPConns := flag.Int("max-ip-conns", 0, "E-5: max concurrent connections per source IP per protocol (0 = unlimited)")
 	handshakeTimeout := flag.Duration("handshake-timeout", 10*time.Second, "E-5: RTMP handshake timeout")
 	connTimeout := flag.Duration("conn-timeout", 60*time.Second, "E-5: RTMP idle read/write timeout (0 disables)")
+	// E-8：访问控制与限流。
+	whitelistFile := flag.String("whitelist-file", "", "E-8: CIDR whitelist file, one CIDR per line (empty disables)")
+	connRate := flag.Float64("conn-rate", 0, "E-8: per-IP connection rate in conns/sec per protocol (0 disables)")
+	connBurst := flag.Int("conn-burst", 5, "E-8: per-IP connection burst capacity (used when -conn-rate > 0)")
+	backoffThreshold := flag.Int("auth-backoff-threshold", 5, "E-8: failed RTSP auth attempts before backoff")
+	backoffBase := flag.Duration("auth-backoff-base", time.Second, "E-8: base auth backoff delay (0 disables)")
+	backoffMax := flag.Duration("auth-backoff-max", 30*time.Second, "E-8: max auth backoff delay")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -101,6 +109,14 @@ func main() {
 	}
 	if *connTimeout < 0 {
 		fmt.Fprintln(os.Stderr, "invalid -conn-timeout (must be >= 0)")
+		os.Exit(2)
+	}
+	if *connRate < 0 || *connBurst < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -conn-rate/-conn-burst (must be >= 0)")
+		os.Exit(2)
+	}
+	if *backoffThreshold < 0 || *backoffBase < 0 || *backoffMax <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -auth-backoff-threshold/-auth-backoff-base/-auth-backoff-max (threshold>=0, base>=0, max>0)")
 		os.Exit(2)
 	}
 
@@ -163,6 +179,19 @@ func main() {
 	// E-5：每个协议各自一份连接限流器（per-protocol 独立计数）。
 	rtspLimiter := limiter.New(*maxConns, *maxIPConns)
 	rtmpLimiter := limiter.New(*maxConns, *maxIPConns)
+	// E-8：白名单全局共享（同一份 CIDR 列表）；建连速率每协议一份，
+	// 失败认证退避只有 RTSP 鉴权会用到。
+	whitelist, err := access.ParseWhitelistFile(*whitelistFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "whitelist: %v\n", err)
+		os.Exit(1)
+	}
+	if whitelist.Enabled() {
+		fmt.Printf("access: whitelist enabled from %s\n", *whitelistFile)
+	}
+	rtspRate := access.NewRateLimiter(*connRate, *connBurst)
+	rtmpRate := access.NewRateLimiter(*connRate, *connBurst)
+	authBackoff := access.NewBackoff(*backoffThreshold, *backoffBase, *backoffMax)
 
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
@@ -174,6 +203,9 @@ func main() {
 	rtspSrv.SetMetrics(flowMetrics)
 	rtspSrv.SetLimits(rtspLimiter)
 	rtspSrv.SetMaxSessions(*maxSessions)
+	rtspSrv.SetWhitelist(whitelist)
+	rtspSrv.SetRateLimit(rtspRate)
+	rtspSrv.SetBackoff(authBackoff)
 	// 切换basic / digest认证
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
@@ -181,6 +213,8 @@ func main() {
 	rtmpSrv := rtmp.New(reg, video, audio)
 	rtmpSrv.SetMetrics(flowMetrics)
 	rtmpSrv.SetLimits(rtmpLimiter)
+	rtmpSrv.SetWhitelist(whitelist)
+	rtmpSrv.SetRateLimit(rtmpRate)
 	rtmpSrv.SetHandshakeTimeout(*handshakeTimeout)
 	rtmpSrv.SetConnTimeout(*connTimeout)
 

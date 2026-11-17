@@ -10,6 +10,7 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"runtime"
 	"sync/atomic"
 )
 
@@ -266,5 +267,9 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	)
 	writeMetric(w, "flow_rtsp_rr_received_total", "counter", "已收到的 RTCP RR 包数",
 		fmt.Sprintf("flow_rtsp_rr_received_total %d", r.rrReceived.Load()),
+	)
+	// E-9：抓取时采样当前 goroutine 数，用于观察资源回收后是否回落。
+	writeMetric(w, "flow_goroutines", "gauge", "当前 goroutine 数",
+		fmt.Sprintf("flow_goroutines %d", runtime.NumGoroutine()),
 	)
 }

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"flow/internal/access"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/source"
@@ -35,6 +36,10 @@ type Server struct {
 
 	// E-5：连接数/单 IP 连接数限流。nil 表示不限制。
 	limiter *limiter.ConnLimiter
+
+	// E-8：IP 白名单与每 IP 建连速率。nil 表示对应功能未启用。
+	whitelist *access.Whitelist
+	rate      *access.RateLimiter
 
 	// E-5：握手超时与消息读/写空闲超时。0 表示不设超时。
 	handshakeTimeout time.Duration
@@ -69,6 +74,18 @@ func (s *Server) SetMetrics(reg *metrics.Registry) {
 // 必须在 Serve 之前调用。
 func (s *Server) SetLimits(l *limiter.ConnLimiter) {
 	s.limiter = l
+}
+
+// SetWhitelist 注入 IP 白名单（E-8）。nil 表示不启用白名单。
+// 必须在 Serve 之前调用。
+func (s *Server) SetWhitelist(w *access.Whitelist) {
+	s.whitelist = w
+}
+
+// SetRateLimit 注入每 IP 建连速率限制（E-8）。nil 表示不限速。
+// 必须在 Serve 之前调用。
+func (s *Server) SetRateLimit(r *access.RateLimiter) {
+	s.rate = r
 }
 
 // SetHandshakeTimeout 设置握手超时（E-5）。<=0 表示不设超时。
@@ -111,8 +128,19 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 			fmt.Printf("rtmp accept err: %v\n", err)
 			continue
 		}
-		// E-5：连接/单 IP 上限。RTMP 没有 503 语义，超限直接断开。
+		// E-8：白名单 / 每 IP 建连速率。RTMP 没有 503 语义，拒绝即断开。
 		ip := remoteIP(conn)
+		if !s.whitelist.Allows(ip) {
+			fmt.Printf("rtmp: reject client %s: not in whitelist\n", ip)
+			_ = conn.Close()
+			continue
+		}
+		if !s.rate.Allow(ip) {
+			fmt.Printf("rtmp: reject client %s: connection rate exceeded\n", ip)
+			_ = conn.Close()
+			continue
+		}
+		// E-5：连接/单 IP 上限。RTMP 没有 503 语义，超限直接断开。
 		if ok, reason := s.limiter.Allow(ip); !ok {
 			fmt.Printf("rtmp: reject client %s: %s\n", ip, reason)
 			_ = conn.Close()

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"flow/internal/access"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/session"
@@ -73,6 +74,11 @@ type Server struct {
 	// E-5：连接数/单 IP 连接数限流。nil 表示不限制。
 	limiter *limiter.ConnLimiter
 
+	// E-8：IP 白名单、每 IP 建连速率、失败认证退避。nil 表示对应功能未启用。
+	whitelist *access.Whitelist
+	rate      *access.RateLimiter
+	backoff   *access.Backoff
+
 	// HTTP 隧道（RTSP over HTTP）的 GET/POST 配对表，按 x-sessioncookie 索引。
 	// GET 先登记，POST 到达时按同一个 cookie 找回数据通道。
 	tunnelsMu sync.Mutex
@@ -121,6 +127,24 @@ func (s *Server) SetLimits(l *limiter.ConnLimiter) {
 // 必须在 Serve 之前调用。
 func (s *Server) SetMaxSessions(n int) {
 	s.sessions.SetMax(n)
+}
+
+// SetWhitelist 注入 IP 白名单（E-8）。nil 表示不启用白名单。
+// 必须在 Serve 之前调用。
+func (s *Server) SetWhitelist(w *access.Whitelist) {
+	s.whitelist = w
+}
+
+// SetRateLimit 注入每 IP 建连速率限制（E-8）。nil 表示不限速。
+// 必须在 Serve 之前调用。
+func (s *Server) SetRateLimit(r *access.RateLimiter) {
+	s.rate = r
+}
+
+// SetBackoff 注入失败认证退避（E-8）。nil 表示不退避。
+// 必须在 Serve 之前调用。
+func (s *Server) SetBackoff(b *access.Backoff) {
+	s.backoff = b
 }
 
 // SetRegistry 注入共享的已发布流注册表（main 里让 RTSP 与 RTMP 互通）。
@@ -235,10 +259,7 @@ func (s *Server) authEnabled() bool {
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
 // 返回的错误只有监听失败这一种（Accept 错误按信号区分，正常退出返回 nil）。
 func (s *Server) Serve(ctx context.Context, addr string) error {
-	s.sessions.OnExpire = func(sess *session.Session) {
-		fmt.Printf("session %s auto teardown: no RTCP/RTSP for %s (last RTCP %s)\n",
-			sess.ID, s.sessions.Timeout(), sess.LastRTCP().Format(time.RFC3339))
-	}
+	s.installExpireHook()
 	go s.sessions.Run(ctx) //启动会话管理器
 
 	listener, err := net.Listen("tcp", addr)
@@ -275,9 +296,21 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 			fmt.Printf("accept err: %v\n", err)
 			continue
 		}
+		// E-8：白名单外的来源直接拒绝（最先判定，最便宜）。
+		ip := remoteIP(conn)
+		if !s.whitelist.Allows(ip) {
+			fmt.Printf("reject client %s: not in whitelist\n", ip)
+			rejectRTSPConn(conn)
+			continue
+		}
+		// E-8：每 IP 建连速率。超速在 accept 阶段拒绝，不影响已有连接。
+		if !s.rate.Allow(ip) {
+			fmt.Printf("reject client %s: connection rate exceeded\n", ip)
+			rejectRTSPConn(conn)
+			continue
+		}
 		// E-5：连接/单 IP 上限。超限的连接在 accept 阶段就拒绝，
 		// 不进入 goroutine，也不影响已建立连接。
-		ip := remoteIP(conn)
 		if ok, reason := s.limiter.Allow(ip); !ok {
 			fmt.Printf("reject client %s: %s\n", ip, reason)
 			rejectRTSPConn(conn)
@@ -316,6 +349,35 @@ func rejectRTSPConn(conn net.Conn) {
 	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 	_, _ = conn.Write([]byte("RTSP/1.0 503 Service Unavailable\r\nCSeq: 0\r\nContent-Length: 0\r\n\r\n"))
 	_ = conn.Close()
+}
+
+// installExpireHook 安装会话超时回收钩子：记一条日志，并关闭该会话独占的
+// 控制连接（E-9）。只在 Sweep 回收（超时/断网/半开）时触发，不干扰客户端的
+// 正常 TEARDOWN（那条路径在回 200 OK 时连接必须还开着）。
+// 测试替换过 s.sessions 后需要重新调用一次。
+func (s *Server) installExpireHook() {
+	s.sessions.OnExpire = func(sess *session.Session) {
+		fmt.Printf("session %s auto teardown: no RTCP/RTSP for %s (last RTCP %s)\n",
+			sess.ID, s.sessions.Timeout(), sess.LastRTCP().Format(time.RFC3339))
+		if st, ok := sess.Data.(*Session); ok && st.conn != nil {
+			s.closeConnIfIdle(st.conn, sess.ID)
+		}
+	}
+}
+
+// closeConnIfIdle 在该连接上除 selfID 外没有其他活跃会话时关闭它，
+// 让 handleConn 的读阻塞立即返回（E-9：半开/断网时连接随会话一起回收，
+// 不再干等 30s 读超时兜底）。还有兄弟会话则不动，避免误杀。
+func (s *Server) closeConnIfIdle(conn *Conn, selfID string) {
+	for _, id := range conn.boundSessions() {
+		if id == selfID {
+			continue
+		}
+		if _, ok := s.sessions.Get(id); ok {
+			return
+		}
+	}
+	conn.Close()
 }
 
 func (s *Server) registerConn(c *Conn) {

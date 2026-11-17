@@ -77,10 +77,12 @@ func main() {
 	backoffThreshold := flag.Int("auth-backoff-threshold", 5, "E-8: failed RTSP auth attempts before backoff")
 	backoffBase := flag.Duration("auth-backoff-base", time.Second, "E-8: base auth backoff delay (0 disables)")
 	backoffMax := flag.Duration("auth-backoff-max", 30*time.Second, "E-8: max auth backoff delay")
-	// E-6：RTSPS（RTSP over TLS）。两个 flag 必须成对出现；空表示明文 RTSP。
-	// 命名与协议无关，后续 T-2（RTMPS）可以直接复用。
-	tlsCert := flag.String("tls-cert", "", "E-6: TLS certificate file for RTSPS (requires -tls-key)")
-	tlsKey := flag.String("tls-key", "", "E-6: TLS private key file for RTSPS (requires -tls-cert)")
+	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
+	// 空表示 RTSP/RTMP 都保持明文。
+	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
+	tlsKey := flag.String("tls-key", "", "E-6/T-2: TLS private key file for RTSPS/RTMPS (requires -tls-cert)")
+	// T-2：RTMPS 独立监听端口，明文 RTMP :1935 继续可用。
+	rtmpsAddr := flag.String("rtmps-addr", ":1936", "T-2: RTMPS listen address (only used with -tls-cert/-tls-key)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -225,13 +227,27 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	rtmpSrv := rtmp.New(reg, video, audio)
-	rtmpSrv.SetMetrics(flowMetrics)
-	rtmpSrv.SetLimits(rtmpLimiter)
-	rtmpSrv.SetWhitelist(whitelist)
-	rtmpSrv.SetRateLimit(rtmpRate)
-	rtmpSrv.SetHandshakeTimeout(*handshakeTimeout)
-	rtmpSrv.SetConnTimeout(*connTimeout)
+	// T-2：RTMPS 与 RTMP 各起一个 Server 实例（共享注册表/指标/限流器），
+	// 两个监听独立 accept、独立回收连接，互不影响关闭流程。
+	newRTMP := func() *rtmp.Server {
+		srv := rtmp.New(reg, video, audio)
+		srv.SetMetrics(flowMetrics)
+		srv.SetLimits(rtmpLimiter)
+		srv.SetWhitelist(whitelist)
+		srv.SetRateLimit(rtmpRate)
+		srv.SetHandshakeTimeout(*handshakeTimeout)
+		srv.SetConnTimeout(*connTimeout)
+		return srv
+	}
+	rtmpSrv := newRTMP()
+	var rtmpsSrv *rtmp.Server
+	if *tlsCert != "" {
+		rtmpsSrv = newRTMP()
+		if err := rtmpsSrv.SetTLS(*tlsCert, *tlsKey); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
 	if *metricsAddr != "" {
@@ -243,6 +259,9 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
+	if rtmpsSrv != nil {
+		wg.Add(1)
+	}
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
 		defer wg.Done()
@@ -253,6 +272,9 @@ func main() {
 	}
 	go serve("rtsp", ":8554", rtspSrv.Serve)
 	go serve("rtmp", ":1935", rtmpSrv.Serve)
+	if rtmpsSrv != nil {
+		go serve("rtmps", *rtmpsAddr, rtmpsSrv.Serve)
+	}
 	wg.Wait()
 }
 

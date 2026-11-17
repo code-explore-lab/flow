@@ -336,11 +336,20 @@
   - 验收：`ffmpeg -tls_verify 0 -rtsp_transport tcp -i rtsps://host:8554/live/test` 拉流成功。
     （ffmpeg 8 的 `-rtsp_transport` 没有 `tls` 值，TLS 由 `rtsps://` scheme 选择。）
   - ✅ 已实现：`rtsp.Server.SetTLS(cert, key)` 用 `tls.LoadX509KeyPair` 加载 PEM（`MinVersion: TLS1.2`），`Serve` 在配置了证书时改用 `tls.Listen` 并打印 `RTSPS server listen`，accept 后的白名单/建连限速/连接上限、`remoteIP`、`RejectRTSPConn`、HTTP 隧道、鉴权与 play/publish 全部原样复用；每个 `*tls.Conn` 在 `handleConn` 前显式握手并设 10s 超时，明文客户端快速失败（日志 `tls: first record does not look like a TLS handshake`）。`cmd/server` 新增 `-tls-cert`/`-tls-key`（必须成对，不成对退出码 2；加载失败退出码 1）。`internal/rtsp/tls_test.go` 用测试内生成的自签证书覆盖：OPTIONS over TLS 成功、明文客户端被拒、缺失/不匹配证书报错。本机 e2e（自签证书 + ffmpeg 8.0.1）：`ffprobe -tls_verify 0 -rtsp_transport tcp rtsps://127.0.0.1:8554/live/test` → h264 640x480 + aac 44100；`ffmpeg ... -f rtsp rtsps://.../live/tls_push` 推流（ANNOUNCE/RECORD，881 包/827KB，gaps=0）后同 URL 用 RTSPS 拉回 → h264 320x240；明文 `rtsp://127.0.0.1:8554` 客户端被拒。证书轮换需重启，单端口 rtsp/rtsps 双协议嗅探未做。
-- [ ] **E-7 真实 USB 摄像头验证**
+- [x] **E-7 真实 USB 摄像头验证**
   - Windows：`ffmpeg -f dshow -i video="..." -c:v libx264 -tune zerolatency -f h264 pipe:1`；
   - Linux：`ffmpeg -f v4l2 -i /dev/video0 ...`；
   - 记录延迟、CPU、分辨率切换、断流重连；
   - 验收：实机连续运行 10 分钟无崩溃。
+  - ✅ 已验证（Windows 11 + Integrated Webcam + ffmpeg 8.0.1，E-7 原始命令原样使用，未额外指定 `-preset`/`-threads`）：
+    - **多 slice 缺陷与修复**：默认 `libx264 -tune zerolatency` 会启用切片线程，640x480/720p 下每帧输出 7 个 slice NALU。旧服务端把每个 slice 当成独立帧（各自时间戳、各自 RTP marker），且视频 ring 只按 64 个 NALU 计容，一次 64KB 管道读就能塞满并覆盖整批数据；15s 拉流只解出 207 帧，客户端报 `concealing 3280 DC/AC/MV` 与 `corrupt decoded frame`。修复内容：`media.StartsVideoAU` 按 H.264 `first_mb_in_slice`（H.265 用 `first_slice_segment_in_pic_flag`）识别 AU 首 NALU，同帧多 slice 共用时间戳并标记 `AUStart`，`streamH264` 把整帧聚合进同一个 RTP AU（marker 只打最后一包）；实时源时间戳强制严格递增（`nextLiveAUTS`）；视频 ring 改为 4096 帧硬上限 + 512KB 字节预算（`RingBuffer` 增加按字节淘汰）；seek 索引按 AU 计帧号。回归测试见 `internal/source/h264_au_test.go`、`internal/source/ring_test.go`、`internal/rtsp/stap_test.go`。
+    - **15s 对照（640x480，客户端延迟 1s 接入）**：修复前 207 帧且大量花屏；修复后 459 帧（≈30fps）、服务端丢帧 0、客户端 0 concealment/corrupt；`-x264-params sliced-threads=0:threads=4` 对照组 444 帧、同样 0 丢帧，说明修复不依赖编码器关切片线程。
+    - **10 分 10 秒 soak**：单条 RTSP 客户端全程不重连，分辨率 640x480 → 1280x720 → 960x540 各 200s，720p 结束后断流 5s；publisher 每段 6,001 帧（29.8fps），客户端 18,003 帧 / 10:07.5（稳定 30fps、`speed=1x`），`flow_rtsp_frames_dropped_total{kind="video"}=0`，客户端 0 concealment/0 corrupt；分辨率切换与 5s 断流期间流不中断，flow 结束时 `alive=True`、无 panic。
+    - **资源占用**：soak 期间 flow 累计 CPU 2.45s / ≈588s（约 0.4% 单核），进程 WorkingSet 平均 18.1MB、峰值 21.0MB（PowerShell 39 次采样）。
+    - **断流重连**：另一轮 6.5 分钟运行在 270s 时强杀拉流 ffmpeg，旧会话立即回收，客户端 1s 后自动重连成功，`flow_sessions_total{proto="rtsp"}` 1→2 且流继续；摄像头 ffmpeg 段间停流 5s 时服务端保持存活，恢复后从新的 SPS/PPS+IDR 继续解码。
+    - **延迟**：低延迟客户端（`-fflags nobuffer -max_delay 0 -flags low_delay`）720p 下，服务端收流→客户端解码的排队延迟中位 3.3ms（p95 437ms 是连接初期管道积压一次性排空，不是稳态）；x264 编码耗时中位 5.3ms/p95 8.2ms。默认 ffmpeg RTSP 客户端带约 500ms 重排缓冲，实测端到端约 650ms，需要低延迟时要显式加上述参数。注意按帧号配对 publisher/decoder 日志会被启动积压错位，本项只报告两端各自可独立测量的数值。
+    - **已知噪声**：客户端日志中的 `non monotonically increasing dts`（10 分钟 1,750 行）来自 ffmpeg null muxer 的既有告警，旧版本与非切片对照组同样出现，与服务端丢帧无关。
+    - `gofmt` / `go vet` / `go test ./...` 通过；修复提交 `7aeb40b fix: group multi-slice NALUs into one RTP access unit`。
 - [x] **E-8 访问控制 / 限流**
   - IP 白名单（CIDR）、每 IP 建连速率限制、失败认证退避；
   - 验收：非白名单连接被拒，暴力尝试被限速。
@@ -363,9 +372,10 @@
   - 实现 C1/C2/S1/S2 的 HMAC-SHA256（FP9/FP10）校验，校验失败回退 simple；
   - 验收：ffmpeg/ffplay 推拉流不变；complex-only 客户端能完成握手。
   - ✅ 已实现：新增 `internal/rtmp/handshake_digest.go`，按 FP9/FP10 的两种 digest offset 方案（块首 / 块尾 4 字节求和 % 728）校验 C1 的 HMAC-SHA256（FP key 前 30 字节）；命中则生成带 FMS 摘要的 S1（前 36 字节）与 `random + HMAC(FMS 68B, C1 摘要)` 的 S2，并校验 C2 尾部摘要；两种方案都不命中时逐字节保持原 simple echo，C2 不符只记录不拒绝。`handshake_test.go` 覆盖两种 offset 方案、合法/损坏 C2、simple 回退；ffmpeg 8.0.1 RTMP 推拉 e2e 回归通过（h264 320x240）。本机无 librtmp/OBS，complex-only 真实客户端未联调，完整握手由合成 FP9 客户端单测覆盖。
-- [ ] **T-2 RTMPS（P2）**
+- [x] **T-2 RTMPS（P2）**
   - 与 E-6 共用证书参数，用 `tls.Listen` 包住 RTMP 监听；
   - 验收：`ffmpeg -f flv rtmps://127.0.0.1:1936/live/test` 推流、`ffplay rtmps://...` 拉流成功。
+  - ✅ 已实现：`rtmp.Server` 新增 `SetTLS(cert, key)`，用 `tls.LoadX509KeyPair` 加载 PEM（`MinVersion: TLS1.2`），`Serve` 在配置了证书时改用 `tls.Listen` 并打印 `RTMPS server listen`；accept 后先显式 `tls.Conn.Handshake()`（10s deadline）再复用原有 RTMP 握手/命令/推拉逻辑，明文客户端快速失败（日志 `rtmp: tls handshake ... first record does not look like a TLS handshake`）。`cmd/server` 复用 E-6 的 `-tls-cert`/`-tls-key`，新增 `-rtmps-addr`（默认 `:1936`，仅在配置证书时启用）；RTMPS 与明文 RTMP `:1935` 各用一个 `Server` 实例，共享注册表、指标与限流器，互不影响关闭流程。测试 `internal/rtmp/tls_test.go` 覆盖自签证书加载、TLS 上完成 RTMP 握手并收到 `NetConnection.Connect.Success`、明文客户端被拒且不影响后续连接、静默客户端握手超时、证书缺失/不匹配报错、未启用 TLS 时明文路径无回归。本机 e2e（自签证书 + ffmpeg 8.0.1）：`ffmpeg -re -i testdata/with_audio.mp4 -c copy -f flv rtmps://127.0.0.1:1936/live/rtmpstest` 推流成功（ffmpeg 默认不校验证书，无需额外参数），`ffprobe rtmps://...` 解出 h264 640x480 + aac 44100，`ffmpeg -t 3 -f null -` 解码 60 帧；同一进程明文 `rtmp://127.0.0.1:1935/...` 推拉正常；明文客户端连 1936 被 TLS 握手拒绝（WinSock -10054）。证书轮换需重启；未做 RTMP/RTMPS 单端口协议嗅探。`gofmt`/`go vet`/`go test ./...` 通过。
 - [ ] **T-3 RTMP 连接鉴权（P0）**
   - 现状 `connect` / `publish` / `play` 不校验任何凭据，任意 app/流名都能推拉；
   - 支持 token/密钥、app 白名单、推拉权限分离；凭据从文件/环境变量读取；

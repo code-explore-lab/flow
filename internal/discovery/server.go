@@ -97,6 +97,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if r.URL.Query().Get("all") == "1" {
+			entries := s.store.Candidates(name)
+			if len(entries) == 0 {
+				writeError(w, http.StatusNotFound, "stream not registered")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"streams": entries})
+			return
+		}
 		entry, ok := s.store.Lookup(name)
 		if !ok {
 			writeError(w, http.StatusNotFound, "stream not registered")

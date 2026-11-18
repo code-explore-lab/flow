@@ -72,8 +72,9 @@ RTMP / HTTP-FLV 上游的时间戳在重连时按 PTS（DTS+CTS）平移到上�
 ./registry -listen :7000 -ttl 15s
 
 # 节点：上报自己的 RTSP/RTMP 公网地址，并启用本地空闲回收
+# RTMP 地址要带 app 路径（推流/播放都是 rtmp://host:1935/live/<流名>）
 ./flow -node-id edge-a \
-       -advertise rtsp://10.0.0.5:8554,rtmp://10.0.0.5:1935 \
+       -advertise rtsp://10.0.0.5:8554,rtmp://10.0.0.5:1935/live \
        -discovery-url http://registry:7000
 
 # 边缘节点本地没有 live/demo 时，ffplay 会跟随 302 连到持有者
@@ -82,6 +83,34 @@ ffplay rtsp://10.0.0.6:8554/live/demo
 
 `-stream-idle 0` 关闭本地回收；S-1 回源和 `-pull` 的流始终豁免，由各自的
 重连逻辑维护。发现只做精确流名匹配；RTMP 客户端不跟随 RTSP 302。
+
+边缘分发与负载均衡（`-discovery-mode proxy`，S-2）：边缘节点不再只是回
+302，而是直接按发现结果从持有者拉流，再以本节点流名对外服务。上游节点
+宕机时，puller 在下一轮重连时重新查询注册中心并切换到其他副本，本地流
+不关闭，已经连上的 RTSP / RTMP / HTTP-FLV 下游继续收帧（时间戳跨上游
+平移，不会回退）。注册中心会记录每个节点的活跃观看数，查询时按负载
+排序；边缘副本按 `hops` 登记，`-discovery-max-hops`（默认 1）限制级联
+深度，避免拓扑无限加深。
+
+```bash
+# 推流源：上报自己的 RTSP/RTMP 地址（RTMP 基础地址带 app 路径）
+./flow -node-id origin \
+       -advertise rtsp://10.0.0.5:8554,rtmp://10.0.0.5:1935/live \
+       -discovery-url http://registry:7000
+
+# 边缘节点：本地没有的流直接从发现到的节点拉，失败时自动切换
+./flow -node-id edge-b \
+       -advertise rtsp://10.0.0.6:8554,rtmp://10.0.0.6:1935/live \
+       -discovery-url http://registry:7000 \
+       -discovery-mode proxy
+
+# 客户端始终连边缘节点；节点 A 宕机后连接保持并恢复出帧
+ffplay rtsp://10.0.0.6:8554/live/demo
+```
+
+`redirect`（默认）只做 RTSP 302，边缘不承担带宽；`proxy` 适用于 RTMP 和
+HTTP-FLV（它们无法跟随 302），代价是媒体经过边缘节点。代理模式下
+`-advertise` 可以省略（纯消费节点），但这样不会成为其他节点的候选。
 
 从摄像头推实时 H.264（`-live` 表示从 stdin 读 Annex-B 裸流）：
 

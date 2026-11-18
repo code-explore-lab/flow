@@ -272,6 +272,58 @@ func TestEnsureRelaysRTSP(t *testing.T) {
 	readIDR(t, rd)
 }
 
+// TestEnsureRelaysRTSPAudio 上游同时有音视频轨时两条轨都要转发。
+// 回归：第二次 SETUP 不带 Session 时上游会新建会话，PLAY 只启动第一个
+// 轨所在会话，音频静默丢失（下游能播放但一直等不到音频帧）。
+func TestEnsureRelaysRTSPAudio(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	upReg := stream.NewRegistry()
+	up := rtsp.New(nil, nil, true)
+	up.SetRegistry(upReg)
+	addr := freeAddr(t)
+	go func() { _ = up.Serve(ctx, addr) }()
+	waitDial(t, addr)
+
+	ust := publishUpstream(t, upReg, "live/src")
+	ust.SetAudioCodec(stream.AudioPCMA, nil, 8000, 1, 8000)
+	streamFrames(t, ust)
+	audioSrc := ust.SourceFor("audio")
+	if audioSrc == nil {
+		t.Fatal("upstream has no audio source")
+	}
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		ts := uint32(0)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			audioSrc.Write(source.Frame{Data: []byte{0xd5, 0x00}, Timestamp: ts, Keyframe: true})
+			ts += 160
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	edgeReg := stream.NewRegistry()
+	specs, err := ParseSpecs("rtsp://" + addr + "/live")
+	if err != nil {
+		t.Fatalf("ParseSpecs: %v", err)
+	}
+	m := newTestManager(ctx, edgeReg, specs, 3*time.Second)
+
+	st := m.Ensure(ctx, "live/src")
+	checkRelayed(t, edgeReg, "live/src", st)
+
+	rd, cancelSub := st.SourceFor("audio").Subscribe()
+	defer cancelSub()
+	awaitFrame(t, rd, 5*time.Second, "audio frame", func(source.Frame) bool { return true })
+}
+
 // TestEnsureReconnectsRTSP 上游连接断开后 puller 按退避重连，本地流不被关闭，
 // 下游继续收到帧且时间戳保持单调；ctx 取消后流注销、下游读到结束。
 func TestEnsureReconnectsRTSP(t *testing.T) {

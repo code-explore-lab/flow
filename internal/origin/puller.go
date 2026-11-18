@@ -27,9 +27,8 @@ const (
 // 所有字段中的 st/ready/failed 在构造后不再替换，protocol 状态时钟也只由
 // run 所在的 goroutine 访问，因此只有 ready/failed 的关闭需要 Once。
 type Puller struct {
-	mgr   *Manager
-	name  string // 本地流名
-	specs []Spec // 该流适用的模板，按显式 → 通配排序
+	mgr  *Manager
+	name string // 本地流名
 
 	st     *stream.Stream
 	ready  chan struct{}
@@ -47,7 +46,7 @@ type Puller struct {
 	rtspAudio tsClock
 }
 
-func newPuller(m *Manager, name string, specs []Spec) *Puller {
+func newPuller(m *Manager, name string) *Puller {
 	st := &stream.Stream{Name: name}
 	// S-3：回源流由 puller 自己的退避重连维护，上游断线期间下游仍要
 	// 继续等帧，不能被本地 janitor 当空闲流摘掉。
@@ -55,7 +54,6 @@ func newPuller(m *Manager, name string, specs []Spec) *Puller {
 	return &Puller{
 		mgr:    m,
 		name:   name,
-		specs:  specs,
 		st:     st,
 		ready:  make(chan struct{}),
 		failed: make(chan struct{}),
@@ -150,11 +148,13 @@ func (p *Puller) run(ctx context.Context) {
 	}
 }
 
-// tryOnce 按模板顺序尝试一次。任一模板成功播过（played）就直接返回；
-// 全部失败时返回最后一个错误，"不存在" 信号优先保留。
+// tryOnce 按本次解析出的地址顺序尝试一次。发现服务的结果排在静态模板
+// 之前，任一模板成功播过（played）就直接返回；全部失败时返回最后一个
+// 错误，"不存在" 信号优先保留。
 func (p *Puller) tryOnce(ctx context.Context) (bool, error) {
+	specs := p.mgr.specsFor(ctx, p.name)
 	var lastErr error
-	for _, spec := range p.specs {
+	for _, spec := range specs {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
@@ -177,6 +177,9 @@ func (p *Puller) dial(ctx context.Context, spec Spec) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("parse %q: %w", raw, err)
 	}
+	// S-2：在建立连接时记录上游拓扑，重连后 announcer 上报的是新上游。
+	// 静态回源模板没有拓扑信息，保持 (0, "") 的推流源身份。
+	p.st.SetDiscoveryMeta(spec.Hops, spec.Upstream)
 	switch spec.Scheme {
 	case "rtmp":
 		p.rtmpClock.newConn()

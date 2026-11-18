@@ -1,8 +1,10 @@
 package origin
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSpecsWildcard(t *testing.T) {
@@ -79,6 +81,69 @@ func TestParseSpecsExplicitFillsDefaultPort(t *testing.T) {
 	}
 	if specs[0].Raw != "rtmp://h:1935/live/src" {
 		t.Errorf("Raw = %q, want default port added", specs[0].Raw)
+	}
+}
+
+// TestSpecFromURL S-2：发现服务返回的完整播放地址要能直接转成回源 Spec。
+func TestSpecFromURL(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want Spec
+	}{
+		{
+			"rtsp://10.0.0.5/live/x",
+			Spec{Scheme: "rtsp", Host: "10.0.0.5:554", Base: "live/x", Raw: "rtsp://10.0.0.5:554/live/x"},
+		},
+		{
+			"rtmp://10.0.0.5:1935/live/x?token=abc",
+			Spec{Scheme: "rtmp", Host: "10.0.0.5:1935", Base: "live/x",
+				Raw: "rtmp://10.0.0.5:1935/live/x?token=abc", Query: "token=abc"},
+		},
+		{
+			"http://10.0.0.5:8080/live/x",
+			Spec{Scheme: "http", Host: "10.0.0.5:8080", Base: "live/x.flv",
+				Raw: "http://10.0.0.5:8080/live/x.flv"},
+		},
+		{
+			"http://10.0.0.5:8080/live/x.flv",
+			Spec{Scheme: "http", Host: "10.0.0.5:8080", Base: "live/x.flv",
+				Raw: "http://10.0.0.5:8080/live/x.flv"},
+		},
+	}
+	for _, c := range cases {
+		got, err := SpecFromURL(c.raw)
+		if err != nil {
+			t.Errorf("SpecFromURL(%q): %v", c.raw, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("SpecFromURL(%q) = %+v, want %+v", c.raw, got, c.want)
+		}
+	}
+	for _, raw := range []string{"ftp://h/x", "rtsp://", "://bad"} {
+		if _, err := SpecFromURL(raw); err == nil {
+			t.Errorf("SpecFromURL(%q) succeeded, want error", raw)
+		}
+	}
+}
+
+// TestSpecsForPrefersDiscovery 发现服务的结果排在静态模板之前；没有静态
+// 模板时也有来源（hasSources 只看是否配置了 locator）。
+func TestSpecsForPrefersDiscovery(t *testing.T) {
+	specs, err := ParseSpecs("rtmp://static/live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(context.Background(), nil, nil, specs, time.Second)
+	dyn := Spec{Scheme: "rtsp", Host: "10.0.0.5:554", Raw: "rtsp://10.0.0.5:554/live/src"}
+	m.SetLocator(func(context.Context, string) []Spec { return []Spec{dyn} })
+
+	got := m.specsFor(context.Background(), "src")
+	if len(got) != 2 || got[0].Raw != dyn.Raw || got[1].Scheme != "rtmp" {
+		t.Fatalf("specsFor = %+v, want discovered first then static", got)
+	}
+	if !m.hasSources("anything") {
+		t.Fatal("hasSources = false with a locator configured")
 	}
 }
 

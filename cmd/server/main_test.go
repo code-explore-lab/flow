@@ -64,7 +64,7 @@ func TestDiscoveryFinderSkipsSelf(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f := discoveryFinder{client: self}
+	f := discoveryFinder{client: self, self: "node-a", maxHops: 1}
 	if _, ok := f.Find(ctx, "live/self"); ok {
 		t.Fatal("finder redirected to the local node")
 	}

@@ -152,17 +152,24 @@ func Pull(ctx context.Context, o PullOptions) (played bool, err error) {
 
 		rtpCh, rtcpCh := nextCh, nextCh+1
 		nextCh += 2
-		resp, err := c.request("SETUP", setupURL(base, at), [][2]string{
+		hdrs := [][2]string{
 			{"Transport", fmt.Sprintf("RTP/AVP/TCP;unicast;interleaved=%d-%d", rtpCh, rtcpCh)},
-		})
+		}
+		// 后续 SETUP 必须带回第一次的 Session（RFC 2326 §12.37），
+		// 否则上游会再建一个会话，PLAY 只启动第一个轨所在会话——
+		// 上游是 flow 自身时音频轨就这样静默丢失。
+		if session != "" {
+			hdrs = append(hdrs, [2]string{"Session", session})
+		}
+		resp, err := c.request("SETUP", setupURL(base, at), hdrs)
 		if err != nil {
 			return false, fmt.Errorf("SETUP %s: %w", at.Control, err)
 		}
 		if resp.code() != 200 {
 			return false, fmt.Errorf("SETUP %s: %s", at.Control, resp.status)
 		}
-		if session == "" {
-			session = sessionID(resp.headers["session"])
+		if sid := sessionID(resp.headers["session"]); sid != "" {
+			session = sid
 		}
 		// 上游可能调整通道号，以响应里的 Transport 为准。
 		if _, inter, _, err := extractTransportInfo(resp.headers["transport"]); err == nil && inter != "" {

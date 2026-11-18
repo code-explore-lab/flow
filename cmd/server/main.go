@@ -101,6 +101,10 @@ func main() {
 	discoveryTTL := flag.Duration("discovery-ttl", discovery.DefaultTTL, "S-3: lease TTL; nodes renew every TTL/3")
 	discoveryTimeout := flag.Duration("discovery-timeout", 750*time.Millisecond, "S-3: per-request discovery lookup timeout")
 	streamIdle := flag.Duration("stream-idle", stream.DefaultIdleTimeout, "S-3: unpublish streams with no media for this long (0 disables)")
+	// S-2：边缘分发。redirect 只回 302；proxy 直接用发现结果回源，上游
+	// 宕机后由本节点的 puller 切换，下游连接不中断。
+	discoveryMode := flag.String("discovery-mode", "redirect", "S-2: redirect (RTSP 302) or proxy (edge pulls from the owning node)")
+	discoveryMaxHops := flag.Int("discovery-max-hops", 1, "S-2: maximum relay hops used/advertised (0 = publisher only)")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -196,6 +200,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -discovery-timeout (must be > 0)")
 		os.Exit(2)
 	}
+	if *discoveryMode != "redirect" && *discoveryMode != "proxy" {
+		fmt.Fprintf(os.Stderr, "invalid -discovery-mode %q (want redirect or proxy)\n", *discoveryMode)
+		os.Exit(2)
+	}
+	if *discoveryMaxHops < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -discovery-max-hops (must be >= 0)")
+		os.Exit(2)
+	}
 	node := strings.TrimSpace(*nodeID)
 	if node == "" {
 		node, _ = os.Hostname()
@@ -210,13 +222,18 @@ func main() {
 			os.Exit(2)
 		}
 		if strings.TrimSpace(*advertise) == "" {
-			fmt.Fprintln(os.Stderr, "-discovery-url requires -advertise (e.g. rtsp://10.0.0.5:8554)")
-			os.Exit(2)
-		}
-		advertiseMap, err = discovery.ParseAdvertise(*advertise)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
+			// 纯边缘代理可以只消费发现结果、不上报；redirect 模式必须
+			// 告诉注册中心客户端该连哪里。
+			if *discoveryMode == "redirect" {
+				fmt.Fprintln(os.Stderr, "-discovery-url requires -advertise in redirect mode (e.g. rtsp://10.0.0.5:8554)")
+				os.Exit(2)
+			}
+		} else {
+			advertiseMap, err = discovery.ParseAdvertise(*advertise)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
 		}
 	}
 
@@ -328,27 +345,43 @@ func main() {
 	rtmpRate := access.NewRateLimiter(*connRate, *connBurst)
 	authBackoff := access.NewBackoff(*backoffThreshold, *backoffBase, *backoffMax)
 
-	// S-1：按需回源管理器。没有配置 -origin 时保持 nil，三个服务端都
-	// 不会调用 Ensure（保持原有 404/本地回退行为）。
-	var originMgr *origin.Manager
-	if len(originSpecs) > 0 {
-		originMgr = origin.NewManager(ctx, reg, flowMetrics, originSpecs, *originTimeout)
-		fmt.Printf("origin: %d template(s), wait up to %s for first media\n",
-			len(originSpecs), *originTimeout)
-	}
-
-	// S-3：把本地正在出帧的流按 TTL 租约登记到发现服务。整批心跳的语义
-	// 是「本节点当前持有这些流」，源主动下线时一次心跳内即被清除；节点
-	// 进程消失则由 TTL 过期兜底。
+	// S-3/S-2：先建发现客户端，S-2 的代理回源要用它解析上游节点。
 	var discoveryClient *discovery.Client
 	if *discoveryURL != "" {
 		discoveryClient = discovery.NewClient(*discoveryURL, node, *discoveryTTL)
 		discoveryClient.SetTimeout(*discoveryTimeout)
+	}
+
+	// S-1：按需回源管理器。配置了 -origin 或 S-2 代理发现时创建；
+	// 其余情况保持 nil，服务端走原有 404/本地回退行为。
+	var originMgr *origin.Manager
+	if len(originSpecs) > 0 || (discoveryClient != nil && *discoveryMode == "proxy") {
+		originMgr = origin.NewManager(ctx, reg, flowMetrics, originSpecs, *originTimeout)
+		if discoveryClient != nil && *discoveryMode == "proxy" {
+			originMgr.SetLocator(discoveryLocator{
+				client:  discoveryClient,
+				self:    node,
+				maxHops: *discoveryMaxHops,
+			}.Specs)
+		}
+		fmt.Printf("origin: %d template(s), discovery proxy=%v, wait up to %s for first media\n",
+			len(originSpecs), discoveryClient != nil && *discoveryMode == "proxy", *originTimeout)
+	}
+
+	// S-3：把本地正在出帧的流按 TTL 租约登记到发现服务。整批心跳的语义
+	// 是「本节点当前持有这些流」，源主动下线时一次心跳内即被清除；节点
+	// 进程消失则由 TTL 过期兜底。S-2 代理模式可以只消费不上报。
+	if discoveryClient != nil && len(advertiseMap) > 0 {
 		announcer := discovery.NewAnnouncer(discoveryClient, reg, advertiseMap,
 			*discoveryTTL/3, stream.DefaultActiveWindow)
+		announcer.SetLoad(flowMetrics.ActiveViewers)
+		announcer.SetMaxHops(*discoveryMaxHops)
 		go announcer.Run(ctx)
 		fmt.Printf("discovery: node %q advertising %d protocol(s) to %s, heartbeat %s, ttl %s\n",
 			node, len(advertiseMap), *discoveryURL, announcer.Interval(), *discoveryTTL)
+	} else if discoveryClient != nil {
+		fmt.Printf("discovery: node %q consuming %s in %s mode (not advertising)\n",
+			node, *discoveryURL, *discoveryMode)
 	}
 
 	rtspSrv := rtsp.New(video, audio, *live)
@@ -367,9 +400,14 @@ func main() {
 	if originMgr != nil {
 		rtspSrv.SetOrigin(originMgr)
 	}
-	// S-3：本地没有的流先查发现服务，命中后回 302（D-1 语义）。
-	if discoveryClient != nil {
-		rtspSrv.SetDiscovery(discoveryFinder{client: discoveryClient})
+	// S-3/S-2：redirect 模式下本地没有的流先查发现服务，命中后回 302
+	// （D-1 语义）；proxy 模式由上面的 origin locator 直接回源，不再 302。
+	if discoveryClient != nil && *discoveryMode == "redirect" {
+		rtspSrv.SetDiscovery(discoveryFinder{
+			client:  discoveryClient,
+			self:    node,
+			maxHops: *discoveryMaxHops,
+		})
 		rtspSrv.SetDiscoveryTimeout(*discoveryTimeout)
 	}
 	// 切换basic / digest认证
@@ -479,26 +517,60 @@ func main() {
 	wg.Wait()
 }
 
-// discoveryFinder 把发现服务客户端适配成 rtsp.StreamFinder。
-// 指向本节点的条目直接忽略，避免客户端在两个地址之间来回重定向。
+// discoveryFinder 把发现服务客户端适配成 rtsp.StreamFinder（S-3/S-2）。
+// 在全部候选里按负载选一个，并忽略本节点和会让拓扑成环的条目。
 type discoveryFinder struct {
-	client *discovery.Client
+	client  *discovery.Client
+	self    string
+	maxHops int
 }
 
 func (f discoveryFinder) Find(ctx context.Context, name string) (string, bool) {
-	entry, ok, err := f.client.Lookup(ctx, name)
-	if err != nil || !ok {
-		return "", false
-	}
-	if entry.Node == f.client.Node() {
+	entries, err := f.client.LookupAll(ctx, name)
+	if err != nil || len(entries) == 0 {
 		return "", false
 	}
 	for _, scheme := range []string{"rtsp", "rtsps"} {
-		if u := entry.URL(scheme); u != "" {
-			return u, true
+		if e, ok := discovery.Pick(entries, f.self, scheme, f.maxHops); ok {
+			return e.URL(scheme), true
 		}
 	}
 	return "", false
+}
+
+// discoveryLocator 把注册中心的候选转成 S-1 回源用的 Spec 列表（S-2）。
+// 每个节点取一个可拉的协议地址（rtsp > rtmp > http），整体按负载排序；
+// Hops/Upstream 会由 puller 写回本地流，announcer 据此上报副本拓扑。
+type discoveryLocator struct {
+	client  *discovery.Client
+	self    string
+	maxHops int
+}
+
+func (l discoveryLocator) Specs(ctx context.Context, name string) []origin.Spec {
+	entries, err := l.client.LookupAll(ctx, name)
+	if err != nil {
+		// 发现服务不可用不应阻塞回源：静态 -origin 模板仍可兜底。
+		return nil
+	}
+	var out []origin.Spec
+	for _, e := range discovery.PickAll(entries, l.self, l.maxHops) {
+		for _, scheme := range []string{"rtsp", "rtmp", "http"} {
+			u := e.URL(scheme)
+			if u == "" {
+				continue
+			}
+			spec, err := origin.SpecFromURL(u)
+			if err != nil {
+				continue
+			}
+			spec.Hops = e.Hops + 1
+			spec.Upstream = e.Node
+			out = append(out, spec)
+			break
+		}
+	}
+	return out
 }
 
 // envOrFlag 返回命令行 flag 值，为空时回退到环境变量。

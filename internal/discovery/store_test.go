@@ -100,6 +100,92 @@ func TestStoreConflictWithLiveOwner(t *testing.T) {
 	}
 }
 
+// TestStoreMultiProviderAndPick S-2：推流源与边缘副本可以同时登记，
+// 选择器按负载排序，并能按跳数和反向边过滤。
+func TestStoreMultiProviderAndPick(t *testing.T) {
+	now := time.Unix(1000, 0)
+	s := NewStore(10 * time.Second)
+	s.SetClock(fixedClock(&now))
+
+	s.RegisterBatch("node-a", []Stream{{
+		Name: "live/x", URLs: map[string]string{"rtsp": "rtsp://a/live/x"},
+		Hops: 0, Load: 9,
+	}}, 10*time.Second)
+	for _, tc := range []struct {
+		node string
+		load int
+	}{
+		{"node-b", 2},
+		{"node-c", 5},
+	} {
+		res := s.RegisterBatch(tc.node, []Stream{{
+			Name: "live/x", URLs: map[string]string{"rtsp": "rtsp://" + tc.node + "/live/x"},
+			Hops: 1, Upstream: "node-a", Load: tc.load,
+		}}, 10*time.Second)
+		if len(res.Registered) != 1 || len(res.Conflicts) != 0 {
+			t.Fatalf("%s heartbeat result = %+v", tc.node, res)
+		}
+	}
+
+	cands := s.Candidates("live/x")
+	if len(cands) != 3 {
+		t.Fatalf("candidates = %+v, want 3 providers", cands)
+	}
+	if cands[0].Node != "node-b" || cands[1].Node != "node-c" || cands[2].Node != "node-a" {
+		t.Fatalf("candidate order = %q,%q,%q; want by load b,c,a",
+			cands[0].Node, cands[1].Node, cands[2].Node)
+	}
+
+	// maxHops=1 排除不了任何人（副本就是 1 跳）；maxHops=0 只剩推流源。
+	if e, ok := Pick(cands, "", "rtsp", 1); !ok || e.Node != "node-b" {
+		t.Fatalf("Pick(maxHops=1) = %+v, ok=%v; want node-b", e, ok)
+	}
+	if e, ok := Pick(cands, "", "rtsp", 0); !ok || e.Node != "node-a" {
+		t.Fatalf("Pick(maxHops=0) = %+v, ok=%v; want node-a", e, ok)
+	}
+	// 本节点自己不能当候选。
+	if e, ok := Pick(cands, "node-b", "rtsp", 1); !ok || e.Node != "node-c" {
+		t.Fatalf("Pick(self=node-b) = %+v, ok=%v; want node-c", e, ok)
+	}
+}
+
+// TestStoreConflictOnlyBetweenPublishers 两个推流源仍然互斥，副本不与源
+// 冲突；这是 S-2 多副本的前提，同时保留 S-3 的防双写语义。
+func TestStoreConflictOnlyBetweenPublishers(t *testing.T) {
+	now := time.Unix(1000, 0)
+	s := NewStore(10 * time.Second)
+	s.SetClock(fixedClock(&now))
+
+	s.RegisterBatch("node-a", []Stream{{
+		Name: "live/x", URLs: map[string]string{"rtsp": "rtsp://a/live/x"},
+	}}, 10*time.Second)
+	res := s.RegisterBatch("node-b", []Stream{{
+		Name: "live/x", URLs: map[string]string{"rtsp": "rtsp://b/live/x"},
+		Hops: 1, Upstream: "node-a",
+	}}, 10*time.Second)
+	if len(res.Conflicts) != 0 || len(res.Registered) != 1 {
+		t.Fatalf("relay heartbeat = %+v, want registered", res)
+	}
+	res = s.RegisterBatch("node-c", []Stream{{
+		Name: "live/x", URLs: map[string]string{"rtsp": "rtsp://c/live/x"},
+	}}, 10*time.Second)
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("second publisher = %+v, want conflict", res)
+	}
+}
+
+// TestPickSkipsReverseEdge 反向边（对方的上游就是本节点）不能作为候选，
+// 否则两个边缘会互相回源形成环。
+func TestPickSkipsReverseEdge(t *testing.T) {
+	entries := []Entry{{
+		Name: "live/x", Node: "node-b", Hops: 1, Upstream: "node-a",
+		URLs: map[string]string{"rtsp": "rtsp://b/live/x"},
+	}}
+	if e, ok := Pick(entries, "node-a", "rtsp", 2); ok {
+		t.Fatalf("Pick returned reverse edge %+v", e)
+	}
+}
+
 func TestStoreUnregisterOwnership(t *testing.T) {
 	s := NewStore(time.Second)
 	s.RegisterBatch("node-a", testStreams("live/x"), time.Second)

@@ -43,6 +43,45 @@ type Spec struct {
 	// RTSP URL 里的 user:pass。显式映射已把它们保存在 Raw 里。
 	Query string
 	User  *url.Userinfo
+
+	// S-2：从发现服务解析出的上游会带上来源节点的拓扑信息。静态 -origin
+	// 模板保持 (0, "")，视为推流源。
+	Hops     int
+	Upstream string
+}
+
+// SpecFromURL 把一个完整的播放地址转成回源用的 Spec。用于 S-2 把发现
+// 服务返回的候选地址交给 puller；支持 origin 能拉的 rtsp/rtmp/http。
+func SpecFromURL(raw string) (Spec, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return Spec{}, fmt.Errorf("parse %q: %w", raw, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if _, ok := defaultPorts[scheme]; !ok {
+		return Spec{}, fmt.Errorf("unsupported scheme %q in %q (want rtsp, rtmp or http)", u.Scheme, raw)
+	}
+	if u.Host == "" {
+		return Spec{}, fmt.Errorf("missing host in %q", raw)
+	}
+
+	explicit := *u
+	explicit.Scheme = scheme
+	if explicit.Port() == "" {
+		explicit.Host = net.JoinHostPort(explicit.Hostname(), defaultPorts[scheme])
+	}
+	if scheme == "http" && !strings.HasSuffix(strings.ToLower(explicit.Path), ".flv") {
+		explicit.Path += ".flv"
+	}
+	explicit.RawPath = ""
+	return Spec{
+		Scheme: scheme,
+		Host:   explicit.Host,
+		Base:   strings.Trim(explicit.Path, "/"),
+		Raw:    explicit.String(),
+		Query:  explicit.RawQuery,
+		User:   explicit.User,
+	}, nil
 }
 
 // ParseSpecs 解析逗号分隔的 -origin 配置。空串返回 nil。
@@ -115,9 +154,10 @@ func parseSpec(item string) (Spec, error) {
 	return Spec{Scheme: scheme, Host: host, Base: base, Query: u.RawQuery, User: u.User}, nil
 }
 
-// urlFor 生成本地流名 name 的上游 URL。显式映射忽略 name。
+// urlFor 生成本地流名 name 的上游 URL。显式映射和发现服务给出的完整
+// 地址（Raw 非空）都忽略 name。
 func (s Spec) urlFor(name string) string {
-	if s.Local != "" {
+	if s.Raw != "" {
 		return s.Raw
 	}
 	streamName := s.streamName(name)

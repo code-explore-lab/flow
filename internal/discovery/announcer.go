@@ -36,6 +36,10 @@ type Announcer struct {
 	interval     time.Duration
 	activeWindow time.Duration
 
+	// S-2：心跳里附带节点负载，且只广告不超过 maxHops 的副本。
+	load    func() int
+	maxHops int
+
 	dirty chan struct{}
 
 	mu        sync.Mutex
@@ -70,15 +74,28 @@ func NewAnnouncer(client *Client, reg *stream.Registry, advertise map[string]str
 	if reg != nil {
 		// Observer 必须非阻塞，这里只投递一个信号；真正的收集/发送
 		// 在 Run 的 goroutine 里做。
-		a := &Announcer{client: client, reg: reg, advertise: cp, interval: interval, activeWindow: activeWindow, dirty: make(chan struct{}, 1)}
+		a := &Announcer{client: client, reg: reg, advertise: cp, interval: interval, activeWindow: activeWindow, maxHops: 1, dirty: make(chan struct{}, 1)}
 		reg.SetObserver(a.onEvent)
 		return a
 	}
-	return &Announcer{client: client, advertise: cp, interval: interval, activeWindow: activeWindow, dirty: make(chan struct{}, 1)}
+	return &Announcer{client: client, advertise: cp, interval: interval, activeWindow: activeWindow, maxHops: 1, dirty: make(chan struct{}, 1)}
 }
 
 // Interval 返回心跳间隔（测试/日志用）。
 func (a *Announcer) Interval() time.Duration { return a.interval }
+
+// SetLoad 设置节点负载来源（通常是 /metrics 里的活跃观看数）。nil 表示
+// 统一上报 0。可在 Run 之前调用。
+func (a *Announcer) SetLoad(fn func() int) { a.load = fn }
+
+// SetMaxHops 设置广告的最大级联跳数：`hops > n` 的副本不再上报，避免
+// 拓扑无限加深。n < 0 按 0 处理（只广告推流源）。可在 Run 之前调用。
+func (a *Announcer) SetMaxHops(n int) {
+	if n < 0 {
+		n = 0
+	}
+	a.maxHops = n
+}
 
 func (a *Announcer) onEvent(stream.Event, string, *stream.Stream) {
 	select {
@@ -150,10 +167,19 @@ func (a *Announcer) collect() []Stream {
 	if len(a.advertise) == 0 {
 		return nil
 	}
+	load := 0
+	if a.load != nil {
+		load = a.load()
+	}
 	snap := a.reg.Snapshot()
 	out := make([]Stream, 0, len(snap))
 	for _, ns := range snap {
 		if !ns.Stream.Active(a.activeWindow) {
+			continue
+		}
+		hops, upstream := ns.Stream.DiscoveryMeta()
+		if hops > a.maxHops {
+			// 超过级联深度上限：本机仍有流可播，但不再把别的边缘引过来。
 			continue
 		}
 		urls := make(map[string]string, len(a.advertise))
@@ -165,7 +191,13 @@ func (a *Announcer) collect() []Stream {
 		if len(urls) == 0 {
 			continue
 		}
-		out = append(out, Stream{Name: ns.Name, URLs: urls})
+		out = append(out, Stream{
+			Name:     ns.Name,
+			URLs:     urls,
+			Hops:     hops,
+			Upstream: upstream,
+			Load:     load,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -187,6 +219,7 @@ func (a *Announcer) logf(format string, args ...any) {
 }
 
 // joinStreamURL 在基础地址后拼接流名，保留流名里的路径层级。
+// HTTP-FLV 的播放地址必须带 .flv 后缀，其余协议原样拼接。
 func joinStreamURL(base, name string) string {
 	name = strings.Trim(name, "/")
 	if name == "" {
@@ -197,6 +230,11 @@ func joinStreamURL(base, name string) string {
 		return strings.TrimRight(base, "/") + "/" + name
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/" + name
+	if (u.Scheme == "http" || u.Scheme == "https") && !strings.HasSuffix(strings.ToLower(u.Path), ".flv") {
+		u.Path += ".flv"
+	}
 	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
 	return u.String()
 }

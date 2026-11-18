@@ -101,6 +101,15 @@ func (r *Registry) DecSession() {
 	r.sessions.Add(-1)
 }
 
+// ActiveViewers 返回当前活跃的观看端数量（RTSP 会话 + RTMP/HTTP-FLV
+// 播放）。S-2 用它作为节点负载，供发现服务做简单的负载均衡。
+func (r *Registry) ActiveViewers() int {
+	if r == nil {
+		return 0
+	}
+	return int(r.sessions.Load() + r.plays.Load())
+}
+
 // IncSessionTotal 累计创建过的 RTSP 会话数。
 func (r *Registry) IncSessionTotal() {
 	if r == nil {

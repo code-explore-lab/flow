@@ -84,6 +84,47 @@ func (c *Client) Lookup(ctx context.Context, name string) (Entry, bool, error) {
 	}
 }
 
+// LookupAll 返回一路流的全部候选 provider（S-2 负载均衡/代理）。
+// 未登记或租约过期返回 nil 和 nil error。
+func (c *Client) LookupAll(ctx context.Context, name string) ([]Entry, error) {
+	name = strings.Trim(strings.TrimSpace(name), "/")
+	if name == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(c.streamURL(name))
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("all", "1")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out struct {
+			Streams []Entry `json:"streams"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&out); err != nil {
+			return nil, fmt.Errorf("discovery lookup all %q: %w", name, err)
+		}
+		return out.Streams, nil
+	case http.StatusNotFound:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("discovery lookup all %q: HTTP %d: %s",
+			name, resp.StatusCode, readSnippet(resp.Body))
+	}
+}
+
 // Heartbeat 发送一次整批心跳。streams 为空时表示本节点此刻没有任何
 // 可广告的流，注册中心会清空该节点的租约。
 func (c *Client) Heartbeat(ctx context.Context, streams []Stream) (BatchResult, error) {

@@ -185,6 +185,12 @@ type Stream struct {
 	// 保留，下游继续等帧，不能因为暂时没有媒体写入就被摘掉。
 	idleExempt atomic.Bool
 
+	// S-2：发现服务上报的副本元数据。hops 是从推流源算起的级联跳数
+	// （0 表示本机就是推流源），upstream 是当前拉流的上游节点 ID。
+	// 由回源 puller 在每次连接成功后写入，announcer 读取。
+	discoveryHops     atomic.Int32
+	discoveryUpstream atomic.Value // string
+
 	mu sync.Mutex
 }
 
@@ -482,6 +488,23 @@ func (s *Stream) SetIdleExempt(v bool) { s.idleExempt.Store(v) }
 
 // IdleExempt 报告这条流是否豁免空闲回收。
 func (s *Stream) IdleExempt() bool { return s.idleExempt.Load() }
+
+// SetDiscoveryMeta 记录这条流在发现拓扑里的位置（S-2）。hops 是从推流源
+// 算起的级联跳数，upstream 是当前拉流的上游节点 ID。推流端的本地流保持
+// 默认值 (0, "")。
+func (s *Stream) SetDiscoveryMeta(hops int, upstream string) {
+	if hops < 0 {
+		hops = 0
+	}
+	s.discoveryHops.Store(int32(hops))
+	s.discoveryUpstream.Store(upstream)
+}
+
+// DiscoveryMeta 返回发现拓扑元数据；未设置时返回 (0, "")。
+func (s *Stream) DiscoveryMeta() (int, string) {
+	upstream, _ := s.discoveryUpstream.Load().(string)
+	return int(s.discoveryHops.Load()), upstream
+}
 
 // NamedStream 是 Snapshot 返回的一条登记项。
 type NamedStream struct {

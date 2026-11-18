@@ -36,6 +36,57 @@ func TestAnnouncerCollect(t *testing.T) {
 	}
 }
 
+// TestAnnouncerCollectS2Metadata 心跳要带上副本的 hops/upstream 与节点
+// 负载，HTTP-FLV 的播放地址要补 .flv 后缀。
+func TestAnnouncerCollectS2Metadata(t *testing.T) {
+	reg := stream.NewRegistry()
+	c := NewClient("http://example.invalid", "node-a", 5*time.Second)
+	a := NewAnnouncer(c, reg, map[string]string{
+		"http": "http://10.0.0.1:8080",
+	}, time.Second, time.Second)
+	a.SetLoad(func() int { return 7 })
+	a.SetMaxHops(1)
+
+	st := &stream.Stream{}
+	if _, err := reg.Publish("live/x", st); err != nil {
+		t.Fatal(err)
+	}
+	st.EnsureVideo().Src.Write(source.Frame{Data: []byte{0x65}, Timestamp: 0})
+	st.SetDiscoveryMeta(1, "node-origin")
+
+	got := a.collect()
+	if len(got) != 1 {
+		t.Fatalf("collect = %+v", got)
+	}
+	if got[0].Hops != 1 || got[0].Upstream != "node-origin" || got[0].Load != 7 {
+		t.Fatalf("metadata = hops %d upstream %q load %d", got[0].Hops, got[0].Upstream, got[0].Load)
+	}
+	if want := "http://10.0.0.1:8080/live/x.flv"; got[0].URLs["http"] != want {
+		t.Fatalf("http url = %q, want %q", got[0].URLs["http"], want)
+	}
+}
+
+// TestAnnouncerCollectSkipsDeepRelay 超过 -discovery-max-hops 的副本不再
+// 上报，防止级联拓扑无限加深。
+func TestAnnouncerCollectSkipsDeepRelay(t *testing.T) {
+	reg := stream.NewRegistry()
+	c := NewClient("http://example.invalid", "node-a", 5*time.Second)
+	a := NewAnnouncer(c, reg, map[string]string{"rtsp": "rtsp://10.0.0.1:8554"},
+		time.Second, time.Second)
+	a.SetMaxHops(1)
+
+	st := &stream.Stream{}
+	if _, err := reg.Publish("live/x", st); err != nil {
+		t.Fatal(err)
+	}
+	st.EnsureVideo().Src.Write(source.Frame{Data: []byte{0x65}, Timestamp: 0})
+	st.SetDiscoveryMeta(2, "node-edge")
+
+	if got := a.collect(); len(got) != 0 {
+		t.Fatalf("collect advertised hop-2 relay: %+v", got)
+	}
+}
+
 func TestAnnouncerCollectSkipsInactive(t *testing.T) {
 	reg := stream.NewRegistry()
 	c := NewClient("http://example.invalid", "node-a", 5*time.Second)

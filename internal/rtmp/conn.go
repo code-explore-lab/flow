@@ -73,11 +73,6 @@ type Conn struct {
 	// fourCCs 是 connect 命令里客户端声明的 fourCcList（Enhanced RTMP）。
 	// nil 表示客户端没声明，按支持 HEVC 的新客户端处理。
 	fourCCs []string
-
-	// beforeMedia 可选：RTMP client（T-9 回源）在把媒体消息交给推流处理器
-	// 之前做时间戳单调化——上游重连后时间戳会从 0 重新计时，直接透传会让
-	// RTSP 的 RTP 时间戳倒退。服务端连接保持 nil。
-	beforeMedia func(*Message)
 }
 
 // countingReader 统计底层连接读到的字节总数，用于周期性回 Ack。
@@ -213,23 +208,13 @@ func (c *Conn) dispatch(m *Message) error {
 	case msgCommandAMF0:
 		return c.handleCommand(m)
 	case msgVideo:
-		if c.beforeMedia != nil {
-			c.beforeMedia(m)
-		}
 		c.handleVideo(m)
 	case msgAudio:
-		if c.beforeMedia != nil {
-			c.beforeMedia(m)
-		}
 		c.handleAudio(m)
 	case msgDataAMF0:
 		c.handleData(m)
 	case msgAggregate:
-		// T-7：聚合消息拆成子消息后按普通消息处理。整体平移外层时间戳
-		// 时，子消息会按 splitAggregate 的相对偏移一起平移。
-		if c.beforeMedia != nil {
-			c.beforeMedia(m)
-		}
+		// T-7：聚合消息拆成子消息后按普通消息处理。
 		return c.handleAggregate(m)
 	default:
 		// msgDataAMF3(15)、msgCommandAMF3(17) 等不支持的 AMF3 消息

@@ -55,6 +55,12 @@ type Server struct {
 
 	// T-7：connect 时向对端通告的 chunk size。0 表示用 connectChunkSize。
 	chunkSize uint32
+
+	// S-1：按需回源。接口定义在本包，cmd/server 注入 origin.Manager，
+	// 避免 rtmp → origin 的 import 环。
+	originMu  sync.RWMutex
+	origin    OriginResolver
+	originCtx context.Context
 }
 
 // New 构造一个 RTMP 服务器。reg 为 nil 时自建一份；video/audio 可以为 nil
@@ -151,6 +157,7 @@ const tlsHandshakeTimeout = 10 * time.Second
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
 // 返回的错误只有监听失败这一种（Accept 错误按信号区分，正常退出返回 nil）。
 func (s *Server) Serve(ctx context.Context, addr string) error {
+	s.setOriginContext(ctx)
 	// T-2：配置了证书就用 tls.Listen（RTMPS），否则保持明文 RTMP。
 	// TLS 只是包在 TCP 外面一层，accept 循环与 RTMP 处理逻辑完全复用；
 	// tls.Conn 的 RemoteAddr() 也仍返回底层 *net.TCPAddr。

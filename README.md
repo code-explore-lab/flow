@@ -37,6 +37,30 @@ RTMP 回源（从上游拉流并在本地重新发布，供 RTSP/RTMP/HTTP-FLV �
 ffplay rtmp://127.0.0.1:1935/live/relay
 ```
 
+按需回源 / 级联（`-origin`，S-1）：本机注册表没有某路流时，按模板从上游
+RTSP / RTMP / HTTP-FLV 拉流，收到首帧后以本地流名登记，RTSP / RTMP /
+HTTP-FLV 下游都能直接播放；上游断开后按 1s→30s 指数退避重连，本地流不
+摘除，下游继续等帧。首次回源在 `-origin-timeout` 内拿不到媒体就回退到
+404 / 本地 testdata；已经就绪的流在源站重启期间不会被放弃。
+
+```bash
+# 通配模板：本地缺 live/src 时拉 rtmp://upstream/live/src
+./flow -origin rtmp://upstream/live
+
+# 显式映射（本地名=上游 URL），可带 RTMP 拉流 token（T-3）
+./flow -origin "news=rtmp://upstream/live/src?token=playsecret"
+
+# 上游 RTSP 需要 Basic/Digest 时把凭据写进 URL
+./flow -origin rtsp://user:pass@camera/live
+
+# 多个模板逗号分隔；等待首帧的超时默认 5s
+./flow -origin "rtmp://up/live,http://cdn/live" -origin-timeout 5s
+```
+
+RTMP / HTTP-FLV 上游的时间戳在重连时按 PTS（DTS+CTS）平移到上一连接
+最大值之后，下游不会看到时间戳回退。回源流不做空闲回收，首个请求触发后
+保持到进程退出。
+
 从摄像头推实时 H.264（`-live` 表示从 stdin 读 Annex-B 裸流）：
 
 ```bash
@@ -78,6 +102,8 @@ go tool pprof -http=127.0.0.1:8081 cpu.pprof
 | `cmd/demux_test/` | 裸 H.264 文件解复用的小工具 |
 | `internal/rtsp/` | RTSP 协议层：请求解析、会话、鉴权、SR/RR、NACK/PLI、组播等 |
 | `internal/rtmp/` | RTMP 协议层：握手、Chunk、AMF0、publish/play，以及回源客户端（`-pull`） |
+| `internal/origin/` | 按需回源/级联（`-origin`）：模板匹配、跨协议拉流、退避重连与本地缓存 |
+| `internal/flvingest/` | FLV tag → `source.Frame`（推流/回源共用），含 PTS/CTS 与跨重连时间戳平移 |
 | `internal/httpflv/`, `internal/flvmux/` | HTTP-FLV 分发与 frame→FLV Tag 封装 |
 | `internal/rtp/` | RTP 打包/解包，H.264 与 AAC |
 | `internal/rtcp/` | RTCP 包解析：SR/RR、SDES、BYE、NACK |

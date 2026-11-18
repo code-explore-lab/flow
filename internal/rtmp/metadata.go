@@ -68,9 +68,9 @@ func (c *Conn) handleData(m *Message) {
 	if name != "onMetaData" {
 		return
 	}
-	p.stream.SetMetaData(&metaData{
+	p.Stream.SetMetaData(&metaData{
 		payload: append([]byte(nil), m.Payload...),
 		fields:  fields,
 	})
-	p.stream.SetMetaDataPayload(m.Payload)
+	p.Stream.SetMetaDataPayload(m.Payload)
 }

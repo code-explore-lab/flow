@@ -88,6 +88,12 @@ type Server struct {
 	// GET 先登记，POST 到达时按同一个 cookie 找回数据通道。
 	tunnelsMu sync.Mutex
 	tunnels   map[string]*httpTunnel
+
+	// S-1：按需回源解析器。origin 包依赖本包的拉流客户端，所以这里只
+	// 定义接口，由 cmd/server 注入实现，避免 import 环。
+	originMu  sync.RWMutex
+	origin    OriginResolver
+	originCtx context.Context
 }
 
 // New 构造一个服务器。live 为 true 时 video 应是从 reader 构造的实时源；
@@ -285,6 +291,7 @@ const tlsHandshakeTimeout = 10 * time.Second
 // Serve 监听 addr，接受连接直到 ctx 取消，然后优雅退出。
 // 返回的错误只有监听失败这一种（Accept 错误按信号区分，正常退出返回 nil）。
 func (s *Server) Serve(ctx context.Context, addr string) error {
+	s.setOriginContext(ctx)
 	s.installExpireHook()
 	go s.sessions.Run(ctx) //启动会话管理器
 

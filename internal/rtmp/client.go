@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"flow/internal/flv"
+	"flow/internal/flvingest"
 	"flow/internal/metrics"
 	"flow/internal/stream"
 )
@@ -234,23 +235,58 @@ func (cl *Client) Run(ctx context.Context) {
 	}
 }
 
-// dialAndPull 建立一次上游会话并读到断开。played 表示是否成功走到
-// Play.Start（用于决定是否重置退避）。
-func (cl *Client) dialAndPull(ctx context.Context, st *stream.Stream, clock *rebaseClock) (played bool, err error) {
-	dialer := net.Dialer{Timeout: cl.handshakeTimeout}
-	raw, err := dialer.DialContext(ctx, "tcp", cl.spec.addr)
+// ErrStreamNotFound 表示上游明确回复流不存在（NetStream.Play.StreamNotFound /
+// FileNotFound）。回源据此停止重试，而不是把上游打满。
+var ErrStreamNotFound = errors.New("rtmp: stream not found")
+
+// PullOptions 一次 RTMP 拉流会话的参数。Stream 是本地共享流，重连时复用
+// 同一个指针；Rebase 可选，用来把上游时间戳平移到跨重连单调；OnFirstMedia
+// 可选，在第一个音视频 tag 写出后调用一次（回源的 Ready 信号）。
+type PullOptions struct {
+	Addr       string
+	App        string
+	TcURL      string
+	StreamName string
+	Stream     *stream.Stream
+	// Rebase 可选：输入上游 DTS 与 CTS（毫秒），返回平移后的 DTS。
+	Rebase func(dtsMs uint32, ctsMs int32) uint32
+	// OnFirstMedia 在第一个成功处理的上游音视频 tag 后调用一次。
+	OnFirstMedia func()
+	// HandshakeTimeout 覆盖握手与命令阶段超时；<=0 用默认值。
+	HandshakeTimeout time.Duration
+	// ConnTimeout 是消息读空闲超时；<=0 用默认值。
+	ConnTimeout time.Duration
+}
+
+// Pull 建立一次上游 RTMP 会话并读到断开。played 表示是否成功走到
+// Play.Start（用于决定是否重置退避）。调用方负责重连。
+func Pull(ctx context.Context, o PullOptions) (played bool, err error) {
+	if o.Stream == nil {
+		return false, errors.New("rtmp pull: nil stream")
+	}
+	if o.HandshakeTimeout <= 0 {
+		o.HandshakeTimeout = defaultPullHandshakeTimeout
+	}
+	if o.ConnTimeout <= 0 {
+		o.ConnTimeout = defaultPullConnTimeout
+	}
+
+	dialer := net.Dialer{Timeout: o.HandshakeTimeout}
+	raw, err := dialer.DialContext(ctx, "tcp", o.Addr)
 	if err != nil {
 		return false, fmt.Errorf("dial: %w", err)
 	}
 
 	c := newConn(raw)
-	c.handshakeTimeout = cl.handshakeTimeout
-	c.connTimeout = cl.connTimeout
+	c.handshakeTimeout = o.HandshakeTimeout
+	c.connTimeout = o.ConnTimeout
 	// 复用推流侧的解包逻辑：上游发来的 FLV tag 直接写进本地流。
-	c.publish = &publishState{stream: st, audioRate: defaultAACRate}
-	// 每条新连接重新开始计时，rebaseClock 把时间戳平移到上次的最大值之后。
-	clock.newConn()
-	c.beforeMedia = func(m *Message) { m.Timestamp = clock.apply(m.Timestamp) }
+	ingest := flvingest.NewIngest(o.Stream)
+	ingest.OnFirstMedia = o.OnFirstMedia
+	// 平移必须在 ingest 里按 DTS+CTS 做：先改 tag 时间戳再加 CTS 会让
+	// 带正 CTS 的 B 帧在重连后 PTS 回退。
+	ingest.Rebase = o.Rebase
+	c.publish = ingest
 
 	// ctx 取消时关闭连接，唤醒阻塞在 readMessage 上的 goroutine。
 	done := make(chan struct{})
@@ -269,23 +305,40 @@ func (cl *Client) dialAndPull(ctx context.Context, st *stream.Stream, clock *reb
 	}
 
 	// 命令阶段整体限时，避免上游接受 TCP 却不回 _result 时永久挂住。
-	if cl.handshakeTimeout > 0 {
-		_ = c.SetReadDeadline(time.Now().Add(cl.handshakeTimeout))
+	if c.handshakeTimeout > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(c.handshakeTimeout))
 	}
-	if err := c.clientConnect(cl.spec.app, cl.spec.tcURL); err != nil {
+	if err := c.clientConnect(o.App, o.TcURL); err != nil {
 		return false, err
 	}
 	streamID, err := c.clientCreateStream()
 	if err != nil {
 		return false, err
 	}
-	if err := c.clientPlay(streamID, cl.spec.streamName); err != nil {
+	if err := c.clientPlay(streamID, o.StreamName); err != nil {
 		return false, err
 	}
 	_ = c.SetReadDeadline(time.Time{})
 	played = true
 
 	return true, c.pump()
+}
+
+// dialAndPull 建立一次上游会话并读到断开。played 表示是否成功走到
+// Play.Start（用于决定是否重置退避）。
+func (cl *Client) dialAndPull(ctx context.Context, st *stream.Stream, clock *rebaseClock) (played bool, err error) {
+	// 每条新连接重新开始计时，rebaseClock 把时间戳平移到上次的最大值之后。
+	clock.newConn()
+	return Pull(ctx, PullOptions{
+		Addr:             cl.spec.addr,
+		App:              cl.spec.app,
+		TcURL:            cl.spec.tcURL,
+		StreamName:       cl.spec.streamName,
+		Stream:           st,
+		Rebase:           clock.apply,
+		HandshakeTimeout: cl.handshakeTimeout,
+		ConnTimeout:      cl.connTimeout,
+	})
 }
 
 // clientConnect 发 connect 并等 NetConnection.Connect.Success。
@@ -338,7 +391,9 @@ func (c *Conn) clientPlay(streamID uint32, name string) error {
 		switch code := commandStatusCode(cmd); code {
 		case "NetStream.Play.Start":
 			return nil
-		case "NetStream.Play.Failed", "NetStream.Play.StreamNotFound", "NetStream.Play.FileNotFound":
+		case "NetStream.Play.StreamNotFound", "NetStream.Play.FileNotFound":
+			return fmt.Errorf("%w: play %q failed: %s", ErrStreamNotFound, name, code)
+		case "NetStream.Play.Failed":
 			return fmt.Errorf("rtmp: play %q failed: %s", name, code)
 		}
 		// Play.Reset 等中间状态，继续等 Play.Start。
@@ -392,30 +447,41 @@ func commandStatusCode(cmd *Command) string {
 
 // rebaseClock 把上游时间戳平移成跨重连单调递增。
 //
-// 上游每次重连后从 0 重新计时；本时钟记录历史最大值 last，新连接的第一帧
-// 以 last+1 为基准，后续帧保持连接内的相对时间差。只有读循环一个 goroutine
-// 访问，无需加锁。
+// 上游每次重连后从 0 重新计时；本时钟记录历史最大 PTS（last），新连接的
+// 第一帧选择平移量，使它的 PTS=DTS+CTS 落在 last+1，后续帧保持连接内的
+// 相对时间差。只有读循环一个 goroutine 访问，无需加锁。
 type rebaseClock struct {
 	started bool
 	base    uint32
 	last    uint32
+	minCTS  int32 // 已见的最小 CTS（一般为负），重连时留出同样的重排窗口
 }
 
 // newConn 标记进入新连接：下一帧重新计算基准。
 func (r *rebaseClock) newConn() { r.started = false }
 
-func (r *rebaseClock) apply(raw uint32) uint32 {
+// apply 平移视频/音频的 DTS。cts 是 PTS−DTS（毫秒）。
+func (r *rebaseClock) apply(dts uint32, cts int32) uint32 {
+	if cts < r.minCTS {
+		r.minCTS = cts
+	}
 	if !r.started {
 		r.started = true
+		r.base = 0
 		if r.last > 0 {
-			r.base = r.last + 1
-		} else {
-			r.base = 0
+			// 首帧的 DTS 是本连接最小的 DTS；留出 minCTS 的重排窗口，
+			// 保证之后带负 CTS 的 B 帧 PTS 也落在 last+1 之后。
+			if shift := int64(r.last) + 1 - int64(dts) - int64(r.minCTS); shift > 0 {
+				r.base = uint32(shift)
+			}
 		}
 	}
-	v := raw + r.base
-	if v > r.last {
-		r.last = v
+	v := int64(dts) + int64(r.base)
+	if v < 0 {
+		v = 0
 	}
-	return v
+	if p := v + int64(cts); p > int64(r.last) {
+		r.last = uint32(p)
+	}
+	return uint32(v)
 }

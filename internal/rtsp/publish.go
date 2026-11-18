@@ -38,10 +38,16 @@ type rtspStreamMeta struct {
 
 // newPublishedStream 按 ANNOUNCE 轨道创建共享流：帧源 + 编码参数 + SDP 描述。
 func newPublishedStream(name string, tracks []announcedTrack) *stream.Stream {
-	p := &stream.Stream{
-		Name: name,
-		Meta: &rtspStreamMeta{tracks: append([]announcedTrack(nil), tracks...)},
-	}
+	p := &stream.Stream{Name: name}
+	applyTracks(p, tracks)
+	return p
+}
+
+// applyTracks 把 SDP 轨道列表应用到一路共享流上：登记 Meta（拉流端据此
+// 还原精确 SDP）并按轨道创建帧源、写入编码参数。推流（ANNOUNCE）和
+// 回源（DESCRIBE）共用，重复调用会覆盖参数但保留已写入的帧源。
+func applyTracks(p *stream.Stream, tracks []announcedTrack) {
+	p.Meta = &rtspStreamMeta{tracks: append([]announcedTrack(nil), tracks...)}
 	for _, t := range tracks {
 		switch t.Kind {
 		case "video":
@@ -58,7 +64,6 @@ func newPublishedStream(name string, tracks []announcedTrack) *stream.Stream {
 			p.SetAudioCodec(codec, cfg, rate, ch, clock)
 		}
 	}
-	return p
 }
 
 // audioCodecFromSDP 把 SDP rtpmap 编码名映射成 stream 的音频编码常量。

@@ -59,6 +59,10 @@ type Server struct {
 	referers       []string
 	requireReferer bool
 	token          string
+
+	// S-1：按需回源。接口定义在本包，cmd/server 注入 origin.Manager，
+	// 避免 httpflv → origin → rtsp/rtmp 的 import 环。
+	origin OriginResolver
 }
 
 // New 构造 HTTP-FLV 服务器。reg 为 nil 时自建一份；video/audio 是本地文件
@@ -203,6 +207,15 @@ func (s *Server) resolve(ctx context.Context, name string) (*resolved, bool) {
 		// 返回 404，比悄悄播放 testdata 更符合预期。
 		res := s.resolveRegistry(ctx, name, st)
 		return res, res != nil
+	}
+
+	// 本地没有这路流：先尝试按需回源（S-1）。回源成功时注册表里已经有
+	// 这条流，直接按注册表路径处理；失败再退回本地文件。
+	if s.origin != nil {
+		if st = s.origin.Ensure(ctx, name); st != nil {
+			res := s.resolveRegistry(ctx, name, st)
+			return res, res != nil
+		}
 	}
 
 	// 本地文件回退，与 RTMP 播放保持一致：没有推流时播放 testdata。

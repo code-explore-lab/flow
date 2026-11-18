@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"flow/internal/flv"
+	"flow/internal/flvingest"
 	"flow/internal/source"
 	"flow/internal/stream"
 )
@@ -30,7 +31,7 @@ func newPublishConn(t *testing.T) (*Server, *Conn, *stream.Stream) {
 	st := mustPublish(t, srv.registry, "push")
 	c := &Conn{
 		srv:     srv,
-		publish: &publishState{stream: st, audioRate: defaultAACRate},
+		publish: flvingest.NewIngest(st),
 	}
 	return srv, c, st
 }
@@ -210,7 +211,7 @@ func TestAudioSequenceHeaderAndFrames(t *testing.T) {
 
 func TestAudioBeforeSequenceHeader(t *testing.T) {
 	_, c, st := newPublishConn(t)
-	c.publish.audioRate = 0 // 还没收到序列头
+	c.publish.AudioRate = 0 // 还没收到序列头
 
 	rd := st.SourceFor("audio")
 	if rd != nil {

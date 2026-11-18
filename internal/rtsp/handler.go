@@ -151,13 +151,22 @@ func (s *Server) handleConn(conn *Conn) {
 			respErr = writeResponse(conn, "200 OK", hd, nil)
 		case "DESCRIBE":
 			hd["Content-Type"] = "application/sdp"
+			// 本地没有这路流时先尝试按需回源（S-1）；回源成功意味着首帧
+			// 已经到达，下来的 buildSDP 能直接拿到编码参数。
+			pub := s.publishedFromURI(req.URI)
+			if pub == nil {
+				pub = s.ensureOrigin(req.URI)
+			}
 			// 记住命中的已发布流，后续 SETUP 即使 URI 写法不同也能找回来。
-			if pub := s.publishedFromURI(req.URI); pub != nil {
+			if pub != nil {
 				conn.setDescribeStream(pub.Name)
 			} else {
 				conn.setDescribeStream("")
 			}
-			sdp, errSDP := s.buildSDP(req.URI)
+			// 回源命中时 pub 可能就是请求的流；但同一路回源可能先被其它
+			// 协议按不同流名（RTMP 裸名 vs RTSP live/src）拉起来，注册表
+			// 里查不到 req.URI，所以这里直接用手上的 pub 生成 SDP。
+			sdp, errSDP := s.buildSDPFor(pub)
 			if errSDP != nil {
 				respErr = writeResponse(conn, "500 Internal Server Error", hd, nil)
 				break
@@ -257,7 +266,13 @@ func (s *Server) handleInterleaved(conn *Conn, channel byte, payload []byte) {
 // sprop-parameter-sets 和 AAC config）全部来自 ANNOUNCE，拉流端与推流端一致。
 // 没有已发布流时退回本地文件/实时源的原有逻辑。
 func (s *Server) buildSDP(uri string) (string, error) {
-	if pub := s.publishedFromURI(uri); pub != nil {
+	return s.buildSDPFor(s.publishedFromURI(uri))
+}
+
+// buildSDPFor 与 buildSDP 相同，但使用调用方已经解析好的流（DESCRIBE 的
+// 回源路径里，流的注册名可能与请求 URI 不同）。
+func (s *Server) buildSDPFor(pub *stream.Stream) (string, error) {
+	if pub != nil {
 		return publishedSDP(pub, s.multicastAddr, s.multicastTTL), nil
 	}
 
@@ -477,6 +492,10 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 		if pub == nil && describeName != "" {
 			// 有些客户端 SETUP 的 URL 与 DESCRIBE 不同，用连接上记录的流兜底。
 			pub = s.publishedStreamByName(describeName)
+		}
+		if pub == nil {
+			// 客户端跳过了 DESCRIBE，或 DESCRIBE 后流被下线；再试一次回源。
+			pub = s.ensureOrigin(req.URI)
 		}
 		if pub == nil && describeName != "" {
 			// DESCRIBE 时流还在、SETUP 时已经下线：不能退回本地文件源冒充，

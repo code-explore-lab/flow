@@ -237,7 +237,7 @@ func TestHandlePublish(t *testing.T) {
 	if st == nil {
 		t.Fatal("publish did not register the stream")
 	}
-	if server.publish == nil || server.publish.stream != st {
+	if server.publish == nil || server.publish.Stream != st {
 		t.Fatal("publish state does not point at the registered stream")
 	}
 

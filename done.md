@@ -470,9 +470,10 @@
 
 ## S — 架构与集群（P3）
 
-- [ ] **S-1 回源 / 级联**
+- [x] **S-1 回源 / 级联**
   - 本机无该流时向上游 RTSP/RTMP/HTTP 拉流并缓存为源，失败回退；
   - 验收：边缘节点按需回源，源站断开后按策略重连。
+  - ✅ 已实现：新增 `internal/origin/`，`-origin [name=]scheme://host[:port]/base`（逗号分隔多模板，`-origin-timeout` 默认 5s）支持通配模板与显式映射。RTSP / RTMP / HTTP-FLV 在注册表查不到流时调用 `Manager.Ensure`，首个媒体帧到达（Ready）后以本地流名登记到共享注册表，三种下游协议随即都能拉流；上游断开按 1s→30s 指数退避重连，本地 `*stream.Stream` 不替换、不关闭，下游阻塞等帧。首次回源超时或上游明确不存在时回退到原有 404 / 本地 testdata；Ready 之后 `ErrNotFound` 不再视为终态，源站重启期间继续重连。与 T-3/T-9 打通：RTMP 上游 `?token=` 透传到 play 流名，RTSP URL 的 `user:pass` 自动完成 Basic/Digest 401 challenge。RTMP / HTTP-FLV 跨重连时间戳按 PTS=DTS+CTS 平移（`flvingest.Ingest.Rebase`），避免带 B 帧的上游在源站重启后让下游 muxer 报 non-monotonic DTS。测试：`internal/origin/relay_edge_test.go`（RTMP play token、错误 token 快速失败、RTSP Basic/Digest、上游消失后重连、RTSP DESCRIBE 复用回源流 SDP）、`internal/rtsp/pull_auth_test.go`、`internal/origin/spec_test.go`、`internal/rtmp/client_test.go`（PTS 平移）、`internal/flvingest/ingest_test.go`，`go test -race` 通过。手工 e2e：上游 :8555/:1935 推流，边缘 :8556/:1936/:8081 `-origin rtmp://127.0.0.1:1935/live`，RTSP/RTMP/HTTP-FLV 下游 ffprobe 均 rc=0（h264 640x480 + aac 44100）；杀掉推流端后边缘日志 `origin "live/src": EOF (reconnect in 1s)`，重启推流后自动恢复且下游不中断，HTTP-FLV 抓包跨重连 DTS 无回退；不可达源 `-origin rtsp://127.0.0.1:1/live -origin-timeout 1s` 时边缘日志 `no media within 1s; falling back`，HTTP-FLV 返回 200（本地 testdata）、RTSP DESCRIBE 正常。已知取舍：回源流不做空闲回收，首次失败后后台仍按退避重试。
 - [ ] **S-2 边缘分发 / 负载均衡**
   - 多节点注册中心（etcd/Redis/自研）记录流位置；客户端重定向或代理；
   - 验收：两节点间推→拉成功，节点宕机后客户端可恢复。

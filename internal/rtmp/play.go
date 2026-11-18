@@ -314,7 +314,12 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 	)
 
 	var st *stream.Stream
-	if st = c.srv.registry.Get(name); st != nil {
+	if st = c.srv.registry.Get(name); st == nil {
+		// 本地没有这路流：先尝试按需回源（S-1）。回源失败返回 nil，
+		// 下面继续走本地源回退。
+		st = c.srv.ensureOrigin(name)
+	}
+	if st != nil {
 		if t := st.VideoTrack(); t != nil && t.Src != nil {
 			video = t.Src
 		}

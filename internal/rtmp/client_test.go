@@ -58,26 +58,69 @@ func TestParsePullSpec(t *testing.T) {
 func TestRebaseClockMonotonicAcrossReconnect(t *testing.T) {
 	var c rebaseClock
 	// 第一条连接：原样从 0 起。
-	if got := c.apply(0); got != 0 {
+	if got := c.apply(0, 0); got != 0 {
 		t.Fatalf("first apply(0) = %d, want 0", got)
 	}
-	if got := c.apply(3600); got != 3600 {
+	if got := c.apply(3600, 0); got != 3600 {
 		t.Fatalf("first apply(3600) = %d, want 3600", got)
 	}
 
 	// 重连后上游从 0 重新计时：平移到最后值 + 1 之后。
 	c.newConn()
-	if got := c.apply(0); got != 3601 {
+	if got := c.apply(0, 0); got != 3601 {
 		t.Fatalf("reconnect apply(0) = %d, want 3601", got)
 	}
-	if got := c.apply(1800); got != 5401 {
+	if got := c.apply(1800, 0); got != 5401 {
 		t.Fatalf("reconnect apply(1800) = %d, want 5401", got)
 	}
 
-	// 再次重连仍继续保持单调（每次重连在上一最大值后 +1 起算）。
+	// 再次重连仍继续保持单调：首帧 PTS 直接落在上一最大值 +1（与上游
+	// 这一帧原本的 90ms 无关）。
 	c.newConn()
-	if got := c.apply(90); got != 5492 {
-		t.Fatalf("second reconnect apply(90) = %d, want 5492", got)
+	if got := c.apply(90, 0); got != 5402 {
+		t.Fatalf("second reconnect apply(90) = %d, want 5402", got)
+	}
+}
+
+// TestRebaseClockAccountsForCTS 回归 S-1 重连后观察到的 non monotonic dts：
+// 上一连接最后 DTS=3600、CTS=40，PTS 已经到 3640；重连后首帧 CTS=0。若只
+// 按 DTS 平移（base=3601）新 PTS=3601 就落到 3640 之前。这里断言基准按
+// PTS 计算：新 DTS=3641，PTS=3641。
+func TestRebaseClockAccountsForCTS(t *testing.T) {
+	var c rebaseClock
+	c.apply(3600, 40) // PTS=3640
+	c.newConn()
+	if got := c.apply(0, 0); got != 3641 {
+		t.Fatalf("reconnect apply(0,0) DTS = %d, want 3641", got)
+	}
+	if c.last != 3641 {
+		t.Fatalf("last PTS = %d, want 3641", c.last)
+	}
+
+	// 同一连接内音频（无 CTS）照常跟随基准，不会落到视频之前。
+	if got := c.apply(0, 0); got != 3641 {
+		t.Fatalf("audio apply(0,0) = %d, want 3641", got)
+	}
+}
+
+// TestRebaseClockNegativeCTS：B 帧 CTS 为负时，重连基准要留出同样的重排
+// 窗口，保证新连接里带负 CTS 的帧 PTS 也不低于上一连接的最大值 +1。
+func TestRebaseClockNegativeCTS(t *testing.T) {
+	var c rebaseClock
+	c.apply(3600, 40)  // PTS=3640
+	c.apply(3700, -40) // PTS=3660，minCTS=-40
+	c.newConn()
+
+	// 首帧（如序列头）DTS=0、CTS=0：base = 3660+1-0-(-40) = 3701。
+	if got := c.apply(0, 0); got != 3701 {
+		t.Fatalf("reconnect apply(0,0) = %d, want 3701", got)
+	}
+	// 同连接带负 CTS 的 B 帧：PTS = 3701-40 = 3661 > 上一连接最大值 3660。
+	if got := c.apply(0, -40); got != 3701 {
+		t.Fatalf("apply(0,-40) DTS = %d, want 3701", got)
+	}
+	if c.last != 3701 {
+		t.Fatalf("last PTS = %d, want 3701", c.last)
 	}
 }
 

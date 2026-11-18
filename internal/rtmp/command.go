@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"flow/internal/flv"
+	"flow/internal/flvingest"
 	"flow/internal/stream"
 )
 
@@ -339,7 +340,7 @@ func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
 		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
 			statusObj("error", "NetStream.Publish.BadName", "Already Publishing"))
 	}
-	c.publish = &publishState{stream: st, audioRate: defaultAACRate}
+	c.publish = flvingest.NewIngest(st)
 	c.streamName = name
 	c.srv.metrics.IncPublish()
 	c.srv.metrics.IncPublishTotal()

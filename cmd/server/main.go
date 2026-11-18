@@ -20,6 +20,7 @@ import (
 	"flow/internal/httpflv"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
+	"flow/internal/origin"
 	"flow/internal/rtmp"
 	"flow/internal/rtsp"
 	"flow/internal/source"
@@ -88,6 +89,9 @@ func main() {
 	publishPolicyFlag := flag.String("publish-policy", "replace", "T-8: duplicate publish policy: replace|reject|reject-if-active (applies to RTSP and RTMP)")
 	// T-9：RTMP 回源。逗号分隔，每项 [本地名=]rtmp://host[:port]/app/stream。
 	pull := flag.String("pull", "", "T-9: relay upstream RTMP, comma-separated [localName=]rtmp://host[:port]/app/stream")
+	// S-1：按需回源。逗号分隔，每项 [name=]scheme://host[:port]/base。
+	originFlag := flag.String("origin", "", "S-1: on-demand relay, comma-separated [name=]scheme://host[:port]/base (scheme: rtsp|rtmp|http)")
+	originTimeout := flag.Duration("origin-timeout", 5*time.Second, "S-1: how long a request waits for first upstream media before falling back")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -155,6 +159,15 @@ func main() {
 		os.Exit(2)
 	}
 	publishPolicy, err := stream.ParsePublishPolicy(*publishPolicyFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if *originTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -origin-timeout (must be > 0)")
+		os.Exit(2)
+	}
+	originSpecs, err := origin.ParseSpecs(*originFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -259,6 +272,15 @@ func main() {
 	rtmpRate := access.NewRateLimiter(*connRate, *connBurst)
 	authBackoff := access.NewBackoff(*backoffThreshold, *backoffBase, *backoffMax)
 
+	// S-1：按需回源管理器。没有配置 -origin 时保持 nil，三个服务端都
+	// 不会调用 Ensure（保持原有 404/本地回退行为）。
+	var originMgr *origin.Manager
+	if len(originSpecs) > 0 {
+		originMgr = origin.NewManager(ctx, reg, flowMetrics, originSpecs, *originTimeout)
+		fmt.Printf("origin: %d template(s), wait up to %s for first media\n",
+			len(originSpecs), *originTimeout)
+	}
+
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
 	rtspSrv.SetUsers(users)
@@ -272,6 +294,9 @@ func main() {
 	rtspSrv.SetWhitelist(whitelist)
 	rtspSrv.SetRateLimit(rtspRate)
 	rtspSrv.SetBackoff(authBackoff)
+	if originMgr != nil {
+		rtspSrv.SetOrigin(originMgr)
+	}
 	// 切换basic / digest认证
 	if *authMode == "digest" {
 		rtspSrv.SetAuthScheme(rtsp.AuthDigest)
@@ -295,6 +320,9 @@ func main() {
 		srv.SetConnTimeout(*connTimeout)
 		srv.SetAuth(rtmpAuth)
 		srv.SetChunkSize(uint32(*rtmpChunkSize))
+		if originMgr != nil {
+			srv.SetOrigin(originMgr)
+		}
 		return srv
 	}
 	rtmpSrv := newRTMP()
@@ -316,6 +344,9 @@ func main() {
 		httpflvSrv.SetCORS(*httpflvCORS)
 		httpflvSrv.SetReferer(*httpflvReferer, *httpflvRequireReferer)
 		httpflvSrv.SetToken(*httpflvToken)
+		if originMgr != nil {
+			httpflvSrv.SetOrigin(originMgr)
+		}
 	}
 
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。

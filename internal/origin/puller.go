@@ -48,11 +48,15 @@ type Puller struct {
 }
 
 func newPuller(m *Manager, name string, specs []Spec) *Puller {
+	st := &stream.Stream{Name: name}
+	// S-3：回源流由 puller 自己的退避重连维护，上游断线期间下游仍要
+	// 继续等帧，不能被本地 janitor 当空闲流摘掉。
+	st.SetIdleExempt(true)
 	return &Puller{
 		mgr:    m,
 		name:   name,
 		specs:  specs,
-		st:     &stream.Stream{Name: name},
+		st:     st,
 		ready:  make(chan struct{}),
 		failed: make(chan struct{}),
 	}

@@ -452,7 +452,8 @@
   - ✅ 已实现：新增 `internal/flvmux` 把 `source.Frame` 转成 FLV Tag，逻辑与 RTMP 拉流一致但独立成包供 HTTP-FLV 复用：视频按访问单元合并多 slice、DTS=PTS−CTS 写入 tag 时间戳、CTS 写进 CompositionTime 低 24 位，SPS/PPS（HEVC 含 VPS）生成序列头且支持参数集晚到（先丢媒体帧、补齐后补发序列头）；音频 AAC 生成 ASC 序列头、MP3/G.711 生成裸 tag、Opus 整体跳过；每条轨的时间戳各自从首帧建立相对基准，避免 RTSP 音视频 RTP 时钟相差上亿时互相污染。新增 `internal/httpflv` 服务器：默认监听 `:8080`，路由 `/live/<name>.flv`，先按完整路径查注册表（RTSP 的 `live/<name>`），未命中再用最后一段匹配 RTMP 裸流名，注册表未命中时回退 testdata 本地源；响应为 chunked FLV：文件头 → onMetaData（`stream.SetMetaDataPayload` 保存推流端原始 AMF0 负载，RTMP `handleData` 写入）→ 音视频序列头 → 两条轨的 goroutine 持续泵送。写路径用 `bufio.Writer` + 互斥锁串行化并显式 `http.ResponseController.Flush()`——只刷本地 bufio 时 net/http 自身 2KB 缓冲会让小包卡住、客户端连响应头都收不到（单测曾因此挂死）；每次写前重设 15s 写超时，客户端断开（`r.Context().Done()`）或写失败立即结束另一条轨。安全项都在进入流式响应前完成：CORS 预检（`-httpflv-cors`，支持 `*` 或 Origin 允许列表、回显请求头、`Vary: Origin`）、Referer 防盗链（`-httpflv-referer`/`-httpflv-require-referer`，支持 `example.com`、`*.example.com`，按主机名匹配防 `evil.com/example.com` 绕过）、token（`-httpflv-token`，query `?token=` 或 `X-Flow-Token`，常量时间比较）、复用全局 IP 白名单；`-httpflv-addr` 为空可整体关闭。`cmd/server` 新增对应 flag，与 RTSP/RTMP 共用注册表、指标与白名单。测试新增 `flvmux`（AU 合并、参数集晚到、AAC/MP3/G.711/Opus）与 `httpflv`（完整流式 tag 顺序、HEAD/404/405、路径穿越、CORS、Referer/token、白名单、流名解析），并跑了 `-race`。e2e（ffmpeg 8.0.1）：本地回退 `ffprobe` 解出 h264+aac；RTSP 推 H.264+AAC → HTTP-FLV 解出 h264+aac，RTSP PCMA → `pcm_alaw`，RTSP Opus → 仅视频；RTMP 推 H.264+MP3 → `mp3`；`ffplay -nodisp http://127.0.0.1:8080/live/test.flv` 正常播放；防盗链/令牌/CORS 预检的 403/200/204 分支均符合预期。`gofmt -l .`、`go vet ./...`、`go test ./...` 全部通过。
 - [ ] **P-2 HLS（含 LL-HLS）**
   - 切片、m3u8、音视频分离、低延迟部分段；
-  - 验收：浏览器/Safari/ffplay 播放，端到端延迟有数据。
+  - 验收：浏览器/Safari/ffplay 播放，端到端延迟有数据；
+  - 施工计划与子任务（P-2-1 ~ P-2-7）见 [hls.md](hls.md)。
 - [ ] **P-3 MPEG-DASH**
   - fMP4 切片与 MPD，复用 P-2 的切片管线；
   - 验收：dash.js 参考播放器可播。
@@ -477,9 +478,15 @@
 - [ ] **S-2 边缘分发 / 负载均衡**
   - 多节点注册中心（etcd/Redis/自研）记录流位置；客户端重定向或代理；
   - 验收：两节点间推→拉成功，节点宕机后客户端可恢复。
-- [ ] **S-3 动态源注册与发现**
+- [x] **S-3 动态源注册与发现**
   - 流注册/心跳/过期；与 D-1 Redirect 联动；
   - 验收：源下线后注册表自动清理。
+  - ✅ 已实现：分两层补齐「源下线自动清理」与「跨节点发现」。
+    1) 本地租约：`internal/stream/janitor.go` 新增 `Janitor`，按 `ExternalSource.LastWrite()` 判断媒体活跃度，超过 `-stream-idle`（默认 30s，0 关闭）没有写入就调用新增的 `Registry.Reap`——判断当前登记指针、未豁免、仍在空闲窗口内全部在同一把锁内完成，避免与 `Publish` 竞态；摘除后 `Close()` 帧源并触发 `Unpublished`，下游 reader 读到流结束而不是一直等帧。`Stream.SetIdleExempt` 让 S-1 回源和 T-9 `-pull` 的流豁免：它们断线时本地流必须保留给下游等帧，由各自的指数退避重连维护。注册表同时新增 `Snapshot()`（按流名排序）、`SetObserver` 以及 Publish/Unpublish（含 replace 时的旧流 Unpublished）事件回调，回调在锁外同步执行且要求非阻塞。
+    2) 注册中心：新增 `internal/discovery`，`Store` 以「流名 → 节点 + 各协议 URL + 过期时间」保存租约，支持假时钟测试；`POST /v1/streams` 是整批心跳（登记/续约，并删除该节点本轮未上报的旧条目）、`GET /v1/streams[/name]` 查询、`DELETE /v1/streams/<name>?node=` 立即注销。同名流被另一个仍存活的节点持有时返回 409 语义的 `conflicts`，旧租约过期后允许接管。`Client` 提供 Lookup/Heartbeat/Delete；`Announcer` 用一个后台 goroutine 每 `TTL/3` 上报一次本地 `Active` 的流（回源流上游断开时不广告，避免把其他边缘引过来），publish/unpublish 事件经 100ms 去抖立即刷新，退出时发送空批次清空本节点租约；注册中心不可达只限频打日志，不影响本地播放。新增独立二进制 `cmd/registry`（`-listen :7000 -ttl 15s`）。
+    3) D-1 联动：`rtsp.Server.SetDiscovery` 注入 `StreamFinder`；OPTIONS/DESCRIBE 在本地注册表未命中时先查发现服务，命中且不是本节点就复用 D-1 的 `302 Found + Location`，未命中再走 S-1 回源/本地回退。本机条目由 `cmd/server` 的适配器按 `node-id` 过滤，防止重定向自环；查询超时 `-discovery-timeout`（默认 750ms），超时按未命中处理。新增参数 `-node-id`（默认 hostname）、`-advertise`（逗号分隔的 rtsp/rtmp/http 公网基础地址）、`-discovery-url`、`-discovery-ttl`、`-stream-idle`。
+    测试：`internal/stream/janitor_test.go` 覆盖空闲回收、活跃流不误杀、豁免流保留、回收关闭源让读者读到结束、旧指针 Reap 不影响新流、Snapshot 排序；`internal/discovery` 覆盖租约边界（差 1ms）、整批替换、存活/过期冲突与接管、归属校验、非法 URL、List/Sweep、假时钟，以及 Client↔Server 的注册/查询/删除、空批次清空和 Announcer 的上下线同步与退出清理；`internal/rtsp/discovery_test.go` 覆盖 DESCRIBE/OPTIONS 302、本地流优先不查发现、未命中回退，`cmd/server` 覆盖本节点条目过滤。`gofmt -l .`、`go vet ./...`、`go test ./...` 全绿，`go test -race ./internal/stream/ ./internal/discovery/ ./internal/rtsp/ ./internal/origin/` 通过。
+    端到端（本机三进程）：registry :17000（TTL 5s）+ 节点 A :18554 + 节点 B :18556，两者 `-advertise` 各自 RTSP 地址。ffmpeg 向 A 推 `live/demo` 后 `GET /v1/streams/live/demo` 返回 node-a 与 `rtsp://127.0.0.1:18554/live/demo`；`ffprobe rtsp://127.0.0.1:18556/live/demo` 输出 `Status 302: Redirecting to rtsp://127.0.0.1:18554/live/demo` 并成功解出 h264 640x480 + aac 44100。杀掉推流端后 1s 内注册中心返回 404（节点 A 立即摘流 + 批次心跳移除）；重新推流后强杀节点 A 进程，注册中心在 TTL 到期后（约 4s）返回 404，节点 B 的 DESCRIBE 不再收到 302，回退到本地源。已知取舍：发现只按精确流名匹配（RTSP `live/x` 与 RTMP 裸 `x` 需各自登记）；RTMP 不支持 302，HTTP-FLV 动态重定向与多租户命名空间留给 S-2/S-4。
 - [ ] **S-4 多租户与资源隔离**
   - app/路径命名空间、配额、按租户限速/限连接；
   - 验收：租户 A 的流量不影响租户 B 的基线。

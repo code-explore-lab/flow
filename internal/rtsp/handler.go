@@ -147,14 +147,25 @@ func (s *Server) handleConn(conn *Conn) {
 		var respErr error
 		switch req.Method {
 		case "OPTIONS":
+			// S-3：本地没有但别的节点持有时，先回 302。ffmpeg/ffprobe
+			// 收到 OPTIONS 的 3xx 会读 Location 并整条重连（同 D-1）。
+			if loc, ok := s.redirectForURI(req.URI); ok {
+				respErr = writeDiscoveryRedirect(conn, hd, req.Method, req.URI, loc)
+				break
+			}
 			hd["Public"] = publicMethods
 			respErr = writeResponse(conn, "200 OK", hd, nil)
 		case "DESCRIBE":
 			hd["Content-Type"] = "application/sdp"
-			// 本地没有这路流时先尝试按需回源（S-1）；回源成功意味着首帧
-			// 已经到达，下来的 buildSDP 能直接拿到编码参数。
+			// 本地没有这路流时先查发现服务（S-3），命中就 302 到持有者；
+			// 未命中再按需回源（S-1）。回源成功意味着首帧已经到达，下来的
+			// buildSDP 能直接拿到编码参数。
 			pub := s.publishedFromURI(req.URI)
 			if pub == nil {
+				if loc, ok := s.redirectForURI(req.URI); ok {
+					respErr = writeDiscoveryRedirect(conn, hd, req.Method, req.URI, loc)
+					break
+				}
 				pub = s.ensureOrigin(req.URI)
 			}
 			// 记住命中的已发布流，后续 SETUP 即使 URI 写法不同也能找回来。

@@ -175,7 +175,11 @@ func parsePullSpec(raw string) (*pullSpec, error) {
 // Run 一直回源，直到 ctx 取消。内部自动重连（指数退避）；返回时注销并关闭
 // 本地流，让下游读到流结束。
 func (cl *Client) Run(ctx context.Context) {
-	st, err := cl.registry.Publish(cl.spec.localName, &stream.Stream{})
+	local := &stream.Stream{}
+	// S-3：-pull 的回源流由客户端重连逻辑维护，断线期间不能被
+	// 本地 janitor 当空闲流回收。
+	local.SetIdleExempt(true)
+	st, err := cl.registry.Publish(cl.spec.localName, local)
 	if err != nil {
 		fmt.Printf("rtmp pull %q: publish local stream %q: %v\n",
 			cl.spec.streamName, cl.spec.localName, err)

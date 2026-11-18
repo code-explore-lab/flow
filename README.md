@@ -61,6 +61,28 @@ RTMP / HTTP-FLV 上游的时间戳在重连时按 PTS（DTS+CTS）平移到上�
 最大值之后，下游不会看到时间戳回退。回源流不做空闲回收，首个请求触发后
 保持到进程退出。
 
+动态源注册与发现（`-discovery-url`，S-3）：节点把本地正在出帧的流按 TTL
+租约登记到注册中心；边缘节点本地没有某路流时查询注册中心，命中就用 RTSP
+302（D-1 语义）把客户端指到真正持有该流的节点。推流端停止出帧超过
+`-stream-idle`（默认 30s）后本地注册表自动摘除，节点进程消失则由 TTL
+过期兜底。
+
+```bash
+# 注册中心（独立进程，默认 :7000，租约 15s）
+./registry -listen :7000 -ttl 15s
+
+# 节点：上报自己的 RTSP/RTMP 公网地址，并启用本地空闲回收
+./flow -node-id edge-a \
+       -advertise rtsp://10.0.0.5:8554,rtmp://10.0.0.5:1935 \
+       -discovery-url http://registry:7000
+
+# 边缘节点本地没有 live/demo 时，ffplay 会跟随 302 连到持有者
+ffplay rtsp://10.0.0.6:8554/live/demo
+```
+
+`-stream-idle 0` 关闭本地回收；S-1 回源和 `-pull` 的流始终豁免，由各自的
+重连逻辑维护。发现只做精确流名匹配；RTMP 客户端不跟随 RTSP 302。
+
 从摄像头推实时 H.264（`-live` 表示从 stdin 读 Annex-B 裸流）：
 
 ```bash

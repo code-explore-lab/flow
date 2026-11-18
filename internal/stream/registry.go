@@ -11,8 +11,10 @@ package stream
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"flow/internal/source"
@@ -177,6 +179,11 @@ type Stream struct {
 
 	// createdAt 是流登记到 Registry 的时间，供还没有建轨的流判断活跃度。
 	createdAt time.Time
+
+	// idleExempt 为 true 时 Janitor 不按空闲回收这条流。回源（S-1）和
+	// -pull（T-9）这类由各自重连逻辑维护的流要置位：断线期间本地流必须
+	// 保留，下游继续等帧，不能因为暂时没有媒体写入就被摘掉。
+	idleExempt atomic.Bool
 
 	mu sync.Mutex
 }
@@ -391,6 +398,32 @@ func (s *Stream) Close() {
 	}
 }
 
+// Event 是注册表变更事件。S-3 的发现上报用它感知流的上下线，
+// 本地 janitor 内部清理本身也会触发 Unpublished。
+type Event int
+
+const (
+	// EventPublished 一路流被登记或替换（替换时旧流另有一条 Unpublished）。
+	EventPublished Event = iota
+	// EventUnpublished 一路流被摘除（TEARDOWN、推流断开、janitor 回收等）。
+	EventUnpublished
+)
+
+func (e Event) String() string {
+	switch e {
+	case EventPublished:
+		return "published"
+	case EventUnpublished:
+		return "unpublished"
+	}
+	return "unknown"
+}
+
+// Observer 监听注册表变更。实现必须是非阻塞的：回调在 Publish/Unpublish
+// 的调用方 goroutine 上执行，不能拿注册表锁，也不能做网络 IO。需要上报
+// 时只投递到有缓冲的 channel，由后台 goroutine 合并发送。
+type Observer func(Event, string, *Stream)
+
 // Registry 流名 → Stream 的并发安全注册表。
 type Registry struct {
 	mu sync.RWMutex
@@ -399,6 +432,9 @@ type Registry struct {
 	// policy 是同名推流策略；activeWindow 是 reject-if-active 的活跃窗口。
 	policy       PublishPolicy
 	activeWindow time.Duration
+
+	// observer 非 nil 时在 Publish/Unpublish 完成后（锁外）收到通知。
+	observer Observer
 }
 
 // NewRegistry 创建一个空注册表，默认替换同名流。
@@ -441,6 +477,63 @@ func (s *Stream) Active(window time.Duration) bool {
 	return false
 }
 
+// SetIdleExempt 控制这条流是否豁免空闲回收。回源/-pull 在创建流时置 true。
+func (s *Stream) SetIdleExempt(v bool) { s.idleExempt.Store(v) }
+
+// IdleExempt 报告这条流是否豁免空闲回收。
+func (s *Stream) IdleExempt() bool { return s.idleExempt.Load() }
+
+// NamedStream 是 Snapshot 返回的一条登记项。
+type NamedStream struct {
+	Name   string
+	Stream *Stream
+}
+
+// SetObserver 设置注册表变更观察者（S-3 发现上报）。传 nil 取消。
+// 只在 Serve/后台任务启动前调用；观察者会在 Publish/Unpublish 的调用方
+// goroutine 上被同步调用，必须非阻塞。
+func (r *Registry) SetObserver(o Observer) {
+	r.mu.Lock()
+	r.observer = o
+	r.mu.Unlock()
+}
+
+// Snapshot 返回当前登记的全部流，按流名排序，供 janitor 扫描和心跳上报。
+// 返回的 *Stream 仍是共享对象，调用方只读。
+func (r *Registry) Snapshot() []NamedStream {
+	r.mu.RLock()
+	out := make([]NamedStream, 0, len(r.m))
+	for name, s := range r.m {
+		out = append(out, NamedStream{Name: name, Stream: s})
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// Reap 在流当前登记的仍是 s、未豁免、且超过 idle 没有媒体写入时摘除它。
+// 判断和删除在同一把锁内完成，避免和新的 Publish 竞态；删除后关闭源并
+// 通知观察者，下游 reader 会读到流结束而不是一直挂住。
+func (r *Registry) Reap(name string, s *Stream, idle time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	r.mu.Lock()
+	if r.m[name] != s || s.IdleExempt() || s.Active(idle) {
+		r.mu.Unlock()
+		return false
+	}
+	delete(r.m, name)
+	obs := r.observer
+	r.mu.Unlock()
+
+	if obs != nil {
+		obs(EventUnpublished, name, s)
+	}
+	s.Close()
+	return true
+}
+
 // Publish 按当前策略登记一路流。成功返回登记的流；同名冲突被拒时返回
 // ErrPublishRejected，新流不登记、旧流保持不变，调用方可以直接丢弃 s。
 func (r *Registry) Publish(name string, s *Stream) (*Stream, error) {
@@ -467,10 +560,17 @@ func (r *Registry) Publish(name string, s *Stream) (*Stream, error) {
 		}
 	}
 	r.m[name] = s
+	obs := r.observer
 	r.mu.Unlock()
 
 	if old != nil && old != s {
+		if obs != nil {
+			obs(EventUnpublished, name, old)
+		}
 		old.Close()
+	}
+	if obs != nil {
+		obs(EventPublished, name, s)
 	}
 	return s, nil
 }
@@ -482,10 +582,17 @@ func (r *Registry) Unpublish(name string, s *Stream) {
 		return
 	}
 	r.mu.Lock()
+	deleted := false
 	if r.m[name] == s {
 		delete(r.m, name)
+		deleted = true
 	}
+	obs := r.observer
 	r.mu.Unlock()
+
+	if deleted && obs != nil {
+		obs(EventUnpublished, name, s)
+	}
 	s.Close()
 }
 

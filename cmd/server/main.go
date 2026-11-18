@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/discovery"
 	"flow/internal/httpflv"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
@@ -92,6 +93,14 @@ func main() {
 	// S-1：按需回源。逗号分隔，每项 [name=]scheme://host[:port]/base。
 	originFlag := flag.String("origin", "", "S-1: on-demand relay, comma-separated [name=]scheme://host[:port]/base (scheme: rtsp|rtmp|http)")
 	originTimeout := flag.Duration("origin-timeout", 5*time.Second, "S-1: how long a request waits for first upstream media before falling back")
+	// S-3：动态源注册与发现。节点把活跃流登记到注册中心，边缘节点按发现结果
+	// 用 D-1 的 302 重定向；本地 janitor 负责源静默后的自动清理。
+	nodeID := flag.String("node-id", "", "S-3: node identity advertised to the discovery registry (default hostname)")
+	advertise := flag.String("advertise", "", "S-3: comma-separated public base URLs, e.g. rtsp://10.0.0.5:8554,rtmp://10.0.0.5:1935")
+	discoveryURL := flag.String("discovery-url", "", "S-3: discovery registry base URL, e.g. http://127.0.0.1:7000 (empty disables)")
+	discoveryTTL := flag.Duration("discovery-ttl", discovery.DefaultTTL, "S-3: lease TTL; nodes renew every TTL/3")
+	discoveryTimeout := flag.Duration("discovery-timeout", 750*time.Millisecond, "S-3: per-request discovery lookup timeout")
+	streamIdle := flag.Duration("stream-idle", stream.DefaultIdleTimeout, "S-3: unpublish streams with no media for this long (0 disables)")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -171,6 +180,44 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+
+	// S-3：发现配置。启用上报时必须提供可对外播放的 advertise 地址，
+	// 否则注册中心只知道节点活着、不知道客户端该连哪里。
+	if *streamIdle < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -stream-idle (must be >= 0)")
+		os.Exit(2)
+	}
+	if *discoveryTTL <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -discovery-ttl (must be > 0)")
+		os.Exit(2)
+	}
+	if *discoveryTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -discovery-timeout (must be > 0)")
+		os.Exit(2)
+	}
+	node := strings.TrimSpace(*nodeID)
+	if node == "" {
+		node, _ = os.Hostname()
+		if node == "" {
+			node = "flow"
+		}
+	}
+	var advertiseMap map[string]string
+	if *discoveryURL != "" {
+		if !strings.HasPrefix(*discoveryURL, "http://") && !strings.HasPrefix(*discoveryURL, "https://") {
+			fmt.Fprintf(os.Stderr, "invalid -discovery-url %q (want http://host:port)\n", *discoveryURL)
+			os.Exit(2)
+		}
+		if strings.TrimSpace(*advertise) == "" {
+			fmt.Fprintln(os.Stderr, "-discovery-url requires -advertise (e.g. rtsp://10.0.0.5:8554)")
+			os.Exit(2)
+		}
+		advertiseMap, err = discovery.ParseAdvertise(*advertise)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 	}
 
 	// 凭据优先级：文件 < 环境变量 < 命令行参数。
@@ -253,6 +300,15 @@ func main() {
 	// RTSP / RTMP / RTMPS 三个 Server 同时生效。
 	reg := stream.NewRegistry()
 	reg.SetPublishPolicy(publishPolicy)
+
+	// S-3：本地空闲回收。推流端进程被强杀/半开 TCP 时协议层收不到 FIN，
+	// 这里按「最近一次媒体写入」兜底摘除并关闭源，下游读到流结束而非挂死。
+	// 回源（S-1）和 -pull（T-9）的流在各自构造时已标记豁免。
+	if *streamIdle > 0 {
+		janitor := stream.NewJanitor(reg, *streamIdle)
+		go janitor.Run(ctx)
+		fmt.Printf("stream janitor: drop streams with no media for %s (relay streams exempt)\n", janitor.Idle())
+	}
 	// E-4：两个协议共用一个指标注册表，/metrics 与两个服务器都读它。
 	flowMetrics := metrics.New()
 	// E-5：每个协议各自一份连接限流器（per-protocol 独立计数）。
@@ -281,6 +337,20 @@ func main() {
 			len(originSpecs), *originTimeout)
 	}
 
+	// S-3：把本地正在出帧的流按 TTL 租约登记到发现服务。整批心跳的语义
+	// 是「本节点当前持有这些流」，源主动下线时一次心跳内即被清除；节点
+	// 进程消失则由 TTL 过期兜底。
+	var discoveryClient *discovery.Client
+	if *discoveryURL != "" {
+		discoveryClient = discovery.NewClient(*discoveryURL, node, *discoveryTTL)
+		discoveryClient.SetTimeout(*discoveryTimeout)
+		announcer := discovery.NewAnnouncer(discoveryClient, reg, advertiseMap,
+			*discoveryTTL/3, stream.DefaultActiveWindow)
+		go announcer.Run(ctx)
+		fmt.Printf("discovery: node %q advertising %d protocol(s) to %s, heartbeat %s, ttl %s\n",
+			node, len(advertiseMap), *discoveryURL, announcer.Interval(), *discoveryTTL)
+	}
+
 	rtspSrv := rtsp.New(video, audio, *live)
 	rtspSrv.SetRegistry(reg)
 	rtspSrv.SetUsers(users)
@@ -296,6 +366,11 @@ func main() {
 	rtspSrv.SetBackoff(authBackoff)
 	if originMgr != nil {
 		rtspSrv.SetOrigin(originMgr)
+	}
+	// S-3：本地没有的流先查发现服务，命中后回 302（D-1 语义）。
+	if discoveryClient != nil {
+		rtspSrv.SetDiscovery(discoveryFinder{client: discoveryClient})
+		rtspSrv.SetDiscoveryTimeout(*discoveryTimeout)
 	}
 	// 切换basic / digest认证
 	if *authMode == "digest" {
@@ -402,6 +477,28 @@ func main() {
 		}(cl)
 	}
 	wg.Wait()
+}
+
+// discoveryFinder 把发现服务客户端适配成 rtsp.StreamFinder。
+// 指向本节点的条目直接忽略，避免客户端在两个地址之间来回重定向。
+type discoveryFinder struct {
+	client *discovery.Client
+}
+
+func (f discoveryFinder) Find(ctx context.Context, name string) (string, bool) {
+	entry, ok, err := f.client.Lookup(ctx, name)
+	if err != nil || !ok {
+		return "", false
+	}
+	if entry.Node == f.client.Node() {
+		return "", false
+	}
+	for _, scheme := range []string{"rtsp", "rtsps"} {
+		if u := entry.URL(scheme); u != "" {
+			return u, true
+		}
+	}
+	return "", false
 }
 
 // envOrFlag 返回命令行 flag 值，为空时回退到环境变量。

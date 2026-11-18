@@ -94,29 +94,35 @@ type Server struct {
 	originMu  sync.RWMutex
 	origin    OriginResolver
 	originCtx context.Context
+
+	// S-3：动态发现。本地没有的流若在别的节点上，OPTIONS/DESCRIBE 回
+	// 302 + Location。nil 表示未启用。只在 Serve 之前配置。
+	finder           StreamFinder
+	discoveryTimeout time.Duration
 }
 
 // New 构造一个服务器。live 为 true 时 video 应是从 reader 构造的实时源；
 // audio 传 nil 表示只有视频轨（实时模式就是这么用）。
 func New(video *source.H264Source, audio *source.AACSource, live bool) *Server {
 	return &Server{
-		video:         video,
-		audio:         audio,
-		live:          live,
-		videoPath:     "testdata/test.h264",
-		audioPath:     "testdata/test.aac",
-		sessions:      session.NewManager(session.DefaultTimeout),
-		registry:      stream.NewRegistry(),
-		conns:         make(map[*Conn]struct{}),
-		tunnels:       make(map[string]*httpTunnel),
-		authScheme:    AuthBasic,
-		authSecret:    newAuthSecret(),
-		cseqCheck:     true,
-		multicastAddr: defaultMulticastAddr,
-		multicastTTL:  defaultMulticastTTL,
-		rtcp:          newRTCPScheduler(),
-		degrade:       defaultDegradeConfig,
-		metrics:       metrics.New(),
+		video:            video,
+		audio:            audio,
+		live:             live,
+		videoPath:        "testdata/test.h264",
+		audioPath:        "testdata/test.aac",
+		sessions:         session.NewManager(session.DefaultTimeout),
+		registry:         stream.NewRegistry(),
+		conns:            make(map[*Conn]struct{}),
+		tunnels:          make(map[string]*httpTunnel),
+		authScheme:       AuthBasic,
+		authSecret:       newAuthSecret(),
+		cseqCheck:        true,
+		multicastAddr:    defaultMulticastAddr,
+		multicastTTL:     defaultMulticastTTL,
+		rtcp:             newRTCPScheduler(),
+		degrade:          defaultDegradeConfig,
+		metrics:          metrics.New(),
+		discoveryTimeout: defaultDiscoveryTimeout,
 	}
 }
 

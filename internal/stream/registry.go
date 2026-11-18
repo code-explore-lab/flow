@@ -171,6 +171,9 @@ type Stream struct {
 	// metaData 是推流端发来的 onMetaData（RTMP）。any 保持本包不依赖
 	// internal/flv；具体结构由 rtmp 包解释。带锁，因为它可能晚于拉流到达。
 	metaData any
+	// metaPayload 是 onMetaData 消息的原始 AMF0 负载，供 HTTP-FLV 等
+	// 复用 FLV 封装的协议原样转发。
+	metaPayload []byte
 
 	// createdAt 是流登记到 Registry 的时间，供还没有建轨的流判断活跃度。
 	createdAt time.Time
@@ -299,6 +302,24 @@ func (s *Stream) MetaData() any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.metaData
+}
+
+// SetMetaDataPayload 记录 onMetaData 的原始 AMF0 负载。HTTP-FLV 直接把它
+// 写成一个 FLV script tag，不做重编码。
+func (s *Stream) SetMetaDataPayload(payload []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metaPayload = append(s.metaPayload[:0], payload...)
+}
+
+// MetaDataPayload 返回 onMetaData 原始负载的副本，没有时为 nil。
+func (s *Stream) MetaDataPayload() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.metaPayload) == 0 {
+		return nil
+	}
+	return append([]byte(nil), s.metaPayload...)
 }
 
 // AudioParams 返回音频编码参数的副本。还没收到编码参数时返回 false。

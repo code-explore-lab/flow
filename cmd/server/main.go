@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/httpflv"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/rtmp"
@@ -95,6 +96,12 @@ func main() {
 	rtmpAddr := flag.String("rtmp-addr", ":1935", "RTMP listen address")
 	// T-2：RTMPS 独立监听端口，明文 RTMP :1935 继续可用。
 	rtmpsAddr := flag.String("rtmps-addr", ":1936", "T-2: RTMPS listen address (only used with -tls-cert/-tls-key)")
+	// P-1：HTTP-FLV 分发。默认 :8080，空表示关闭。
+	httpflvAddr := flag.String("httpflv-addr", ":8080", "P-1: HTTP-FLV listen address (empty disables)")
+	httpflvCORS := flag.String("httpflv-cors", "", "P-1: allowed CORS origins, comma-separated (\"*\" allows any; empty disables CORS headers)")
+	httpflvReferer := flag.String("httpflv-referer", "", "P-1: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
+	httpflvRequireReferer := flag.Bool("httpflv-require-referer", false, "P-1: reject requests without a Referer when -httpflv-referer is set")
+	httpflvToken := flag.String("httpflv-token", "", "P-1: playback token, passed as ?token=... or X-Flow-Token (empty disables)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -297,6 +304,17 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// P-1：HTTP-FLV 复用同一份注册表，RTSP/RTMP 推上来的流都能用
+	// http://host:8080/live/<name>.flv 拉取。
+	var httpflvSrv *httpflv.Server
+	if *httpflvAddr != "" {
+		httpflvSrv = httpflv.New(reg, video, audio)
+		httpflvSrv.SetMetrics(flowMetrics)
+		httpflvSrv.SetWhitelist(whitelist)
+		httpflvSrv.SetCORS(*httpflvCORS)
+		httpflvSrv.SetReferer(*httpflvReferer, *httpflvRequireReferer)
+		httpflvSrv.SetToken(*httpflvToken)
+	}
 
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
 	if *metricsAddr != "" {
@@ -311,6 +329,9 @@ func main() {
 	if rtmpsSrv != nil {
 		wg.Add(1)
 	}
+	if httpflvSrv != nil {
+		wg.Add(1)
+	}
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
 		defer wg.Done()
@@ -323,6 +344,9 @@ func main() {
 	go serve("rtmp", *rtmpAddr, rtmpSrv.Serve)
 	if rtmpsSrv != nil {
 		go serve("rtmps", *rtmpsAddr, rtmpsSrv.Serve)
+	}
+	if httpflvSrv != nil {
+		go serve("httpflv", *httpflvAddr, httpflvSrv.Serve)
 	}
 	wg.Wait()
 }

@@ -445,9 +445,10 @@
 
 ## P — 协议与分发扩展（P3）
 
-- [ ] **P-1 HTTP-FLV**
+- [x] **P-1 HTTP-FLV**
   - 复用 FLV 封装，HTTP 长连接推流；支持跨域/防盗链；
   - 验收：`ffplay http://127.0.0.1:8080/live/test.flv` 正常。
+  - ✅ 已实现：新增 `internal/flvmux` 把 `source.Frame` 转成 FLV Tag，逻辑与 RTMP 拉流一致但独立成包供 HTTP-FLV 复用：视频按访问单元合并多 slice、DTS=PTS−CTS 写入 tag 时间戳、CTS 写进 CompositionTime 低 24 位，SPS/PPS（HEVC 含 VPS）生成序列头且支持参数集晚到（先丢媒体帧、补齐后补发序列头）；音频 AAC 生成 ASC 序列头、MP3/G.711 生成裸 tag、Opus 整体跳过；每条轨的时间戳各自从首帧建立相对基准，避免 RTSP 音视频 RTP 时钟相差上亿时互相污染。新增 `internal/httpflv` 服务器：默认监听 `:8080`，路由 `/live/<name>.flv`，先按完整路径查注册表（RTSP 的 `live/<name>`），未命中再用最后一段匹配 RTMP 裸流名，注册表未命中时回退 testdata 本地源；响应为 chunked FLV：文件头 → onMetaData（`stream.SetMetaDataPayload` 保存推流端原始 AMF0 负载，RTMP `handleData` 写入）→ 音视频序列头 → 两条轨的 goroutine 持续泵送。写路径用 `bufio.Writer` + 互斥锁串行化并显式 `http.ResponseController.Flush()`——只刷本地 bufio 时 net/http 自身 2KB 缓冲会让小包卡住、客户端连响应头都收不到（单测曾因此挂死）；每次写前重设 15s 写超时，客户端断开（`r.Context().Done()`）或写失败立即结束另一条轨。安全项都在进入流式响应前完成：CORS 预检（`-httpflv-cors`，支持 `*` 或 Origin 允许列表、回显请求头、`Vary: Origin`）、Referer 防盗链（`-httpflv-referer`/`-httpflv-require-referer`，支持 `example.com`、`*.example.com`，按主机名匹配防 `evil.com/example.com` 绕过）、token（`-httpflv-token`，query `?token=` 或 `X-Flow-Token`，常量时间比较）、复用全局 IP 白名单；`-httpflv-addr` 为空可整体关闭。`cmd/server` 新增对应 flag，与 RTSP/RTMP 共用注册表、指标与白名单。测试新增 `flvmux`（AU 合并、参数集晚到、AAC/MP3/G.711/Opus）与 `httpflv`（完整流式 tag 顺序、HEAD/404/405、路径穿越、CORS、Referer/token、白名单、流名解析），并跑了 `-race`。e2e（ffmpeg 8.0.1）：本地回退 `ffprobe` 解出 h264+aac；RTSP 推 H.264+AAC → HTTP-FLV 解出 h264+aac，RTSP PCMA → `pcm_alaw`，RTSP Opus → 仅视频；RTMP 推 H.264+MP3 → `mp3`；`ffplay -nodisp http://127.0.0.1:8080/live/test.flv` 正常播放；防盗链/令牌/CORS 预检的 403/200/204 分支均符合预期。`gofmt -l .`、`go vet ./...`、`go test ./...` 全部通过。
 - [ ] **P-2 HLS（含 LL-HLS）**
   - 切片、m3u8、音视频分离、低延迟部分段；
   - 验收：浏览器/Safari/ffplay 播放，端到端延迟有数据。

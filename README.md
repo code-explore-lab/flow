@@ -1,15 +1,14 @@
 # flow
 
-Go 实现的 RTSP / RTMP 流媒体服务器：本地文件或 stdin 摄像头作为媒体源，
-RTSP（UDP / TCP interleaved）与 RTMP 按流名共享同一组源，任一协议推上来的流
-另一种协议都能直接拉取。
+Go 实现的 RTSP / RTMP / HTTP-FLV 流媒体服务器：本地文件或 stdin 摄像头作为
+媒体源，三种协议按流名共享同一组源，任一协议推上来的流其他协议都能直接拉取。
 
 ## 构建与运行
 
 ```bash
 go build ./...
 
-go run ./cmd/server        # RTSP :8554，RTMP :1935
+go run ./cmd/server        # RTSP :8554，RTMP :1935，HTTP-FLV :8080
 ```
 
 播放本地测试媒体（`testdata/` 会自动作为兜底源）：
@@ -18,7 +17,13 @@ go run ./cmd/server        # RTSP :8554，RTMP :1935
 ffplay rtsp://127.0.0.1:8554/live
 ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/live
 ffplay rtmp://127.0.0.1:1935/live/test
+ffplay http://127.0.0.1:8080/live/test.flv
 ```
+
+HTTP-FLV 支持跨域与防盗链：`-httpflv-cors` 配置允许的 Origin，
+`-httpflv-referer` / `-httpflv-require-referer` 校验 Referer，
+`-httpflv-token` 要求 `?token=` 或 `X-Flow-Token` 头；
+`-httpflv-addr` 传空可关闭该服务。
 
 从摄像头推实时 H.264（`-live` 表示从 stdin 读 Annex-B 裸流）：
 
@@ -56,11 +61,12 @@ go tool pprof -http=127.0.0.1:8081 cpu.pprof
 
 | 路径 | 说明 |
 | --- | --- |
-| `cmd/server/` | 服务入口：解析参数、组装媒体源、并发启动 RTSP 与 RTMP 服务 |
+| `cmd/server/` | 服务入口：解析参数、组装媒体源、并发启动 RTSP / RTMP / HTTP-FLV 服务 |
 | `cmd/loadtest/` | 压测客户端：N 路并发拉流，统计收包/丢包/建连耗时 |
 | `cmd/demux_test/` | 裸 H.264 文件解复用的小工具 |
 | `internal/rtsp/` | RTSP 协议层：请求解析、会话、鉴权、SR/RR、NACK/PLI、组播等 |
 | `internal/rtmp/` | RTMP 协议层：握手、Chunk、AMF0、publish/play |
+| `internal/httpflv/`, `internal/flvmux/` | HTTP-FLV 分发与 frame→FLV Tag 封装 |
 | `internal/rtp/` | RTP 打包/解包，H.264 与 AAC |
 | `internal/rtcp/` | RTCP 包解析：SR/RR、SDES、BYE、NACK |
 | `internal/rtpbuf/`, `internal/plc/` | 接收侧抖动缓冲、丢包补偿 |

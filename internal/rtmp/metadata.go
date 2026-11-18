@@ -72,4 +72,5 @@ func (c *Conn) handleData(m *Message) {
 		payload: append([]byte(nil), m.Payload...),
 		fields:  fields,
 	})
+	p.stream.SetMetaDataPayload(m.Payload)
 }

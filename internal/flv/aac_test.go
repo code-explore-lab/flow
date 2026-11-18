@@ -94,9 +94,15 @@ func TestParseAudioTagErrors(t *testing.T) {
 	if _, err := ParseAudioTag([]byte{0xAF}); err == nil {
 		t.Fatal("accepted too-short tag")
 	}
-	// MP3（SoundFormat=2）不是 AAC。
-	if _, err := ParseAudioTag([]byte{0x2F, 0x00}); err == nil {
-		t.Fatal("accepted non-AAC sound format")
+	// MP3（SoundFormat=2）现在是支持的格式。
+	if at, err := ParseAudioTag([]byte{0x2F, 0x01, 0x02}); err != nil {
+		t.Fatalf("MP3 tag: %v", err)
+	} else if at.SoundFormat != SoundFormatMP3 || !bytes.Equal(at.Data, []byte{0x01, 0x02}) {
+		t.Fatalf("MP3 tag = %+v", at)
+	}
+	// SoundFormat=5（未支持）仍然报错。
+	if _, err := ParseAudioTag([]byte{0x5F, 0x00}); err == nil {
+		t.Fatal("accepted unsupported sound format")
 	}
 	// 非法 AACPacketType。
 	if _, err := ParseAudioTag([]byte{0xAF, 0x03}); err == nil {

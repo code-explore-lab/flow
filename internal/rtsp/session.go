@@ -101,6 +101,10 @@ type mediaTrack struct {
 	//   - 文件/live 模式为 nil，PLAY 时退回 Server 上的全局源。
 	external *source.ExternalSource
 
+	// stream 是推流轨所属的已发布流。MP3 首帧到达时用它把从帧头解析出
+	// 的真实采样率/声道回写到编码参数，供 RTMP 拉流使用。拉流轨为 nil。
+	stream *stream.Stream
+
 	// 接收侧状态。pushRx 在 RECORD/SETUP 时创建，解包后的帧写进它的
 	// ExternalSource；统计字段供验收对比「收到多少包/帧」。
 	recvMu       sync.Mutex

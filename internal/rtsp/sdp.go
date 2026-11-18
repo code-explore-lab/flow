@@ -276,7 +276,8 @@ func parseFMTP(val string) (string, string, error) {
 
 // resolve 把收齐属性的 m= 段变成一条 announcedTrack。
 func (m *sdpMedia) resolve(index int) (announcedTrack, error) {
-	// m= 可以列出多个 payload type，取第一个带 rtpmap 的。
+	// m= 可以列出多个 payload type，取第一个带 rtpmap 的；
+	// 音频静态 PT（PCMU=0、PCMA=8、MPA=14）允许省略 rtpmap。
 	var (
 		pt string
 		rm sdpRTPMap
@@ -285,6 +286,14 @@ func (m *sdpMedia) resolve(index int) (announcedTrack, error) {
 		if r, ok := m.rtpmap[f]; ok {
 			pt, rm = f, r
 			break
+		}
+	}
+	if pt == "" {
+		for _, f := range m.formats {
+			if r, ok := staticRTPMap(m.kind, f); ok {
+				pt, rm = f, r
+				break
+			}
 		}
 	}
 	if pt == "" {
@@ -316,7 +325,25 @@ func (m *sdpMedia) resolve(index int) (announcedTrack, error) {
 	}, nil
 }
 
-// checkCodec 只接受本服务能处理的编码：视频 H.264 / H.265，音频 RFC 3640 AAC。
+// staticRTPMap 返回 RFC 3551 静态音频 payload type 的默认参数。
+// 推流端（例如 ffmpeg）经常对静态 PT 省略 a=rtpmap，只写 m=audio ... 8。
+func staticRTPMap(kind, pt string) (sdpRTPMap, bool) {
+	if kind != "audio" {
+		return sdpRTPMap{}, false
+	}
+	switch pt {
+	case "0":
+		return sdpRTPMap{encoding: "PCMU", clockRate: 8000, channels: 1}, true
+	case "8":
+		return sdpRTPMap{encoding: "PCMA", clockRate: 8000, channels: 1}, true
+	case "14":
+		return sdpRTPMap{encoding: "MPA", clockRate: 90000}, true
+	}
+	return sdpRTPMap{}, false
+}
+
+// checkCodec 只接受本服务能处理的编码：
+// 视频 H.264 / H.265；音频 AAC、G.711 A/μ-law、Opus、MP3。
 func checkCodec(kind, encoding string) error {
 	switch kind {
 	case "video":
@@ -326,7 +353,8 @@ func checkCodec(kind, encoding string) error {
 			return nil
 		}
 	case "audio":
-		if strings.EqualFold(encoding, "MPEG4-GENERIC") {
+		switch strings.ToUpper(encoding) {
+		case "MPEG4-GENERIC", "PCMA", "PCMU", "OPUS", "MPA", "MP3", "MPEG":
 			return nil
 		}
 	}

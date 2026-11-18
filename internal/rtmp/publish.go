@@ -25,8 +25,10 @@ const defaultAACRate uint32 = 44100
 
 // publishState 一条连接当前的推流状态。只在连接的读循环里读写，不需要锁。
 type publishState struct {
-	stream    *stream.Stream
-	audioRate uint32 //采样率
+	stream     *stream.Stream
+	audioRate  uint32 // AAC 采样率（兼容旧字段）
+	audioClock uint32 // 当前音频 RTP 时钟：AAC=采样率，MP3=90000，G.711=8000
+	audioCodec string // 当前音频编码，用于避免重复登记参数
 }
 
 // stopPublish 注销当前推流并关闭帧源（读循环退出、FCUnpublish、
@@ -118,7 +120,7 @@ func (c *Conn) handleVideo(m *Message) {
 	}
 }
 
-// handleAudio 处理一条 FLV audio tag。
+// handleAudio 处理一条 FLV audio tag，支持 AAC、MP3 和 G.711。
 func (c *Conn) handleAudio(m *Message) {
 	p := c.publish
 	if p == nil {
@@ -130,6 +132,40 @@ func (c *Conn) handleAudio(m *Message) {
 		return
 	}
 
+	switch at.SoundFormat {
+	case flv.SoundFormatAAC:
+		c.handleAACAudio(p, m, at)
+	case flv.SoundFormatMP3:
+		rate, ch := mp3TagParams(at)
+		clock := uint32(90000)
+		// 采样率可能晚于首帧才确定；只在切换编码时登记一次。
+		if p.audioCodec != stream.AudioMP3 {
+			p.audioCodec = stream.AudioMP3
+			p.audioClock = clock
+			p.stream.SetAudioCodec(stream.AudioMP3, nil, rate, ch, clock)
+		}
+		p.writeAudioFrame(at.Data, m.Timestamp, clock)
+	case flv.SoundFormatALaw, flv.SoundFormatMuLaw:
+		codec := stream.AudioPCMA
+		if at.SoundFormat == flv.SoundFormatMuLaw {
+			codec = stream.AudioPCMU
+		}
+		ch := uint8(1)
+		if at.SoundType == 1 {
+			ch = 2
+		}
+		clock := uint32(8000)
+		if p.audioCodec != codec {
+			p.audioCodec = codec
+			p.audioClock = clock
+			p.stream.SetAudioCodec(codec, nil, clock, ch, clock)
+		}
+		p.writeAudioFrame(at.Data, m.Timestamp, clock)
+	}
+}
+
+// handleAACAudio 处理 AAC 序列头/裸 AU，保持原有行为。
+func (c *Conn) handleAACAudio(p *publishState, m *Message, at *flv.AudioTag) {
 	switch at.PacketType {
 	// 存放音频编码配置
 	case flv.AACSeqHeader:
@@ -139,6 +175,8 @@ func (c *Conn) handleAudio(m *Message) {
 			return
 		}
 		p.audioRate = uint32(rate)
+		p.audioClock = uint32(rate)
+		p.audioCodec = stream.AudioAAC
 		p.stream.SetAudioParams(at.Config, uint32(rate), ch)
 		// AAC原始音频帧
 	case flv.AACRaw:
@@ -157,6 +195,42 @@ func (c *Conn) handleAudio(m *Message) {
 			Keyframe:  true,
 		})
 	}
+}
+
+// writeAudioFrame 把非 AAC 音频帧写入共享源，时间戳换算到 RTP 时钟。
+func (p *publishState) writeAudioFrame(data []byte, ms, clock uint32) {
+	src := p.stream.SourceFor("audio")
+	if src == nil {
+		p.stream.EnsureAudio(clock)
+		src = p.stream.SourceFor("audio")
+	}
+	src.Write(source.Frame{
+		Data:      data,
+		Timestamp: audioTimestamp(ms, clock),
+		Keyframe:  true,
+	})
+}
+
+// mp3TagParams 从 MP3 tag 里取采样率/声道：优先解析帧头，
+// 解析失败时退回 FLV 的 SoundRate/SoundType 提示值。
+func mp3TagParams(at *flv.AudioTag) (uint32, uint8) {
+	if info, ok := media.ParseMP3Frame(at.Data); ok {
+		return info.SampleRate, info.Channels
+	}
+	rate := uint32(44100)
+	switch at.SoundRate {
+	case 0:
+		rate = 5512
+	case 1:
+		rate = 11025
+	case 2:
+		rate = 22050
+	}
+	ch := uint8(1)
+	if at.SoundType == 1 {
+		ch = 2
+	}
+	return rate, ch
 }
 
 // videoTimestamp FLV 毫秒时间戳 → 90kHz RTP 时间戳。

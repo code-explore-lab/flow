@@ -7,6 +7,7 @@ import (
 
 	"flow/internal/flv"
 	"flow/internal/source"
+	"flow/internal/stream"
 )
 
 // readMessageWithin 带超时地读一条消息，避免测试挂死。
@@ -593,5 +594,114 @@ func TestPlayH264IgnoresLegacyFourCCList(t *testing.T) {
 	}
 	if tag.Codec != "H264" {
 		t.Fatalf("codec = %q, want H264", tag.Codec)
+	}
+}
+
+// TestPlayMP3FromRegistry 校验 MP3 帧按 FLV SoundFormat=2 发送，
+// 时间戳按 90kHz 时钟换算成毫秒。
+func TestPlayMP3FromRegistry(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := mustPublish(t, srv.registry, "mp3")
+	st.SetAudioCodec(stream.AudioMP3, nil, 44100, 2, 90000)
+	st.EnsureAudio(90000)
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	startPlay(t, server, client, "mp3")
+	defer stopPlayer(t, server, client)
+
+	frame1 := append([]byte{0xFF, 0xFB, 0x90, 0x00}, 0x01, 0x02)
+	frame2 := append([]byte{0xFF, 0xFB, 0x90, 0x00}, 0x03, 0x04)
+	src := st.SourceFor("audio")
+	src.Write(source.Frame{Data: frame1, Timestamp: 9000, Keyframe: true})
+	src.Write(source.Frame{Data: frame2, Timestamp: 18000, Keyframe: true})
+
+	for i, want := range []struct {
+		data []byte
+		ts   uint32
+	}{{frame1, 0}, {frame2, 100}} {
+		m := readMessageWithin(t, client)
+		if m.TypeID != msgAudio {
+			t.Fatalf("frame %d type = %d, want audio", i, m.TypeID)
+		}
+		tag, err := flv.ParseAudioTag(m.Payload)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		if tag.SoundFormat != flv.SoundFormatMP3 || !bytes.Equal(tag.Data, want.data) {
+			t.Fatalf("frame %d tag = %+v", i, tag)
+		}
+		if m.Timestamp != want.ts {
+			t.Fatalf("frame %d ts = %d, want %d", i, m.Timestamp, want.ts)
+		}
+	}
+}
+
+// TestPlayG711FromRegistry 校验 G.711 按 A-law/μ-law sound format 发送。
+func TestPlayG711FromRegistry(t *testing.T) {
+	cases := []struct {
+		codec    string
+		soundFmt uint8
+	}{
+		{stream.AudioPCMA, flv.SoundFormatALaw},
+		{stream.AudioPCMU, flv.SoundFormatMuLaw},
+	}
+	for _, tc := range cases {
+		t.Run(tc.codec, func(t *testing.T) {
+			srv := New(nil, nil, nil)
+			st := mustPublish(t, srv.registry, "g711")
+			st.SetAudioCodec(tc.codec, nil, 8000, 1, 8000)
+			st.EnsureAudio(8000)
+
+			server, client := pipeConns(t)
+			server.srv = srv
+			startPlay(t, server, client, "g711")
+			defer stopPlayer(t, server, client)
+
+			data1 := []byte{0xD5, 0x00}
+			data2 := []byte{0x7F, 0x11}
+			src := st.SourceFor("audio")
+			src.Write(source.Frame{Data: data1, Timestamp: 800, Keyframe: true})
+			src.Write(source.Frame{Data: data2, Timestamp: 1600, Keyframe: true})
+
+			for i, want := range []struct {
+				data []byte
+				ts   uint32
+			}{{data1, 0}, {data2, 100}} {
+				m := readMessageWithin(t, client)
+				tag, err := flv.ParseAudioTag(m.Payload)
+				if err != nil {
+					t.Fatalf("frame %d: %v", i, err)
+				}
+				if tag.SoundFormat != tc.soundFmt || !bytes.Equal(tag.Data, want.data) {
+					t.Fatalf("frame %d tag = %+v", i, tag)
+				}
+				if m.Timestamp != want.ts {
+					t.Fatalf("frame %d ts = %d, want %d", i, m.Timestamp, want.ts)
+				}
+			}
+		})
+	}
+}
+
+// TestPlayOpusSkipsAudio 校验 FLV 无法承载的编码不会把错误负载发出去：
+// 音频轨被跳过，客户端收不到 audio 消息。
+func TestPlayOpusSkipsAudio(t *testing.T) {
+	srv := New(nil, nil, nil)
+	st := mustPublish(t, srv.registry, "opus")
+	st.SetAudioCodec(stream.AudioOpus, nil, 48000, 2, 48000)
+	st.EnsureAudio(48000)
+
+	server, client := pipeConns(t)
+	server.srv = srv
+	startPlay(t, server, client, "opus")
+	defer stopPlayer(t, server, client)
+
+	src := st.SourceFor("audio")
+	src.Write(source.Frame{Data: []byte{0x78, 0x01}, Timestamp: 4800, Keyframe: true})
+
+	_ = server.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if m, err := server.readMessage(); err == nil {
+		t.Fatalf("unexpected message type %d for Opus audio", m.TypeID)
 	}
 }

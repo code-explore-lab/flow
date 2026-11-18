@@ -424,9 +424,10 @@
   - RTMP：Enhanced RTMP / HEVC FourCC；拉流端对老客户端优雅降级；
   - 验收：HEVC 推拉 RTSP/RTMP，另一协议能转出。
   - ✅ 已实现：`stream.VideoCodec` 增加 `Codec`/`VPS`，`media.ClassifyVideoNAL` 统一 H.264/H.265 的 VPS/SPS/PPS/IDR/VCL 判定；新增 RFC 7798 `H265Packer`/`H265Depacketizer`（单 NALU / AP / FU）。RTSP 侧支持 SDP `H265/90000`、ANNOUNCE 解析与合成 `sprop-vps/sps/pps`、推流解包与拉流按编码选 packer。RTMP 侧实现 Enhanced RTMP `hvc1` FourCC 的序列头 / CodedFrames / Metadata 忽略、HEVCDecoderConfigurationRecord 编解码，并按 `fourCcList` 对不含 `hvc1` 的老客户端回 `NetStream.Play.Failed`。本地 `-live`/testdata 源仍为 H.264，HEVC 只来自推流。测试覆盖 NAL 分类、packer/depacketizer 往返、FLV 配置记录与标签、RTSP/RTMP HEVC 路径、老客户端拒绝；e2e（ffmpeg 8.0.1/libx265）RTSP→RTMP、RTMP→RTSP、RTSP→RTSP 均解出 `hevc 640x360`。
-- [ ] **F-2 音频扩展**
+- [x] **F-2 音频扩展**
   - RTSP：G.711（PCMA/PCMU）、Opus、MP3；RTMP：MP3/G.711（按需求）；
   - 验收：各编码单独推拉成功，音画同步。
+  - ✅ 已实现：音频模型从「AAC + ASC」扩展为「编码名 + 配置 + 采样率 + RTP 时钟 + 声道」（`stream.AudioCodec` 新增 `Codec`/`SampleRate`/`ClockRate`/`Channels`，`SetAudioCodec`/`NormalizeAudioCodec`/`AudioClockRate`/`DefaultAudioSampleRate`）。关键点是 MP3 的 RTP 时钟固定 90000、采样率 44100，二者不能混用，否则 RTMP 时间戳会漂一倍；帧源里统一存各编码的 RTP 时钟时间戳，RTMP 拉流时再换算成毫秒。新增 `media.ParseMP3Frame`（MPEG1/2/2.5 各层帧长/采样率/声道）、`rtp.G711Packer`/`OpusPacker`/`MPAPacker` 与 `rtp.MPADepacketizer`（RFC 2250 4 字节头、跨包分片重组；兼容 ffmpeg「一个 RTP 包放多个完整帧且不置 marker」的封装，按帧头切分并逐帧递推时间戳，同步丢失时重找同步字）。FLV 支持 SoundFormat 2/7/8 的构造与解析（`BuildAudioTagFor`），未知格式仍按 AAC。RTSP 侧 SDP 对静态 PT 0/8/14 在缺少 `a=rtpmap` 时按 RFC 3551 兜底，ANNOUNCE 推导编码/时钟/声道，合成 SDP 输出 PCMU→PT0、PCMA→PT8、Opus→PT97(48000/2)、MP3→PT14(MPA/90000)、AAC→PT97(MPEG4-GENERIC)；推流端原始负载直写帧源，MP3 用首帧头回填采样率；拉流端 `streamAAC` 按编码选封包器，G.711 分片时间戳按字节数递增。RTMP 推流识别 MP3/A-law/μ-law 并登记参数，拉流按编码生成 FLV tag；FLV 无 Opus 映射，遇到 Opus 只跳过音频、视频继续。跨协议无需转码：AAC/MP3/G.711 在 RTSP↔RTMP 双向可用，Opus 仅 RTSP。测试新增 `media/mp3_test.go`、`rtp/audio_test.go`、`flv/audio_raw_test.go`、`rtsp/audio_test.go`、RTMP 推/拉音频用例与 Opus 跳过用例。e2e（ffmpeg 8.0.1）：RTSP PCMA/PCMU/Opus/MP3 与 RTMP MP3/PCMA/PCMU 单独推拉均解出正确编码（`pcm_alaw`/`pcm_mulaw`/`opus`/`mp3`），跨协议 RTSP PCMA→RTMP、RTMP MP3→RTSP 正常，RTSP Opus→RTMP 只出视频；各 5s 抓包音视频时间戳跨度差 ≤32ms，无累积漂移。`gofmt -l .`、`go vet ./...`、`go test ./...` 全部通过。
 - [ ] **F-3 转封装 / 录制**
   - 把实时流写成 MP4/FLV/TS（按关键帧切分、断点续录、磁盘配额）；
   - 验收：录制 1 分钟文件可被 ffprobe/ffplay 正常播放。

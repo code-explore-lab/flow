@@ -28,6 +28,7 @@ import (
 	"flow/internal/rtpbuf"
 	"flow/internal/session"
 	"flow/internal/source"
+	"flow/internal/stream"
 )
 
 // defaultPLIInterval 是两次 PLI 之间的最小间隔。5% 丢包下如果每个
@@ -38,10 +39,13 @@ const defaultPLIInterval = 500 * time.Millisecond
 // 每个 mediaTrack 独占一个，接收路径是单 goroutine（interleaved 由
 // handleConn 串行处理，UDP 每轨一个读 goroutine），所以解包器不需要锁。
 type pushReceiver struct {
-	external *source.ExternalSource
-	h264     *rtp.H264Depacketizer
-	h265     *rtp.H265Depacketizer
-	aac      *rtp.AACDepacketizer
+	external   *source.ExternalSource
+	h264       *rtp.H264Depacketizer
+	h265       *rtp.H265Depacketizer
+	aac        *rtp.AACDepacketizer
+	audioCodec string               // 非 AAC 音频编码：PCMA/PCMU/OPUS/MP3
+	mpa        *rtp.MPADepacketizer // MP3 分片重组；仅 MP3 使用
+	mp3RateSet bool                 // 已从首个 MP3 帧头修正采样率
 
 	// 接收侧 jitter buffer 与 NACK 缺口跟踪（R-6）。
 	// 收到的包先入 jbuf，按 seq 排序、等满 delay 后才解包；缺口由 nack
@@ -142,6 +146,14 @@ func newPushReceiver(encoding, fmtp string, framerate float64, external *source.
 			if ch, ok := plc.AACLCChannels(asc); ok {
 				rx.aacChannels = ch
 			}
+		}
+	case "PCMA", "PCMU", "OPUS", "MPA", "MP3", "MPEG":
+		if rx.external == nil {
+			rx.external = source.NewExternalAudioSource()
+		}
+		rx.audioCodec = audioCodecFromSDP(encoding)
+		if rx.audioCodec == stream.AudioMP3 {
+			rx.mpa = rtp.NewMPADepacketizer()
 		}
 	default:
 		return nil, fmt.Errorf("unsupported push encoding %q", encoding)
@@ -304,6 +316,9 @@ func (rx *pushReceiver) deliver(track *mediaTrack, pkt *rtp.RTPPacket, rawLen in
 
 	case rx.aac != nil:
 		rx.handleAAC(track, pkt, ev)
+
+	case rx.audioCodec != "":
+		rx.handleRawAudio(track, pkt)
 	}
 
 	if ev.count%100 == 0 {
@@ -571,6 +586,54 @@ func (rx *pushReceiver) handleAAC(track *mediaTrack, pkt *rtp.RTPPacket, ev recv
 			fmt.Printf("push frame recv (%s): first AU %d bytes ts=%d\n",
 				track.kind, len(data), auTS)
 		}
+	}
+}
+
+// handleRawAudio 处理 G.711 / Opus / MP3 推流包。
+//
+// G.711 和 Opus 的 payload 就是完整音频帧，直接发布；MP3 按 RFC 2250
+// 先重组分片。这些编码不做静音 PLC，丢包只表现为音频短暂中断。
+func (rx *pushReceiver) handleRawAudio(track *mediaTrack, pkt *rtp.RTPPacket) {
+	switch rx.audioCodec {
+	case stream.AudioMP3:
+		// 一个 RTP 包可能含多个完整 MP3 帧，逐帧写源。
+		frames, ok := rx.mpa.Depacketize(pkt)
+		if !ok {
+			return
+		}
+		for _, f := range frames {
+			// SDP 拿不到 MP3 采样率，用首个完整帧头修正，供 RTMP 拉流写
+			// FLV SoundRate/声道提示。失败时保留占位的 44100/2。
+			if !rx.mp3RateSet {
+				if info, ok := media.ParseMP3Frame(f.Data); ok {
+					rx.mp3RateSet = true
+					if track.stream != nil {
+						track.stream.SetAudioCodec(stream.AudioMP3, nil,
+							info.SampleRate, info.Channels, 90000)
+					}
+				}
+			}
+			rx.writeRawFrame(track, f.Data, f.Timestamp)
+		}
+	default:
+		if len(pkt.Payload) == 0 {
+			return
+		}
+		// RTP 接收缓冲区会被复用，写源前必须复制。
+		data := append([]byte(nil), pkt.Payload...)
+		rx.writeRawFrame(track, data, pkt.Header.Timestamp)
+	}
+}
+
+// writeRawFrame 把一个非 AAC 音频帧写进共享源并记录首帧日志。
+func (rx *pushReceiver) writeRawFrame(track *mediaTrack, data []byte, ts uint32) {
+	if rx.external == nil {
+		return
+	}
+	rx.external.Write(source.Frame{Data: data, Timestamp: ts, Keyframe: true})
+	if frames := track.recordFrame(); frames == 1 {
+		fmt.Printf("push frame recv (%s): first %s frame %d bytes ts=%d\n",
+			track.kind, rx.audioCodec, len(data), ts)
 	}
 }
 

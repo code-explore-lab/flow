@@ -72,10 +72,83 @@ type VideoCodec struct {
 	PPS   []byte
 }
 
-// AudioCodec 音频编码参数。Config 是 AudioSpecificConfig（2 字节）。
+// 音频编码名，跨 RTSP/RTMP 统一使用这组常量。
+const (
+	AudioAAC  = "AAC"
+	AudioPCMA = "PCMA" // G.711 A-law
+	AudioPCMU = "PCMU" // G.711 μ-law
+	AudioOpus = "OPUS"
+	AudioMP3  = "MP3"
+)
+
+// NormalizeAudioCodec 把协议里的编码别名归一成上面的常量。
+// 空串按 AAC 处理，兼容早期只有 AAC 的调用方。
+func NormalizeAudioCodec(codec string) string {
+	switch strings.ToUpper(strings.TrimSpace(codec)) {
+	case "", "AAC", "MPEG4-GENERIC":
+		return AudioAAC
+	case "PCMA", "G711A", "ALAW", "A-LAW":
+		return AudioPCMA
+	case "PCMU", "G711U", "ULAW", "MU-LAW":
+		return AudioPCMU
+	case "OPUS":
+		return AudioOpus
+	case "MP3", "MPA", "MPEG":
+		return AudioMP3
+	}
+	return strings.ToUpper(strings.TrimSpace(codec))
+}
+
+// AudioClockRate 返回编码的 RTP 时钟频率。MP3 按 RFC 2250 固定 90kHz，
+// 其余编码使用采样率（PCMA/PCMU 8k、Opus 48k、AAC 随 ASC）。
+func AudioClockRate(codec string, sampleRate uint32) uint32 {
+	switch NormalizeAudioCodec(codec) {
+	case AudioMP3:
+		return 90000
+	case AudioPCMA, AudioPCMU:
+		if sampleRate == 0 {
+			return 8000
+		}
+		return sampleRate
+	case AudioOpus:
+		if sampleRate == 0 {
+			return 48000
+		}
+		return sampleRate
+	default:
+		if sampleRate == 0 {
+			return 44100
+		}
+		return sampleRate
+	}
+}
+
+// DefaultAudioSampleRate 返回编码在缺少显式参数时使用的采样率。
+func DefaultAudioSampleRate(codec string) uint32 {
+	switch NormalizeAudioCodec(codec) {
+	case AudioPCMA, AudioPCMU:
+		return 8000
+	case AudioOpus:
+		return 48000
+	case AudioMP3:
+		return 44100
+	default:
+		return 44100
+	}
+}
+
+// AudioCodec 音频编码参数。
+//
+// Config 是编码相关配置：AAC 为 AudioSpecificConfig，Opus 为 OpusHead /
+// 声道映射，PCMA/PCMU/MP3 为空。
+//
+// SampleRate 和 ClockRate 必须分开：MP3 的 RTP 时钟固定 90000，而采样率
+// 通常是 44100，混用会让 RTMP 的毫秒时间戳偏差约一倍。
 type AudioCodec struct {
+	Codec      string // "AAC" / "PCMA" / "PCMU" / "OPUS" / "MP3"
 	Config     []byte
-	SampleRate uint32
+	SampleRate uint32 // 音频采样率（RTMP/FLV 用）
+	ClockRate  uint32 // RTP 时钟频率（RTSP/RTP 时间戳用）
 	Channels   uint8
 }
 
@@ -169,14 +242,34 @@ func (s *Stream) SetVideoParams(codec string, vps, sps, pps []byte) {
 	}
 }
 
-// SetAudioParams 记录 AAC 的 AudioSpecificConfig、采样率和声道数。
-func (s *Stream) SetAudioParams(asc []byte, rate uint32, ch uint8) {
+// SetAudioCodec 记录音频编码、配置、采样率、声道数和 RTP 时钟。
+// clockRate 为 0 时按编码推导（MP3=90000，其余=采样率）。
+func (s *Stream) SetAudioCodec(codec string, config []byte, rate uint32, ch uint8, clockRate uint32) {
+	codec = NormalizeAudioCodec(codec)
+	if rate == 0 {
+		rate = DefaultAudioSampleRate(codec)
+	}
+	if clockRate == 0 {
+		clockRate = AudioClockRate(codec, rate)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := s.ensureAudioLocked(rate)
-	t.Audio.Config = append([]byte(nil), asc...)
+	t.Audio.Codec = codec
+	t.Audio.Config = append([]byte(nil), config...)
 	t.Audio.SampleRate = rate
+	t.Audio.ClockRate = clockRate
 	t.Audio.Channels = ch
+	// 帧源的 SamplingRate 用作 RTP 时钟（RTCP SR / RTSP 拉流）。
+	if t.Src != nil {
+		t.Src.SetSamplingRate(clockRate)
+	}
+}
+
+// SetAudioParams 记录 AAC 的 AudioSpecificConfig、采样率和声道数。
+// AAC 的 RTP 时钟等于采样率，保留这个入口兼容原调用方。
+func (s *Stream) SetAudioParams(asc []byte, rate uint32, ch uint8) {
+	s.SetAudioCodec(AudioAAC, asc, rate, ch, rate)
 }
 
 // VideoParams 返回视频编码参数的副本。还没收到 SPS 时返回 false。
@@ -208,14 +301,27 @@ func (s *Stream) MetaData() any {
 	return s.metaData
 }
 
-// AudioParams 返回音频编码参数的副本。还没收到 ASC 时返回 false。
+// AudioParams 返回音频编码参数的副本。还没收到编码参数时返回 false。
+// PCMA/PCMU/MP3 没有 Config，靠 Codec 字段判断参数已就绪。
 func (s *Stream) AudioParams() (*AudioCodec, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.Audio == nil || s.Audio.Audio == nil || len(s.Audio.Audio.Config) == 0 {
+	if s.Audio == nil || s.Audio.Audio == nil {
 		return nil, false
 	}
 	a := *s.Audio.Audio
+	if a.Codec == "" && len(a.Config) == 0 {
+		return nil, false
+	}
+	if a.Codec == "" {
+		a.Codec = AudioAAC
+	}
+	if a.SampleRate == 0 {
+		a.SampleRate = DefaultAudioSampleRate(a.Codec)
+	}
+	if a.ClockRate == 0 {
+		a.ClockRate = AudioClockRate(a.Codec, a.SampleRate)
+	}
 	a.Config = append([]byte(nil), a.Config...)
 	return &a, true
 }

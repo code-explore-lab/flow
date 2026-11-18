@@ -7,6 +7,7 @@ import (
 	"flow/internal/media"
 	"flow/internal/rtp"
 	"flow/internal/source"
+	"flow/internal/stream"
 )
 
 // videoPacker 是 H.264/H.265 封包器的共同接口：把一批同帧 NALU
@@ -272,10 +273,16 @@ func subscribeVideo(src videoFrameSource, start time.Duration, scale float64) (*
 	return rd, cancel, nil
 }
 
-// streamAAC 每个客户端一条订阅 goroutine：从共享音频源拿 AU → RFC 3640 封包 → 发送。
-// 音频时间戳（采样数，每个 AU +1024）由源统一维护，客户端只负责封包和 seq/SSRC。
-// start/scale 语义同 streamH264：文件模式 seek 到同一时间点并按同一倍率播放，
-// 保持音视频内容对齐。返回值语义同 streamH264：true 表示音频源结束。
+// audioPacker 音频封包器：AAC / G.711 / Opus / MP3 的统一入口。
+type audioPacker interface {
+	Pack([]byte) ([]*rtp.RTPPacket, error)
+}
+
+// streamAAC 每个客户端一条订阅 goroutine：从共享音频源拿帧 → 按编码封包 → 发送。
+//
+// 帧源里的时间戳已经是该编码的 RTP 时钟：AAC 每 AU +1024，G.711 每字节
+// 1 采样，Opus 保留入站包时间戳，MP3 为 90kHz。客户端只负责封包和 seq/SSRC。
+// 函数名沿用历史命名，实际按 track.encoding 选择封包器（空编码按 AAC）。
 func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan struct{}, start time.Duration, scale float64) bool {
 	reader, cancel, err := subscribeVideo(src, start, scale)
 	if err != nil {
@@ -284,13 +291,44 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 	}
 	defer cancel()
 
-	packer := rtp.NewAACPacker()
-	if track.payloadType > 0 {
-		packer.PT = uint8(track.payloadType)
+	codec := stream.NormalizeAudioCodec(track.encoding)
+	var packer audioPacker
+	pcm := false
+	switch codec {
+	case stream.AudioPCMA:
+		p := rtp.NewPCMAPacker()
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer, pcm = p, true
+	case stream.AudioPCMU:
+		p := rtp.NewPCMUPacker()
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer, pcm = p, true
+	case stream.AudioOpus:
+		p := rtp.NewOpusPacker()
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer = p
+	case stream.AudioMP3:
+		p := rtp.NewMPAPacker()
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer = p
+	default:
+		p := rtp.NewAACPacker()
+		if track.payloadType > 0 {
+			p.PT = uint8(track.payloadType)
+		}
+		packer = p
 	}
 	var dropped uint64
 	ssrc := track.ensureSSRC()
-	// 只设置一次RTCP的时钟频率
+	// 只设置一次 RTCP 的时钟频率。
 	rateSet := false
 	for {
 		f, ok := reader.Next(done)
@@ -299,7 +337,7 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 				fmt.Println("audio stream stopped")
 				return false
 			}
-			fmt.Println("aac source ended")
+			fmt.Printf("%s source ended\n", codec)
 			return true
 		}
 		if d := reader.Dropped(); d != dropped {
@@ -307,8 +345,8 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 			fmt.Printf("audio stream: dropped %d old frames (slow consumer)\n", d-dropped)
 			dropped = d
 		}
-		// RTCP SR 的 RTP 时钟 = AAC 采样率。
-		// 文件源在第一帧到达时已经解析完 ADTS 头；推流源来自 ANNOUNCE rtpmap。
+		// RTCP SR 的 RTP 时钟：文件源首帧解析出采样率，推流源来自
+		// ANNOUNCE/RTMP 登记的 ClockRate（MP3=90000）。
 		if !rateSet {
 			track.setClockRate(src.SamplingRate())
 			rateSet = true
@@ -317,9 +355,10 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 		if err != nil {
 			continue
 		}
+		ts := f.Timestamp
 		for _, p := range pkts {
 			p.Header.Seq = uint16(track.nextSeq())
-			p.Header.Timestamp = f.Timestamp
+			p.Header.Timestamp = ts
 			p.Header.SSRC = ssrc
 			data, err := p.Header.Marshal(p.Payload)
 			if err != nil {
@@ -333,6 +372,10 @@ func (s *Server) streamAAC(track *mediaTrack, src audioFrameSource, done <-chan 
 			s.metrics.AddPackets(track.kind, 1)
 			s.metrics.AddOctets(track.kind, uint64(len(p.Payload)))
 			track.cacheSent(p.Header.Seq, data)
+			// G.711 一个包里的字节数就是采样数，后续分片时间戳顺延。
+			if pcm {
+				ts += uint32(len(p.Payload))
+			}
 		}
 	}
 }

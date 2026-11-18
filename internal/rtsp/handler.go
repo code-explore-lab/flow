@@ -577,6 +577,7 @@ func (s *Server) handleSetup(conn *Conn, req *Request, hd map[string]string) err
 	}
 	if pubForTrack != nil {
 		t.external = pubForTrack.SourceFor(kind)
+		t.stream = pubForTrack
 	}
 
 	// R-12：客户端用 client_port=A-A（或显式 rtcp-mux 参数）接受单端口复用。

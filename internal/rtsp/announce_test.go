@@ -131,7 +131,7 @@ func TestParseAnnounceSDPErrors(t *testing.T) {
 		{name: "视频编码不支持", body: minVideoSDP("VP8"), wantErr: errUnsupportedCodec},
 		{
 			name:    "音频编码不支持",
-			body:    "v=0\r\nm=audio 0 RTP/AVP 98\r\na=rtpmap:98 OPUS/48000/2\r\n",
+			body:    "v=0\r\nm=audio 0 RTP/AVP 98\r\na=rtpmap:98 G722/8000/1\r\n",
 			wantErr: errUnsupportedCodec,
 		},
 	}

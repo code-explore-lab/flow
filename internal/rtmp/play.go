@@ -52,13 +52,14 @@ type playState struct {
 	wg       sync.WaitGroup
 
 	// 已解析的帧源与编码参数，seek 时按原样重新订阅。
-	video     frameSource
-	audio     frameSource
-	vparams   *stream.VideoCodec
-	aparams   *stream.AudioCodec
-	audioRate uint32
-	audioCh   uint8
-	codec     string
+	video      frameSource
+	audio      frameSource
+	vparams    *stream.VideoCodec
+	aparams    *stream.AudioCodec
+	audioRate  uint32 // 音频采样率（FLV SoundRate 提示值）
+	audioClock uint32 // 音频 RTP 时钟（源帧时间戳 → FLV 毫秒）
+	audioCh    uint8
+	codec      string
 
 	// 每条轨一个播放时钟；seek 重启 goroutine 后由同一个 playState 延续，
 	// 保证 DTS 不回退。只有对应轨的播放 goroutine 访问（重启前已 wg.Wait）。
@@ -303,12 +304,13 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 	c.stopPlay()
 
 	var (
-		video     frameSource
-		audio     frameSource
-		vparams   *stream.VideoCodec
-		aparams   *stream.AudioCodec
-		audioRate uint32
-		audioCh   uint8
+		video      frameSource
+		audio      frameSource
+		vparams    *stream.VideoCodec
+		aparams    *stream.AudioCodec
+		audioRate  uint32
+		audioClock uint32
+		audioCh    uint8
 	)
 
 	var st *stream.Stream
@@ -325,6 +327,7 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		if p, ok := st.AudioParams(); ok {
 			aparams = p
 			audioRate, audioCh = p.SampleRate, p.Channels
+			audioClock = p.ClockRate
 		}
 	} else {
 		// 注册表没有这条流：回退本地源（ffplay rtmp://.../live/test 放 testdata）。
@@ -334,9 +337,11 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		if c.srv.audio != nil {
 			audio = c.srv.audio
 			audioRate = c.srv.audio.SamplingRate()
+			audioClock = audioRate
 			if p := localAudioParams(c.srv.audio); p != nil {
 				aparams = p
 				audioRate, audioCh = p.SampleRate, p.Channels
+				audioClock = p.ClockRate
 			}
 		}
 	}
@@ -367,15 +372,16 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 	}
 
 	ps := &playState{
-		streamID:  streamID,
-		cancel:    make(chan struct{}),
-		video:     video,
-		audio:     audio,
-		vparams:   vparams,
-		aparams:   aparams,
-		audioRate: audioRate,
-		audioCh:   audioCh,
-		codec:     codec,
+		streamID:   streamID,
+		cancel:     make(chan struct{}),
+		video:      video,
+		audio:      audio,
+		vparams:    vparams,
+		aparams:    aparams,
+		audioRate:  audioRate,
+		audioClock: audioClock,
+		audioCh:    audioCh,
+		codec:      codec,
 	}
 	c.play = ps
 
@@ -521,16 +527,17 @@ func (c *Conn) handleSeek(streamID uint32, cmd *Command) error {
 	ps.stop()
 
 	np := &playState{
-		streamID:  streamID,
-		cancel:    make(chan struct{}),
-		video:     ps.video,
-		audio:     ps.audio,
-		vparams:   ps.vparams,
-		aparams:   ps.aparams,
-		audioRate: ps.audioRate,
-		audioCh:   ps.audioCh,
-		codec:     ps.codec,
-		tsOffset:  ps.seekOffset(),
+		streamID:   streamID,
+		cancel:     make(chan struct{}),
+		video:      ps.video,
+		audio:      ps.audio,
+		vparams:    ps.vparams,
+		aparams:    ps.aparams,
+		audioRate:  ps.audioRate,
+		audioClock: ps.audioClock,
+		audioCh:    ps.audioCh,
+		codec:      ps.codec,
+		tsOffset:   ps.seekOffset(),
 	}
 	c.play = np
 
@@ -754,15 +761,34 @@ func ticksToMillis(ticks int64) int64 {
 }
 
 // playAudio 把音频帧转成 FLV audio tag 发送。
+//
+// FLV 只能承载 AAC、MP3 和 G.711；Opus 等编码直接跳过音频轨，
+// 视频继续发送，而不是把不支持的负载标成 AAC 发出去。
 func (c *Conn) playAudio(ps *playState, rd *source.Reader[source.Frame], unsubscribe func(),
 	params *stream.AudioCodec, rate uint32, ch uint8) {
 	defer ps.wg.Done()
 	defer unsubscribe()
 
-	if rate == 0 {
-		rate = defaultAACRate
+	codec := stream.AudioAAC
+	if params != nil && params.Codec != "" {
+		codec = stream.NormalizeAudioCodec(params.Codec)
 	}
-	if params != nil && len(params.Config) > 0 {
+	switch codec {
+	case stream.AudioAAC, stream.AudioMP3, stream.AudioPCMA, stream.AudioPCMU:
+	default:
+		fmt.Printf("rtmp: audio codec %s cannot be muxed into FLV, skipping audio\n", codec)
+		return
+	}
+
+	if rate == 0 {
+		rate = stream.DefaultAudioSampleRate(codec)
+	}
+	clockRate := ps.audioClock
+	if clockRate == 0 {
+		clockRate = stream.AudioClockRate(codec, rate)
+	}
+
+	if codec == stream.AudioAAC && params != nil && len(params.Config) > 0 {
 		if err := c.writeMessage(&Message{
 			TypeID:   msgAudio,
 			StreamID: ps.streamID,
@@ -779,7 +805,7 @@ func (c *Conn) playAudio(ps *playState, rd *source.Reader[source.Frame], unsubsc
 		rebase  bool
 	)
 	send := func(f source.Frame) bool {
-		ms := uint32(uint64(f.Timestamp) * 1000 / uint64(rate))
+		ms := uint32(uint64(f.Timestamp) * 1000 / uint64(clockRate))
 		if rebase {
 			clock.rebase(ms)
 			rebase = false
@@ -788,7 +814,7 @@ func (c *Conn) playAudio(ps *playState, rd *source.Reader[source.Frame], unsubsc
 			TypeID:    msgAudio,
 			StreamID:  ps.streamID,
 			Timestamp: clock.relative(ms) + ps.tsOffset,
-			Payload:   flv.BuildAudioTag(f.Data, rate, ch),
+			Payload:   flv.BuildAudioTagFor(codec, f.Data, rate, ch),
 		}, audioCSID) == nil
 	}
 
@@ -813,9 +839,12 @@ func localAudioParams(src *source.AACSource) *stream.AudioCodec {
 		fmt.Printf("rtmp: read aac info from %s: %v\n", src.Path(), err)
 		return nil
 	}
+	rate := uint32(info.SamplingFrequency)
 	return &stream.AudioCodec{
+		Codec:      stream.AudioAAC,
 		Config:     info.Config,
-		SampleRate: uint32(info.SamplingFrequency),
+		SampleRate: rate,
+		ClockRate:  rate,
 		Channels:   info.ChannelConfig,
 	}
 }

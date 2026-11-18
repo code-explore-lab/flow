@@ -425,3 +425,81 @@ func TestPublishIngestOverTCP(t *testing.T) {
 		t.Fatal("Serve did not return after ctx cancel")
 	}
 }
+
+func TestPublishMP3Audio(t *testing.T) {
+	_, c, st := newPublishConn(t)
+	// 先建轨并订阅：RingBuffer 只把订阅之后的帧发给读者。
+	st.EnsureAudio(0)
+	rd, cancel := st.SourceFor("audio").Subscribe()
+	defer cancel()
+
+	// MPEG-1 Layer III 44100Hz 立体声帧头。
+	frame := append([]byte{0xFF, 0xFB, 0x90, 0x00}, bytes.Repeat([]byte{0x55}, 32)...)
+
+	c.handleAudio(&Message{
+		TypeID:    msgAudio,
+		Timestamp: 100,
+		Payload:   flv.BuildAudioTagFor("MP3", frame, 44100, 2),
+	})
+
+	params, ok := st.AudioParams()
+	if !ok {
+		t.Fatal("AudioParams not set")
+	}
+	if params.Codec != stream.AudioMP3 || params.SampleRate != 44100 ||
+		params.Channels != 2 || params.ClockRate != 90000 {
+		t.Fatalf("params = %+v", params)
+	}
+
+	f := nextFrame(t, rd)
+	if !bytes.Equal(f.Data, frame) {
+		t.Fatalf("data = %x, want mp3 frame", f.Data)
+	}
+	// MP3 用 90kHz 时钟：100ms = 9000。
+	if f.Timestamp != 9000 || !f.Keyframe {
+		t.Fatalf("frame ts = %d key = %v", f.Timestamp, f.Keyframe)
+	}
+}
+
+func TestPublishG711Audio(t *testing.T) {
+	cases := []struct {
+		codec string
+		want  string
+	}{
+		{"PCMA", stream.AudioPCMA},
+		{"PCMU", stream.AudioPCMU},
+	}
+	for _, tc := range cases {
+		t.Run(tc.codec, func(t *testing.T) {
+			_, c, st := newPublishConn(t)
+			st.EnsureAudio(0)
+			rd, cancel := st.SourceFor("audio").Subscribe()
+			defer cancel()
+
+			data := []byte{0xD5, 0x00, 0x7F}
+			c.handleAudio(&Message{
+				TypeID:    msgAudio,
+				Timestamp: 20,
+				Payload:   flv.BuildAudioTagFor(tc.codec, data, 8000, 1),
+			})
+
+			params, ok := st.AudioParams()
+			if !ok {
+				t.Fatal("AudioParams not set")
+			}
+			if params.Codec != tc.want || params.SampleRate != 8000 ||
+				params.Channels != 1 || params.ClockRate != 8000 {
+				t.Fatalf("params = %+v", params)
+			}
+
+			f := nextFrame(t, rd)
+			if !bytes.Equal(f.Data, data) {
+				t.Fatalf("data = %x, want %x", f.Data, data)
+			}
+			// 20ms @8000Hz = 160。
+			if f.Timestamp != 160 || !f.Keyframe {
+				t.Fatalf("frame ts = %d key = %v", f.Timestamp, f.Keyframe)
+			}
+		})
+	}
+}

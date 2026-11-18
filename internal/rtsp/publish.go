@@ -54,13 +54,69 @@ func newPublishedStream(name string, tracks []announcedTrack) *stream.Stream {
 				p.SetVideoParams("H264", nil, sps, pps)
 			}
 		case "audio":
-			p.EnsureAudio(uint32(t.ClockRate))
-			if asc, ok := parseConfigParam(t.FMTP); ok {
-				p.SetAudioParams(asc, uint32(t.ClockRate), uint8(t.Channels))
-			}
+			codec, cfg, rate, ch, clock := audioParamsFromSDP(t)
+			p.SetAudioCodec(codec, cfg, rate, ch, clock)
 		}
 	}
 	return p
+}
+
+// audioCodecFromSDP 把 SDP rtpmap 编码名映射成 stream 的音频编码常量。
+func audioCodecFromSDP(encoding string) string {
+	switch strings.ToUpper(strings.TrimSpace(encoding)) {
+	case "MPEG4-GENERIC":
+		return stream.AudioAAC
+	case "PCMA":
+		return stream.AudioPCMA
+	case "PCMU":
+		return stream.AudioPCMU
+	case "OPUS":
+		return stream.AudioOpus
+	case "MPA", "MP3", "MPEG":
+		return stream.AudioMP3
+	}
+	return stream.NormalizeAudioCodec(encoding)
+}
+
+// defaultAudioChannels 返回编码在 SDP 没写声道数时的默认值。
+func defaultAudioChannels(codec string) uint8 {
+	switch stream.NormalizeAudioCodec(codec) {
+	case stream.AudioAAC, stream.AudioOpus, stream.AudioMP3:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// audioParamsFromSDP 从 ANNOUNCE 的音频轨推导编码参数。
+// MP3 的采样率无法从 SDP 得到，先按 44100 占位，首帧到达后由
+// handleMP3 用帧头修正；RTP 时钟固定 90000。
+func audioParamsFromSDP(t announcedTrack) (codec string, cfg []byte, rate uint32, ch uint8, clock uint32) {
+	codec = audioCodecFromSDP(t.Encoding)
+	clock = uint32(t.ClockRate)
+	if clock == 0 {
+		clock = stream.AudioClockRate(codec, 0)
+	}
+	switch codec {
+	case stream.AudioAAC:
+		rate = clock
+		if asc, ok := parseConfigParam(t.FMTP); ok {
+			cfg = asc
+		}
+	case stream.AudioPCMA, stream.AudioPCMU:
+		rate = 8000
+	case stream.AudioOpus:
+		rate = 48000
+	case stream.AudioMP3:
+		rate = 44100
+	default:
+		rate = stream.DefaultAudioSampleRate(codec)
+	}
+	ch = uint8(t.Channels)
+	if ch == 0 {
+		ch = defaultAudioChannels(codec)
+	}
+	return codec, cfg, rate, ch, clock
 }
 
 // isHEVCEncoding 判断 SDP rtpmap 里的编码名是否为 H.265。
@@ -178,25 +234,47 @@ func synthesizeTracks(p *stream.Stream) []announcedTrack {
 	}
 	if p.AudioTrack() != nil {
 		ac, ok := p.AudioParams()
-		rate, ch := 44100, uint8(2)
+		codec := stream.AudioAAC
+		rate := int(stream.DefaultAudioSampleRate(codec))
+		ch := defaultAudioChannels(codec)
 		if ok {
+			codec = stream.NormalizeAudioCodec(ac.Codec)
 			if ac.SampleRate > 0 {
 				rate = int(ac.SampleRate)
 			}
 			if ac.Channels > 0 {
-				ch = uint8(ac.Channels)
+				ch = ac.Channels
 			}
 		}
-		at := announcedTrack{
-			Kind:        "audio",
-			PayloadType: 97,
-			Encoding:    "MPEG4-GENERIC",
-			ClockRate:   rate,
-			Channels:    int(ch),
-		}
-		at.FMTP = "profile-level-id=1; mode=AAC-hbr; sizelength=13; indexlength=3; indexdeltalength=3"
-		if ok {
-			at.FMTP += "; config=" + hex.EncodeToString(ac.Config)
+		at := announcedTrack{Kind: "audio", Channels: int(ch)}
+		switch codec {
+		case stream.AudioPCMA:
+			at.PayloadType = 8
+			at.Encoding = "PCMA"
+			at.ClockRate = 8000
+		case stream.AudioPCMU:
+			at.PayloadType = 0
+			at.Encoding = "PCMU"
+			at.ClockRate = 8000
+		case stream.AudioOpus:
+			at.PayloadType = 97
+			at.Encoding = "opus"
+			at.ClockRate = 48000
+			at.Channels = 2
+		case stream.AudioMP3:
+			// MP3 的 SDP 不写声道数，实际声道在帧头里。
+			at.PayloadType = 14
+			at.Encoding = "MPA"
+			at.ClockRate = 90000
+			at.Channels = 0
+		default:
+			at.PayloadType = 97
+			at.Encoding = "MPEG4-GENERIC"
+			at.ClockRate = rate
+			at.FMTP = "profile-level-id=1; mode=AAC-hbr; sizelength=13; indexlength=3; indexdeltalength=3"
+			if ok {
+				at.FMTP += "; config=" + hex.EncodeToString(ac.Config)
+			}
 		}
 		out = append(out, at)
 	}

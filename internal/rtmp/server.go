@@ -261,55 +261,10 @@ func (s *Server) handleConn(conn *Conn) {
 		return
 	}
 
-	for {
-		// E-5：空闲读超时，防止半开连接让读循环永久挂住。
-		if conn.connTimeout > 0 {
-			_ = conn.SetReadDeadline(time.Now().Add(conn.connTimeout))
-		}
-		m, err := conn.readMessage()
-		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("rtmp: client %s disconnected: %v\n", conn.RemoteAddr(), err)
-			}
-			return
-		}
-		if err := conn.maybeAck(); err != nil {
-			fmt.Printf("rtmp: ack to %s failed: %v\n", conn.RemoteAddr(), err)
-			return
-		}
-		// 控制消息优先
-		if handled, err := conn.handleControl(m); err != nil {
-			fmt.Printf("rtmp: control message from %s: %v\n", conn.RemoteAddr(), err)
-			return
-		} else if handled {
-			continue
-		}
-
-		switch m.TypeID {
-		case msgCommandAMF0:
-			if err := conn.handleCommand(m); err != nil {
-				// 鉴权拒绝已经回过 _error/onStatus 并单独打过日志，不再刷一条。
-				if !errors.Is(err, errAuthRejected) {
-					fmt.Printf("rtmp: command from %s: %v\n", conn.RemoteAddr(), err)
-				}
-				return
-			}
-		case msgVideo:
-			conn.handleVideo(m)
-		case msgAudio:
-			conn.handleAudio(m)
-		case msgDataAMF0:
-			conn.handleData(m)
-		case msgAggregate:
-			// T-7：聚合消息拆成子消息后按普通消息处理。
-			if err := conn.handleAggregate(m); err != nil {
-				fmt.Printf("rtmp: aggregate from %s: %v\n", conn.RemoteAddr(), err)
-				return
-			}
-		default:
-			// msgDataAMF3(15)、msgCommandAMF3(17) 等不支持的 AMF3 消息
-			// 与未知类型忽略。
-		}
+	// 鉴权拒绝已经回过 _error/onStatus 并单独打过日志，不再刷一条；
+	// 正常 EOF 也不打日志。
+	if err := conn.pump(); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, errAuthRejected) {
+		fmt.Printf("rtmp: client %s disconnected: %v\n", conn.RemoteAddr(), err)
 	}
 }
 

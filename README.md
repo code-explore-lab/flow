@@ -25,6 +25,18 @@ HTTP-FLV 支持跨域与防盗链：`-httpflv-cors` 配置允许的 Origin，
 `-httpflv-token` 要求 `?token=` 或 `X-Flow-Token` 头；
 `-httpflv-addr` 传空可关闭该服务。
 
+RTMP 回源（从上游拉流并在本地重新发布，供 RTSP/RTMP/HTTP-FLV 下游拉取；
+上游断开后自动重连，下游保持连接）：
+
+```bash
+# 拉 rtmp://upstream/live/src，本地按 relay 名字发布
+./flow -pull "relay=rtmp://upstream/live/src"
+
+# 可配置多路（逗号分隔）；省略本地名时取 URL 最后一节
+./flow -pull "rtmp://upstream/live/a,rtmp://upstream/live/b"
+ffplay rtmp://127.0.0.1:1935/live/relay
+```
+
 从摄像头推实时 H.264（`-live` 表示从 stdin 读 Annex-B 裸流）：
 
 ```bash
@@ -65,7 +77,7 @@ go tool pprof -http=127.0.0.1:8081 cpu.pprof
 | `cmd/loadtest/` | 压测客户端：N 路并发拉流，统计收包/丢包/建连耗时 |
 | `cmd/demux_test/` | 裸 H.264 文件解复用的小工具 |
 | `internal/rtsp/` | RTSP 协议层：请求解析、会话、鉴权、SR/RR、NACK/PLI、组播等 |
-| `internal/rtmp/` | RTMP 协议层：握手、Chunk、AMF0、publish/play |
+| `internal/rtmp/` | RTMP 协议层：握手、Chunk、AMF0、publish/play，以及回源客户端（`-pull`） |
 | `internal/httpflv/`, `internal/flvmux/` | HTTP-FLV 分发与 frame→FLV Tag 封装 |
 | `internal/rtp/` | RTP 打包/解包，H.264 与 AAC |
 | `internal/rtcp/` | RTCP 包解析：SR/RR、SDES、BYE、NACK |

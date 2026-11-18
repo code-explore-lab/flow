@@ -86,6 +86,8 @@ func main() {
 	rtmpApps := flag.String("rtmp-app-whitelist", "", "T-3: comma-separated RTMP app whitelist (also FLOW_RTMP_APPS)")
 	rtmpChunkSize := flag.Uint("rtmp-chunk-size", 4096, "T-7: RTMP outbound chunk size advertised to peers (bytes, 1..16777215)")
 	publishPolicyFlag := flag.String("publish-policy", "replace", "T-8: duplicate publish policy: replace|reject|reject-if-active (applies to RTSP and RTMP)")
+	// T-9：RTMP 回源。逗号分隔，每项 [本地名=]rtmp://host[:port]/app/stream。
+	pull := flag.String("pull", "", "T-9: relay upstream RTMP, comma-separated [localName=]rtmp://host[:port]/app/stream")
 	// E-6 / T-2：RTSPS 与 RTMPS 共用证书。两个 flag 必须成对出现；
 	// 空表示 RTSP/RTMP 都保持明文。
 	tlsCert := flag.String("tls-cert", "", "E-6/T-2: TLS certificate file for RTSPS/RTMPS (requires -tls-key)")
@@ -324,6 +326,18 @@ func main() {
 		}
 	}
 
+	// T-9：建立 RTMP 回源客户端。非法 spec 按参数错误退出（码 2）。
+	var pulls []*rtmp.Client
+	for _, spec := range splitCommaList(*pull) {
+		cl, err := rtmp.NewClient(spec, reg, flowMetrics)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		cl.SetTimeouts(*handshakeTimeout, *connTimeout)
+		pulls = append(pulls, cl)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	if rtmpsSrv != nil {
@@ -332,6 +346,7 @@ func main() {
 	if httpflvSrv != nil {
 		wg.Add(1)
 	}
+	wg.Add(len(pulls))
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
 		defer wg.Done()
@@ -347,6 +362,13 @@ func main() {
 	}
 	if httpflvSrv != nil {
 		go serve("httpflv", *httpflvAddr, httpflvSrv.Serve)
+	}
+	// T-9：每个上游一路 goroutine，ctx 取消后自动退出并注销本地流。
+	for _, cl := range pulls {
+		go func(cl *rtmp.Client) {
+			defer wg.Done()
+			cl.Run(ctx)
+		}(cl)
 	}
 	wg.Wait()
 }

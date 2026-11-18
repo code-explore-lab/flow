@@ -73,10 +73,13 @@ func (c *Conn) handleVideo(m *Message) {
 			p.stream.SetVideoParams("H265", vps, sps, pps)
 			if src := p.stream.SourceFor("video"); src != nil {
 				// 参数集也作为帧写入：ExternalSource 按 NAL 类型缓存参数集，
-				// 中途加入的订阅者订阅时会先收到它们。
-				src.Write(source.Frame{Data: vps, Timestamp: 0})
-				src.Write(source.Frame{Data: sps, Timestamp: 0})
-				src.Write(source.Frame{Data: pps, Timestamp: 0})
+				// 中途加入的订阅者订阅时会先收到它们。时间戳用序列头消息的
+				// 时间戳（通常 0）：回源重连后它已被平移到当前时间线，避免
+				// 参数集把下游时间戳拉回 0。
+				ts := videoTimestamp(m.Timestamp)
+				src.Write(source.Frame{Data: vps, Timestamp: ts})
+				src.Write(source.Frame{Data: sps, Timestamp: ts})
+				src.Write(source.Frame{Data: pps, Timestamp: ts})
 			}
 		default:
 			sps, pps, err := flv.ParseAVCDecoderConfig(vt.Config)
@@ -86,8 +89,11 @@ func (c *Conn) handleVideo(m *Message) {
 			}
 			p.stream.SetVideoParams("H264", nil, sps, pps)
 			if src := p.stream.SourceFor("video"); src != nil {
-				src.Write(source.Frame{Data: sps, Timestamp: 0})
-				src.Write(source.Frame{Data: pps, Timestamp: 0})
+				// 同 HEVC：参数集时间戳跟随序列头，回源重连后才能保持
+				// 下游时间线单调。
+				ts := videoTimestamp(m.Timestamp)
+				src.Write(source.Frame{Data: sps, Timestamp: ts})
+				src.Write(source.Frame{Data: pps, Timestamp: ts})
 			}
 		}
 		// 普通编码帧（H.264 / H.265）

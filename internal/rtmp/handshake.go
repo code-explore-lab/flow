@@ -21,6 +21,7 @@ package rtmp
 // 具体摘要算法见 handshake_digest.go。
 
 import (
+	"crypto/rand"
 	"fmt"
 	"io"
 	"time"
@@ -86,6 +87,50 @@ func (c *Conn) handshake() error {
 	// RTMP 的握手摘要本来就不是安全机制。
 	if complex && !verifyC2(c2, s1) {
 		fmt.Printf("rtmp handshake: c2 digest mismatch from %s (ignored)\n", c.RemoteAddr())
+	}
+	return nil
+}
+
+// clientHandshake 以客户端身份完成 RTMP 握手（T-9 回源使用）：
+// 发 C0+C1，读 S0+S1+S2，再回 C2（回显 S1）。
+//
+// 采用 simple 握手：C1 不带 HMAC 摘要。ffmpeg/SRS/nginx-rtmp 等服务端
+// 都接受这种握手；本项目的服务端在 C1 无摘要时同样走 simple 回显。
+func (c *Conn) clientHandshake() error {
+	if c.handshakeTimeout > 0 {
+		if err := c.SetDeadline(time.Now().Add(c.handshakeTimeout)); err != nil {
+			return fmt.Errorf("rtmp handshake: set deadline: %w", err)
+		}
+		defer func() { _ = c.SetDeadline(time.Time{}) }()
+	}
+
+	// C1 的时间字段不参与 simple 握手校验，填随机字节即可。
+	c1 := make([]byte, handshakeSize)
+	_, _ = rand.Read(c1)
+	out := make([]byte, 0, 1+handshakeSize)
+	out = append(out, handshakeVersion) // C0
+	out = append(out, c1...)            // C1
+	if err := c.write(out); err != nil {
+		return fmt.Errorf("rtmp handshake: write c0c1: %w", err)
+	}
+
+	var s0 [1]byte
+	if _, err := io.ReadFull(c.br, s0[:]); err != nil {
+		return fmt.Errorf("rtmp handshake: read s0: %w", err)
+	}
+	if s0[0] != handshakeVersion {
+		return fmt.Errorf("rtmp handshake: unsupported server version %#x", s0[0])
+	}
+	s1 := make([]byte, handshakeSize)
+	if _, err := io.ReadFull(c.br, s1); err != nil {
+		return fmt.Errorf("rtmp handshake: read s1: %w", err)
+	}
+	if _, err := io.ReadFull(c.br, make([]byte, handshakeSize)); err != nil {
+		return fmt.Errorf("rtmp handshake: read s2: %w", err)
+	}
+	// C2 回显 S1（simple 握手）。
+	if err := c.write(s1); err != nil {
+		return fmt.Errorf("rtmp handshake: write c2: %w", err)
 	}
 	return nil
 }

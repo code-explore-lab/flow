@@ -81,6 +81,24 @@ func startRTMPSServer(t *testing.T) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() { errc <- s.Serve(ctx, addr) }()
+
+	// freeAddr 释放端口到 Serve 真正 bind 之间有窗口；立即连接的用例
+	// （如 TestRTMPSRejectsPlaintext）会拿到 connection refused。这里等到
+	// 端口真的可连再返回。
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		probe, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = probe.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("RTMPS server did not start listening on %s: %v", addr, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	t.Cleanup(func() {
 		cancel()
 		select {

@@ -9,6 +9,36 @@ import (
 	"flow/internal/discovery"
 )
 
+func TestValidateHLSOptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		segment time.Duration
+		part    time.Duration
+		window  int
+		idle    time.Duration
+		max     int64
+		ok      bool
+	}{
+		{"defaults", 4 * time.Second, 500 * time.Millisecond, 6, 60 * time.Second, 64 << 20, true},
+		{"classic", 4 * time.Second, 0, 3, 0, 0, true},
+		{"zero segment", 0, 0, 6, time.Minute, 0, false},
+		{"part equals segment", 4 * time.Second, 4 * time.Second, 6, time.Minute, 0, false},
+		{"negative part", 4 * time.Second, -time.Millisecond, 6, time.Minute, 0, false},
+		{"window too small", 4 * time.Second, time.Second, 2, time.Minute, 0, false},
+		{"negative idle", 4 * time.Second, time.Second, 6, -time.Second, 0, false},
+		{"negative max bytes", 4 * time.Second, time.Second, 6, time.Minute, -1, false},
+	}
+	for _, tt := range tests {
+		err := validateHLSOptions(tt.segment, tt.part, tt.window, tt.idle, tt.max)
+		if tt.ok && err != nil {
+			t.Errorf("%s: unexpected error %v", tt.name, err)
+		}
+		if !tt.ok && err == nil {
+			t.Errorf("%s: expected error", tt.name)
+		}
+	}
+}
+
 func TestLoopbackListenAddr(t *testing.T) {
 	tests := []struct {
 		in   string

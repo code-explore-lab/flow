@@ -115,6 +115,16 @@ func NewH264SourceFromReader(r io.Reader) *H264Source {
 // 返回的 Reader 在源读完后可以继续把剩余帧读完，再返回 false；cancel 只退订，
 // 不会停止源本身。
 func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
+	return s.subscribe(true)
+}
+
+// SubscribeLive 与 Subscribe 相同，但不预加载 SPS/PPS/最近 GOP。
+// HLS 打包器从当前直播位置开始，等到下一个 IDR 再切片。
+func (s *H264Source) SubscribeLive() (*Reader[Frame], func()) {
+	return s.subscribe(false)
+}
+
+func (s *H264Source) subscribe(preload bool) (*Reader[Frame], func()) {
 	s.mu.Lock()
 	if s.cur == nil {
 		run := &h264Run{ring: newVideoRing()}
@@ -126,19 +136,18 @@ func (s *H264Source) Subscribe() (*Reader[Frame], func()) {
 		return rd, rd.Close
 	}
 
-	// 中途加入：从当前写位置开始读，先补发参数集和最近一个 IDR
 	run := s.cur
-	var preload []Frame
-	if run.idr != nil {
+	var frames []Frame
+	if preload && run.idr != nil {
 		if run.sps != nil {
-			preload = append(preload, *run.sps)
+			frames = append(frames, *run.sps)
 		}
 		if run.pps != nil {
-			preload = append(preload, *run.pps)
+			frames = append(frames, *run.pps)
 		}
-		preload = append(preload, *run.idr)
+		frames = append(frames, *run.idr)
 	}
-	rd := run.ring.Subscribe(preload...)
+	rd := run.ring.Subscribe(frames...)
 	s.mu.Unlock()
 	return rd, rd.Close
 }

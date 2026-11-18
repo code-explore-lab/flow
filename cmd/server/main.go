@@ -18,6 +18,7 @@ import (
 
 	"flow/internal/access"
 	"flow/internal/discovery"
+	"flow/internal/hls"
 	"flow/internal/httpflv"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
@@ -25,6 +26,7 @@ import (
 	"flow/internal/rtmp"
 	"flow/internal/rtsp"
 	"flow/internal/source"
+	"flow/internal/srt"
 	"flow/internal/stream"
 )
 
@@ -121,6 +123,22 @@ func main() {
 	httpflvReferer := flag.String("httpflv-referer", "", "P-1: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
 	httpflvRequireReferer := flag.Bool("httpflv-require-referer", false, "P-1: reject requests without a Referer when -httpflv-referer is set")
 	httpflvToken := flag.String("httpflv-token", "", "P-1: playback token, passed as ?token=... or X-Flow-Token (empty disables)")
+	// P-2：HLS/LL-HLS 分发。默认 :8082，空表示关闭；part=0 退化成经典 HLS。
+	hlsAddr := flag.String("hls-addr", ":8082", "P-2: HLS listen address (empty disables)")
+	hlsSegment := flag.Duration("hls-segment", 4*time.Second, "P-2: HLS segment target duration")
+	hlsPart := flag.Duration("hls-part", 500*time.Millisecond, "P-2: LL-HLS part target duration (0 disables LL)")
+	hlsWindow := flag.Int("hls-window", 6, "P-2: number of complete segments kept in memory (>= 3)")
+	hlsIdle := flag.Duration("hls-idle", 60*time.Second, "P-2: close a packager after this long without requests")
+	hlsMaxBytes := flag.Int64("hls-max-bytes", 64<<20, "P-2: per-stream HLS memory budget in bytes (0 = only window limit)")
+	hlsCORS := flag.String("hls-cors", "", "P-2: allowed CORS origins, comma-separated (\"*\" allows any; empty disables CORS headers)")
+	hlsReferer := flag.String("hls-referer", "", "P-2: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
+	hlsRequireReferer := flag.Bool("hls-require-referer", false, "P-2: reject requests without a Referer when -hls-referer is set")
+	hlsToken := flag.String("hls-token", "", "P-2: playback token, passed as ?token=... or X-Flow-Token (empty disables)")
+	// P-5：SRT 推拉流。SRT 里承载 MPEG-TS，与注册表互通后 RTSP/RTMP/
+	// HTTP-FLV 都能拉同一路流。
+	srtAddr := flag.String("srt-addr", ":9000", "P-5: SRT listen address (empty disables)")
+	srtPassphrase := flag.String("srt-passphrase", "", "P-5: SRT encryption passphrase, 10-80 chars (empty disables)")
+	srtLatency := flag.Duration("srt-latency", srt.DefaultLatency, "P-5: SRT receive latency")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -169,6 +187,14 @@ func main() {
 	}
 	if (*tlsCert == "") != (*tlsKey == "") {
 		fmt.Fprintln(os.Stderr, "-tls-cert and -tls-key must be set together")
+		os.Exit(2)
+	}
+	if *srtLatency <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -srt-latency (must be > 0)")
+		os.Exit(2)
+	}
+	if err := validateHLSOptions(*hlsSegment, *hlsPart, *hlsWindow, *hlsIdle, *hlsMaxBytes); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	publishPolicy, err := stream.ParsePublishPolicy(*publishPolicyFlag)
@@ -462,6 +488,40 @@ func main() {
 		}
 	}
 
+	// P-2：HLS/LL-HLS 复用同一份注册表与本地回退源。默认 :8082；
+	// -hls-addr 为空时整体关闭（其它 -hls-* 参数仍做校验）。
+	var hlsSrv *hls.Server
+	if *hlsAddr != "" {
+		hlsSrv = hls.New(reg, video, audio)
+		hlsSrv.SetMetrics(flowMetrics)
+		hlsSrv.SetWhitelist(whitelist)
+		hlsSrv.SetCORS(*hlsCORS)
+		hlsSrv.SetReferer(*hlsReferer, *hlsRequireReferer)
+		hlsSrv.SetToken(*hlsToken)
+		hlsSrv.SetPackaging(hls.Options{
+			SegmentTarget: *hlsSegment,
+			PartTarget:    *hlsPart,
+			Window:        *hlsWindow,
+			MaxBytes:      *hlsMaxBytes,
+		}, *hlsIdle)
+		if originMgr != nil {
+			hlsSrv.SetOrigin(originMgr)
+		}
+	}
+
+	// P-5：SRT 服务器。与其它协议共享注册表和指标；配置了口令后只接受
+	// 加密连接（SRT 自带 AES 和 NAK 重传）。
+	var srtSrv *srt.Server
+	if *srtAddr != "" {
+		srtSrv = srt.New(reg)
+		srtSrv.SetMetrics(flowMetrics)
+		srtSrv.SetLatency(*srtLatency)
+		if err := srtSrv.SetPassphrase(*srtPassphrase); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}
+
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
 	if *metricsAddr != "" {
 		if err := startMetrics(ctx, *metricsAddr, flowMetrics, rtspSrv); err != nil {
@@ -490,6 +550,12 @@ func main() {
 	if httpflvSrv != nil {
 		wg.Add(1)
 	}
+	if srtSrv != nil {
+		wg.Add(1)
+	}
+	if hlsSrv != nil {
+		wg.Add(1)
+	}
 	wg.Add(len(pulls))
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
@@ -507,6 +573,12 @@ func main() {
 	if httpflvSrv != nil {
 		go serve("httpflv", *httpflvAddr, httpflvSrv.Serve)
 	}
+	if srtSrv != nil {
+		go serve("srt", *srtAddr, srtSrv.Serve)
+	}
+	if hlsSrv != nil {
+		go serve("hls", *hlsAddr, hlsSrv.Serve)
+	}
 	// T-9：每个上游一路 goroutine，ctx 取消后自动退出并注销本地流。
 	for _, cl := range pulls {
 		go func(cl *rtmp.Client) {
@@ -515,6 +587,27 @@ func main() {
 		}(cl)
 	}
 	wg.Wait()
+}
+
+// validateHLSOptions 校验 P-2 的切片参数。part=0 表示经典 HLS；
+// 其余情况 part 必须小于 segment，且窗口至少保留 3 段。
+func validateHLSOptions(segment, part time.Duration, window int, idle time.Duration, maxBytes int64) error {
+	if segment <= 0 {
+		return errors.New("invalid -hls-segment (must be > 0)")
+	}
+	if part < 0 || part >= segment {
+		return errors.New("invalid -hls-part (must be >= 0 and < -hls-segment)")
+	}
+	if window < 3 {
+		return errors.New("invalid -hls-window (must be >= 3)")
+	}
+	if idle < 0 {
+		return errors.New("invalid -hls-idle (must be >= 0)")
+	}
+	if maxBytes < 0 {
+		return errors.New("invalid -hls-max-bytes (must be >= 0)")
+	}
+	return nil
 }
 
 // discoveryFinder 把发现服务客户端适配成 rtsp.StreamFinder（S-3/S-2）。

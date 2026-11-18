@@ -23,6 +23,12 @@ func TestRegistryPrometheus(t *testing.T) {
 	r.AddDropped("audio", 3)
 	r.IncSR()
 	r.IncRR()
+	r.IncHLSPackager()
+	r.IncHLSRequest("master")
+	r.IncHLSRequest("segment")
+	r.AddHLSBytes("segment", 4096)
+	r.IncHLSSegment("video")
+	r.IncHLSPart("audio")
 
 	var b strings.Builder
 	r.WritePrometheus(&b)
@@ -43,6 +49,12 @@ func TestRegistryPrometheus(t *testing.T) {
 		`flow_rtsp_frames_dropped_total{kind="audio"} 3`,
 		`flow_rtsp_sr_sent_total 1`,
 		`flow_rtsp_rr_received_total 1`,
+		`flow_hls_packagers 1`,
+		`flow_hls_requests_total{kind="master"} 1`,
+		`flow_hls_requests_total{kind="segment"} 1`,
+		`flow_hls_bytes_served_total{kind="segment"} 4096`,
+		`flow_hls_segments_total{track="video"} 1`,
+		`flow_hls_parts_total{track="audio"} 1`,
 	}
 	for _, w := range wants {
 		if !strings.Contains(out, w) {

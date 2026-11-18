@@ -460,12 +460,14 @@
 - [ ] **P-4 WebRTC（WHIP/WHEP）**
   - ICE/DTLS/SRTP、H.264 打包；推流/拉流入口；
   - 验收：浏览器 WHIP 推、WHEP 拉，延迟 < 500ms 基线。
-- [ ] **P-5 SRT**
+- [x] **P-5 SRT**
   - SRT 推拉、加密/重传；与注册表互通；
   - 验收：`ffmpeg -f mpegts srt://...` 推拉成功。
+  - ✅ 已实现：新增 `internal/srt`，基于纯 Go 的 `github.com/datarhei/gosrt`。SRT 只做传输层，连接里是 MPEG-TS，服务端用 `internal/mpegts` 解出 H.264/AAC 帧写入共享 `stream.Registry`，因此 SRT 推上来的流可以从 RTSP/RTMP/HTTP-FLV 拉取，反向也可以把其他协议发布的流通过 SRT 拉走。StreamID 支持 `publish:live/demo`、`read:`/`play:live/demo`、OBS 的 `#!::r=live/demo,m=publish`，裸流名按拉流处理；拉流端在握手阶段先查注册表，不存在直接拒绝（`REJX_NOTFOUND`），避免接受后才失败。加密由 SRT 自带 AES 完成：`-srt-passphrase`（10..80 字符）配置后只接受加密连接且口令必须匹配，未加密连接或口令错误分别以 `REJ_UNSECURE`/`REJ_BADSECRET` 拒绝；未配置口令时加密连接同样被拒。重传/丢包恢复由 libsrt 的 NAK/TSBPD 负责，`-srt-latency` 默认 120ms（live/live 传输类型）。拉流端等待推流端建好音视频轨最多 5s，AAC 由 ASC 还原 ADTS 头，H.265 明确拒绝（TS 只实现了 H.264 stream type）。指标新增 `flow_connections{proto="srt"}`、`flow_srt_publishes(_total)`、`flow_srt_plays(_total)`，并计入 `ActiveViewers` 供 S-2 负载上报。顺带修复两处分片关键帧缺陷（SRT 发布侧每 slice 都清空 GOP 缓存、预热帧首个 IDR slice 丢失 AUStart），否则中途加入的拉流端首帧会大面积花屏、HTTP-FLV 会把每个 slice 当独立帧。测试新增 `internal/mpegts/mpegts_test.go`（封装/解复用往返、分块输入、PTS/DTS、PCR、PSI 刷新）、`internal/srt/srt_test.go`（StreamID、推拉回环、加密/错误口令/未知流拒绝）与 `source` 的多 slice GOP 回归用例。e2e（ffmpeg 8.0.1）：`-f mpegts srt://127.0.0.1:19000?streamid=publish:live/srt&transtype=live` 推流后，SRT/RTSP/HTTP-FLV 三种方式拉流均解出 `h264 640x480 + aac 44100 Hz mono`，无解码告警；RTMP 推流后按注册表名用 SRT 拉流正常；配置 `-srt-passphrase flowtest1234` 后加密推拉成功，明文拉流、明文推流、错误口令分别被拒（`UNSECURE`/`BADSECRET`）。`gofmt -l .`、`go vet ./...`、`go test ./...` 全部通过。
 - [ ] **P-6 MPEG-TS 输入输出**
   - UDP/文件 TS 解复用为 H.264/AAC 写入注册表；输出 TS 给 P-5/HLS；
   - 验收：TS 推流后 RTSP/RTMP 可拉。
+  - 🔶 部分完成：`internal/mpegts` 已提供 H.264/AAC 子集的解复用器（PAT/PMT、PES 33-bit PTS/DTS、连续计数器丢包重同步、AAC 跨 PES 重组）与封装器（PSI/PCR、ADTS、参数集注入），P-5 的 SRT 推拉已完整接入；TS 推流后 RTSP/RTMP/HTTP-FLV 可拉已验收。UDP/文件 TS 的独立入口尚未接入 `cmd/server`，解复用器可直接复用。
 
 ---
 

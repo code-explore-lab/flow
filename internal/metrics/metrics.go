@@ -19,8 +19,15 @@ import (
 type Registry struct {
 	rtspConns      atomic.Int64 // 当前活跃 RTSP 连接
 	rtmpConns      atomic.Int64 // 当前活跃 RTMP 连接
+	srtConns       atomic.Int64 // 当前活跃 SRT 连接
 	rtspConnsTotal atomic.Uint64
 	rtmpConnsTotal atomic.Uint64
+	srtConnsTotal  atomic.Uint64
+
+	srtPublishes      atomic.Int64
+	srtPlays          atomic.Int64
+	srtPublishesTotal atomic.Uint64
+	srtPlaysTotal     atomic.Uint64
 
 	sessions      atomic.Int64 // 当前活跃 RTSP 会话
 	sessionsTotal atomic.Uint64
@@ -39,6 +46,25 @@ type Registry struct {
 
 	srSent     atomic.Uint64
 	rrReceived atomic.Uint64
+
+	// P-2 HLS：packager 数、HTTP 请求/字节、产出的 segment/part 数。
+	hlsPackagers atomic.Int64
+
+	hlsRequestsMaster  atomic.Uint64
+	hlsRequestsMedia   atomic.Uint64
+	hlsRequestsInit    atomic.Uint64
+	hlsRequestsSegment atomic.Uint64
+	hlsRequestsPart    atomic.Uint64
+	hlsRequestsStats   atomic.Uint64
+
+	hlsBytesInit    atomic.Uint64
+	hlsBytesSegment atomic.Uint64
+	hlsBytesPart    atomic.Uint64
+
+	hlsSegmentsVideo atomic.Uint64
+	hlsSegmentsAudio atomic.Uint64
+	hlsPartsVideo    atomic.Uint64
+	hlsPartsAudio    atomic.Uint64
 }
 
 // New 创建一个空的注册表。
@@ -46,7 +72,7 @@ func New() *Registry {
 	return &Registry{}
 }
 
-// IncConn 记录一个新建的 TCP 连接（proto: "rtsp" / "rtmp"）。
+// IncConn 记录一个新建的连接（proto: "rtsp" / "rtmp" / "srt"）。
 func (r *Registry) IncConn(proto string) {
 	if r == nil {
 		return
@@ -56,10 +82,12 @@ func (r *Registry) IncConn(proto string) {
 		r.rtspConns.Add(1)
 	case "rtmp":
 		r.rtmpConns.Add(1)
+	case "srt":
+		r.srtConns.Add(1)
 	}
 }
 
-// DecConn 记录一个 TCP 连接关闭。
+// DecConn 记录一个连接关闭。
 func (r *Registry) DecConn(proto string) {
 	if r == nil {
 		return
@@ -69,10 +97,12 @@ func (r *Registry) DecConn(proto string) {
 		r.rtspConns.Add(-1)
 	case "rtmp":
 		r.rtmpConns.Add(-1)
+	case "srt":
+		r.srtConns.Add(-1)
 	}
 }
 
-// IncConnTotal 累计接受过的 TCP 连接数。
+// IncConnTotal 累计接受过的连接数。
 func (r *Registry) IncConnTotal(proto string) {
 	if r == nil {
 		return
@@ -82,6 +112,8 @@ func (r *Registry) IncConnTotal(proto string) {
 		r.rtspConnsTotal.Add(1)
 	case "rtmp":
 		r.rtmpConnsTotal.Add(1)
+	case "srt":
+		r.srtConnsTotal.Add(1)
 	}
 }
 
@@ -107,7 +139,7 @@ func (r *Registry) ActiveViewers() int {
 	if r == nil {
 		return 0
 	}
-	return int(r.sessions.Load() + r.plays.Load())
+	return int(r.sessions.Load() + r.plays.Load() + r.srtPlays.Load())
 }
 
 // IncSessionTotal 累计创建过的 RTSP 会话数。
@@ -162,6 +194,52 @@ func (r *Registry) IncPlayTotal() {
 		return
 	}
 	r.playsTotal.Add(1)
+}
+
+// IncSRTPublish / DecSRTPublish 记录 SRT 推流连接数。
+func (r *Registry) IncSRTPublish() {
+	if r == nil {
+		return
+	}
+	r.srtPublishes.Add(1)
+}
+
+func (r *Registry) DecSRTPublish() {
+	if r == nil {
+		return
+	}
+	r.srtPublishes.Add(-1)
+}
+
+// IncSRTPublishTotal 累计 SRT 推流次数。
+func (r *Registry) IncSRTPublishTotal() {
+	if r == nil {
+		return
+	}
+	r.srtPublishesTotal.Add(1)
+}
+
+// IncSRTPlay / DecSRTPlay 记录 SRT 拉流连接数。
+func (r *Registry) IncSRTPlay() {
+	if r == nil {
+		return
+	}
+	r.srtPlays.Add(1)
+}
+
+func (r *Registry) DecSRTPlay() {
+	if r == nil {
+		return
+	}
+	r.srtPlays.Add(-1)
+}
+
+// IncSRTPlayTotal 累计 SRT 拉流次数。
+func (r *Registry) IncSRTPlayTotal() {
+	if r == nil {
+		return
+	}
+	r.srtPlaysTotal.Add(1)
 }
 
 // AddPackets 累计某条轨发出的 RTP 包数（kind: "video" / "audio"）。
@@ -219,6 +297,84 @@ func (r *Registry) IncRR() {
 	r.rrReceived.Add(1)
 }
 
+// IncHLSPackager / DecHLSPackager 记录当前活跃 HLS packager 数。
+func (r *Registry) IncHLSPackager() {
+	if r == nil {
+		return
+	}
+	r.hlsPackagers.Add(1)
+}
+
+func (r *Registry) DecHLSPackager() {
+	if r == nil {
+		return
+	}
+	r.hlsPackagers.Add(-1)
+}
+
+// IncHLSRequest 按资源类型累计 HLS HTTP 请求数。
+// kind: master / media / init / segment / part / stats。
+func (r *Registry) IncHLSRequest(kind string) {
+	if r == nil {
+		return
+	}
+	switch kind {
+	case "master":
+		r.hlsRequestsMaster.Add(1)
+	case "media":
+		r.hlsRequestsMedia.Add(1)
+	case "init":
+		r.hlsRequestsInit.Add(1)
+	case "segment":
+		r.hlsRequestsSegment.Add(1)
+	case "part":
+		r.hlsRequestsPart.Add(1)
+	case "stats":
+		r.hlsRequestsStats.Add(1)
+	}
+}
+
+// AddHLSBytes 按资源类型累计 HLS 已发送字节数。
+// kind: init / segment / part。
+func (r *Registry) AddHLSBytes(kind string, n int) {
+	if r == nil || n <= 0 {
+		return
+	}
+	switch kind {
+	case "init":
+		r.hlsBytesInit.Add(uint64(n))
+	case "segment":
+		r.hlsBytesSegment.Add(uint64(n))
+	case "part":
+		r.hlsBytesPart.Add(uint64(n))
+	}
+}
+
+// IncHLSSegment / IncHLSPart 按轨累计产出的 segment/part 数。
+func (r *Registry) IncHLSSegment(track string) {
+	if r == nil {
+		return
+	}
+	switch track {
+	case "video":
+		r.hlsSegmentsVideo.Add(1)
+	case "audio":
+		r.hlsSegmentsAudio.Add(1)
+	}
+}
+
+func (r *Registry) IncHLSPart(track string) {
+	if r == nil {
+		return
+	}
+	switch track {
+	case "video":
+		r.hlsPartsVideo.Add(1)
+	case "audio":
+		r.hlsPartsAudio.Add(1)
+	}
+}
+
 // writeMetric 写一个指标的 HELP/TYPE 头和若干样本行。
 func writeMetric(w io.Writer, name, typ, help string, lines ...string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
@@ -233,13 +389,27 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	if r == nil {
 		return
 	}
-	writeMetric(w, "flow_connections", "gauge", "当前活跃 TCP 连接数",
+	writeMetric(w, "flow_connections", "gauge", "当前活跃连接数",
 		fmt.Sprintf(`flow_connections{proto="rtsp"} %d`, r.rtspConns.Load()),
 		fmt.Sprintf(`flow_connections{proto="rtmp"} %d`, r.rtmpConns.Load()),
+		fmt.Sprintf(`flow_connections{proto="srt"} %d`, r.srtConns.Load()),
 	)
-	writeMetric(w, "flow_connections_total", "counter", "累计接受的 TCP 连接数",
+	writeMetric(w, "flow_connections_total", "counter", "累计接受的连接数",
 		fmt.Sprintf(`flow_connections_total{proto="rtsp"} %d`, r.rtspConnsTotal.Load()),
 		fmt.Sprintf(`flow_connections_total{proto="rtmp"} %d`, r.rtmpConnsTotal.Load()),
+		fmt.Sprintf(`flow_connections_total{proto="srt"} %d`, r.srtConnsTotal.Load()),
+	)
+	writeMetric(w, "flow_srt_publishes", "gauge", "当前活跃 SRT 推流数",
+		fmt.Sprintf("flow_srt_publishes %d", r.srtPublishes.Load()),
+	)
+	writeMetric(w, "flow_srt_publishes_total", "counter", "累计 SRT 推流次数",
+		fmt.Sprintf("flow_srt_publishes_total %d", r.srtPublishesTotal.Load()),
+	)
+	writeMetric(w, "flow_srt_plays", "gauge", "当前活跃 SRT 拉流数",
+		fmt.Sprintf("flow_srt_plays %d", r.srtPlays.Load()),
+	)
+	writeMetric(w, "flow_srt_plays_total", "counter", "累计 SRT 拉流次数",
+		fmt.Sprintf("flow_srt_plays_total %d", r.srtPlaysTotal.Load()),
 	)
 	writeMetric(w, "flow_sessions", "gauge", "当前活跃 RTSP 会话数",
 		fmt.Sprintf(`flow_sessions{proto="rtsp"} %d`, r.sessions.Load()),
@@ -276,6 +446,30 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	)
 	writeMetric(w, "flow_rtsp_rr_received_total", "counter", "已收到的 RTCP RR 包数",
 		fmt.Sprintf("flow_rtsp_rr_received_total %d", r.rrReceived.Load()),
+	)
+	writeMetric(w, "flow_hls_packagers", "gauge", "当前活跃 HLS packager 数",
+		fmt.Sprintf("flow_hls_packagers %d", r.hlsPackagers.Load()),
+	)
+	writeMetric(w, "flow_hls_requests_total", "counter", "HLS HTTP 请求数",
+		fmt.Sprintf(`flow_hls_requests_total{kind="master"} %d`, r.hlsRequestsMaster.Load()),
+		fmt.Sprintf(`flow_hls_requests_total{kind="media"} %d`, r.hlsRequestsMedia.Load()),
+		fmt.Sprintf(`flow_hls_requests_total{kind="init"} %d`, r.hlsRequestsInit.Load()),
+		fmt.Sprintf(`flow_hls_requests_total{kind="segment"} %d`, r.hlsRequestsSegment.Load()),
+		fmt.Sprintf(`flow_hls_requests_total{kind="part"} %d`, r.hlsRequestsPart.Load()),
+		fmt.Sprintf(`flow_hls_requests_total{kind="stats"} %d`, r.hlsRequestsStats.Load()),
+	)
+	writeMetric(w, "flow_hls_bytes_served_total", "counter", "HLS 已发送资源字节数",
+		fmt.Sprintf(`flow_hls_bytes_served_total{kind="init"} %d`, r.hlsBytesInit.Load()),
+		fmt.Sprintf(`flow_hls_bytes_served_total{kind="segment"} %d`, r.hlsBytesSegment.Load()),
+		fmt.Sprintf(`flow_hls_bytes_served_total{kind="part"} %d`, r.hlsBytesPart.Load()),
+	)
+	writeMetric(w, "flow_hls_segments_total", "counter", "HLS 产出的完整段数",
+		fmt.Sprintf(`flow_hls_segments_total{track="video"} %d`, r.hlsSegmentsVideo.Load()),
+		fmt.Sprintf(`flow_hls_segments_total{track="audio"} %d`, r.hlsSegmentsAudio.Load()),
+	)
+	writeMetric(w, "flow_hls_parts_total", "counter", "HLS 产出的 part 数",
+		fmt.Sprintf(`flow_hls_parts_total{track="video"} %d`, r.hlsPartsVideo.Load()),
+		fmt.Sprintf(`flow_hls_parts_total{track="audio"} %d`, r.hlsPartsAudio.Load()),
 	)
 	// E-9：抓取时采样当前 goroutine 数，用于观察资源回收后是否回落。
 	writeMetric(w, "flow_goroutines", "gauge", "当前 goroutine 数",

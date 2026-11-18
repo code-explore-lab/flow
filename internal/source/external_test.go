@@ -95,6 +95,43 @@ func TestExternalSourceGOPResetsOnIDR(t *testing.T) {
 	}
 }
 
+// TestExternalSourceMultiSliceIDRKeepsWholeGOP 一个关键帧 AU 拆成多个 IDR
+// slice 时，只有首 slice 开启新 GOP；否则缓存里只剩最后一个 slice，中途
+// 加入的订阅者首帧会大面积花屏。
+func TestExternalSourceMultiSliceIDRKeepsWholeGOP(t *testing.T) {
+	src := NewExternalSource()
+	src.Write(Frame{Data: []byte{0x67, 1}, Timestamp: 0})
+	src.Write(Frame{Data: []byte{0x68, 2}, Timestamp: 0})
+	src.Write(Frame{Data: []byte{0x65, 3, 3, 3, 3}, Timestamp: 0, Keyframe: true, AUStart: true})
+	src.Write(Frame{Data: []byte{0x65, 4, 4, 4, 4}, Timestamp: 0, Keyframe: true})
+	src.Write(Frame{Data: []byte{0x65, 5, 5, 5, 5}, Timestamp: 0, Keyframe: true})
+	src.Write(Frame{Data: []byte{0x41, 6}, Timestamp: 3600})
+
+	rd, cancel := src.Subscribe()
+	defer cancel()
+
+	want := []struct{ typ, slice byte }{
+		{0x67, 1}, {0x68, 2}, {0x65, 3}, {0x65, 4}, {0x65, 5}, {0x41, 6},
+	}
+	for i, w := range want {
+		f, ok := nextWithTimeout(t, rd)
+		if !ok {
+			t.Fatalf("preload frame %d missing", i)
+		}
+		if len(f.Data) < 2 || f.Data[0] != w.typ || f.Data[1] != w.slice {
+			t.Fatalf("preload frame %d = %#v, want type %#x slice %d", i, f.Data, w.typ, w.slice)
+		}
+		// 首个 IDR slice 必须补上 AUStart，封装器才会把整个关键帧 AU
+		// 合成一帧；AUStart 原本标在不参与缓存的 AUD 上。
+		if i == 2 && !f.AUStart {
+			t.Fatal("first preloaded IDR slice lost AUStart")
+		}
+		if i > 2 && f.AUStart {
+			t.Fatalf("preload frame %d should not start an AU", i)
+		}
+	}
+}
+
 // TestExternalAudioSourceSkipsParamSetPreload 音频 AU 首字节可能恰好是
 // SPS/PPS/IDR 的类型值，但不能被当成 NAL 缓存并预加载给新订阅者。
 func TestExternalAudioSourceSkipsParamSetPreload(t *testing.T) {

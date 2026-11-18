@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flow HLS / LL-HLS 播放验收</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0f1115; color: #e6e8eb; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 16px; }
+  .row { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
+  video { width: 100%; background: #000; border-radius: 8px; aspect-ratio: 16/9; }
+  .panel { background: #171a21; border: 1px solid #262b35; border-radius: 8px; padding: 12px; }
+  .panel h2 { font-size: 13px; color: #9aa4b2; margin: 0 0 8px; font-weight: 600; }
+  dl { display: grid; grid-template-columns: 140px 1fr; gap: 6px 10px; margin: 0; }
+  dt { color: #9aa4b2; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #status { margin-top: 10px; color: #9aa4b2; min-height: 20px; }
+  #error { color: #ff6b6b; white-space: pre-wrap; }
+  #clock { font-size: 28px; font-variant-numeric: tabular-nums; letter-spacing: 1px; }
+  .hint { color: #7d8795; font-size: 12px; margin-top: 10px; }
+  input[type=text] { width: 100%; box-sizing: border-box; background: #0f1115; color: #e6e8eb;
+    border: 1px solid #303642; border-radius: 6px; padding: 8px; }
+  @media (max-width: 820px) { .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>flow HLS / LL-HLS 播放验收</h1>
+  <p><input id="src" type="text" spellcheck="false" placeholder="master.m3u8 URL"></p>
+  <div class="row">
+    <div>
+      <video id="video" controls autoplay muted playsinline></video>
+      <div id="status">loading…</div>
+      <div id="error"></div>
+    </div>
+    <aside class="panel">
+      <h2>播放延迟</h2>
+      <dl>
+        <dt>hls.latency</dt><dd id="latency">—</dd>
+        <dt>max latency</dt><dd id="maxLatency">—</dd>
+        <dt>target latency</dt><dd id="targetLatency">—</dd>
+        <dt>bandwidth</dt><dd id="bandwidth">—</dd>
+        <dt>level bitrate</dt><dd id="bitrate">—</dd>
+        <dt>currentTime</dt><dd id="currentTime">—</dd>
+      </dl>
+      <h2 style="margin-top:14px">本机时钟</h2>
+      <div id="clock">--:--:--</div>
+      <p class="hint">glass-to-glass：用手机拍屏幕，把画面里的内容和上面的本机时钟对齐；
+        或使用带烧录时钟的测试源。</p>
+    </aside>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+  // 离线验收时可以把 hls.min.js 放在同目录；CDN 不可达则回退到本地副本。
+  if (!window.Hls) {
+    document.write('<script src="hls.min.js"><\/script>');
+  }
+</script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const video = $('video');
+  const params = new URLSearchParams(location.search);
+  const src = params.get('src') || 'http://127.0.0.1:8082/hls/live/test/master.m3u8';
+  $('src').value = src;
+
+  const set = (id, v) => { $(id).textContent = v; };
+  const fmt = (n, digits = 1) => Number.isFinite(n) ? n.toFixed(digits) : '—';
+  const bits = (n) => n > 0 ? (n / 1000).toFixed(0) + ' kbps' : '—';
+
+  setInterval(() => {
+    $('clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }, 250);
+
+  let hls = null;
+  let maxLatencySeen = 0;
+
+  function showError(msg) {
+    $('error').textContent = msg;
+    set('status', 'error');
+    document.title = 'flow HLS — error';
+  }
+
+  function updateStats() {
+    if (!hls) return;
+    set('latency', fmt(hls.latency, 2) + ' s');
+    if (Number.isFinite(hls.latency)) maxLatencySeen = Math.max(maxLatencySeen, hls.latency);
+    const maxLatency = Math.max(hls.maxLatency || 0, maxLatencySeen);
+    set('maxLatency', maxLatency > 0 ? fmt(maxLatency, 2) + ' s' : '—');
+    set('targetLatency', fmt(hls.targetLatency, 2) + ' s');
+    set('bandwidth', bits(hls.bandwidthEstimate));
+    const level = hls.levels && hls.levels[hls.currentLevel];
+    set('bitrate', level ? bits(level.bitrate) : '—');
+    set('currentTime', fmt(video.currentTime, 2));
+    if (!video.paused && video.currentTime > 0) set('status', 'playing');
+    document.title = `flow HLS — latency ${fmt(hls.latency, 2)}s`;
+  }
+
+  function attach() {
+    if (!hls) return;
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      set('status', 'manifest parsed, buffering…');
+      video.play().catch(() => {});
+    });
+    hls.on(Hls.Events.LEVEL_LOADED, updateStats);
+    hls.on(Hls.Events.FRAG_CHANGED, updateStats);
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data) return;
+      if (data.fatal) {
+        showError(`${data.type}/${data.details}: ${data.reason || ''}\n${data.error || ''}`);
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            setTimeout(() => hls.startLoad(), 1000);
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            hls.recoverMediaError();
+            break;
+          default:
+            // keep the last error visible for manual acceptance
+            break;
+        }
+      } else {
+        $('error').textContent = `${data.details}: ${data.reason || ''}`;
+      }
+    });
+  }
+
+  function playNative() {
+    set('status', 'native HLS (Safari)');
+    video.src = src;
+    video.play().catch(() => {});
+    // Safari 没有 hls.latency；用 seekable end 做参考读数。
+    setInterval(() => {
+      if (!video.seekable.length) return;
+      const end = video.seekable.end(video.seekable.length - 1);
+      const latency = Math.max(0, end - video.currentTime);
+      set('latency', fmt(latency, 2) + ' s (seekable)');
+      set('currentTime', fmt(video.currentTime, 2));
+      document.title = `flow HLS — latency ${fmt(latency, 2)}s`;
+    }, 500);
+  }
+
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({
+      lowLatencyMode: true,
+      liveSyncDurationCount: 2,
+      maxBufferLength: 6,
+      backBufferLength: 10,
+      enableWorker: true,
+    });
+    attach();
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    setInterval(updateStats, 500);
+    set('status', 'hls.js loading…');
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    playNative();
+  } else {
+    showError('当前浏览器不支持 MSE/hls.js，也不支持原生 HLS。');
+  }
+})();
+</script>
+</body>
+</html>

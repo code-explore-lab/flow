@@ -76,6 +76,11 @@ func (s *AACSource) Subscribe() (*Reader[Frame], func()) {
 	return rd, rd.Close
 }
 
+// SubscribeLive 与 Subscribe 相同（音频源本来就不预热）。
+func (s *AACSource) SubscribeLive() (*Reader[Frame], func()) {
+	return s.Subscribe()
+}
+
 // SubscribeFrom 从 start 对应的 AU 开始播放，返回独立的 Reader。
 // 音频没有关键帧概念，按「每帧 1024 采样」把时间换成 AU 序号即可，
 // 这样音视频 seek 到同一时间点后仍能保持内容同步。

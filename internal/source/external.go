@@ -36,6 +36,13 @@ type ExternalSource struct {
 	// 所以订阅时按顺序把整个 GOP 先发一遍，再接实时帧。
 	gop      []Frame
 	gopBytes int
+	// lastWasIDR 记录上一次写入的是否 IDR slice，用来区分「新关键帧 AU」
+	// 和同一个 AU 的后续 slice（后者不能清空 GOP 缓存）。
+	lastWasIDR bool
+
+	// useAUFlags 表示写入方会标记 AUStart/AUEnd。只有这样的源才按 slice
+	// 拆帧；不标记的老源一帧就是一个完整 AU，预热时不能擅自改边界。
+	useAUFlags bool
 
 	// rate 音频 RTP 时钟（= AAC 采样率），从 ANNOUNCE 的 rtpmap 带过来。
 	// 拉流端 streamAAC 用它设置 RTCP SR 的 RTP 时钟。
@@ -136,6 +143,10 @@ func (s *ExternalSource) Write(f Frame) {
 		defer s.mu.Unlock()
 		c := f
 		class := media.ClassifyVideoNAL(s.codec, f.Data)
+		// 一个关键帧 AU 可能被拆成多个 slice，每个 slice 都是 IDR 类型；
+		// 只有新 AU 的首个 slice 才开启新 GOP，否则缓存里只剩最后一个
+		// slice，中途加入的订阅者会缺参考数据、首帧解码花屏。
+		newGOP := class.IsIDR && (f.AUStart || !s.lastWasIDR)
 		switch {
 		case class.IsVPS:
 			s.vps = &c
@@ -145,12 +156,17 @@ func (s *ExternalSource) Write(f Frame) {
 			s.pps = &c
 		case class.IsIDR:
 			s.idr = &c
-			// 新关键帧开始新 GOP，旧帧不再需要。
-			s.gop = s.gop[:0]
-			s.gopBytes = 0
+			if newGOP {
+				s.gop = s.gop[:0]
+				s.gopBytes = 0
+			}
+		}
+		s.lastWasIDR = class.IsIDR
+		if f.AUStart || f.AUEnd {
+			s.useAUFlags = true
 		}
 		// 关键帧之后的帧都属于当前 GOP；IDR 之前的参数集不入缓存。
-		if len(s.gop) > 0 || class.IsIDR {
+		if len(s.gop) > 0 || newGOP {
 			if len(s.gop) < maxGOPFrames && s.gopBytes+len(f.Data) <= maxGOPBytes {
 				s.gop = append(s.gop, c)
 				s.gopBytes += len(f.Data)
@@ -178,13 +194,34 @@ func (s *ExternalSource) Subscribe() (*Reader[Frame], func()) {
 		if s.pps != nil {
 			preload = append(preload, *s.pps)
 		}
+		// 按 slice 拆帧的源里，GOP 从 IDR slice 开始，AUStart 原本标在
+		// AUD 上（不在缓存里）。预热的首个媒体帧必须补上 AUStart，否则
+		// 按 AU 合并的封装器（HTTP-FLV 等）会把每个 slice 当成独立一帧。
 		if len(s.gop) > 0 {
-			preload = append(preload, s.gop...)
+			gop := make([]Frame, len(s.gop))
+			copy(gop, s.gop)
+			if s.useAUFlags {
+				gop[0].AUStart = true
+			}
+			preload = append(preload, gop...)
 		} else {
-			preload = append(preload, *s.idr)
+			idr := *s.idr
+			if s.useAUFlags {
+				idr.AUStart = true
+			}
+			preload = append(preload, idr)
 		}
 	}
 	rd := s.ring.Subscribe(preload...)
+	return rd, rd.Close
+}
+
+// SubscribeLive 从当前写位置订阅，不预加载 SPS/PPS/最近 GOP。
+// HLS 打包器用它，避免旧 GOP 污染 PDT 锚点。
+func (s *ExternalSource) SubscribeLive() (*Reader[Frame], func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rd := s.ring.Subscribe()
 	return rd, rd.Close
 }
 

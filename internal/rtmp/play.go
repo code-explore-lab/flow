@@ -301,6 +301,15 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		return errors.New("rtmp: play without server")
 	}
 
+	// O-3：静态 token / app 白名单通过后，再交给外部鉴权服务。
+	// 拒绝沿用 T-3 的语义，统一回 StreamNotFound。
+	allowed, hookErr := c.checkAuthHook("play", rawName)
+	logRTMPAuthHook("play", rawName, c.app, c.remoteIP(), allowed, hookErr)
+	if !allowed {
+		return c.writeCommand(streamID, "onStatus", 0, flv.Null(),
+			statusObj("error", "NetStream.Play.StreamNotFound", "no stream named "+name))
+	}
+
 	c.stopPlay()
 
 	var (

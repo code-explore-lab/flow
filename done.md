@@ -524,9 +524,10 @@
 - [ ] **O-2 Web 控制台（P3，可选）**
   - 简洁页面展示流/会话/指标，支持操作；
   - 验收：浏览器完成查看与踢流。
-- [ ] **O-3 鉴权回调（P2）**
+- [x] **O-3 鉴权回调（P2）**
   - 推/拉鉴权走 HTTP hook（token、IP、流名），支持超时与缓存；
   - 验收：hook 返回拒绝时推拉被拒，超时按默认策略。
+  - ✅ 已实现：新增 `internal/authhook`，把一次推/拉判定 POST 给外部 HTTP 服务（JSON 含 `action`/`protocol`/`app`/`stream`/`ip`/`user`/`token`/`method`/`uri`）。约定 2xx 放行（空 body 或 `{"allow":true}`）、`{"allow":false}` 或 401/403 拒绝、其它状态/超时/不可达按 `DefaultAllow`（默认拒绝）；响应可用 `{"ttl":"30s"}` 覆盖缓存时长。判定结果按 `action|protocol|app|stream|ip|user|token` 哈希缓存（默认 10s，0 关闭），同 key 并发用 in-flight 合并，条目上限 10k；失败结果不缓存，hook 恢复后立即生效。可选 `X-Flow-Signature: HMAC-SHA256(secret, body)`；token 只参与哈希，日志不回显。RTSP 侧新增 `SetAuthHook`，在静态 Basic/Digest 通过后（未配置静态鉴权时也可单独生效）对 `ANNOUNCE`（publish）/`DESCRIBE`（play）调用 hook，拒绝回 `403 Forbidden`（不用 401，避免客户端拿同一凭据反复重试）；流名取 URI 路径，token 取查询串 `?token=`/`?key=`，用户名为 Basic/Digest 里的 username（Digest 密码不暴露）。SETUP/PLAY 依赖 DESCRIBE/ANNOUNCE 建立的 Session，无法绕过检查。RTMP 侧在 `handlePublish`/`handlePlay` 的 T-3 校验之后调用，拒绝沿用 `Connection.Rejected` / `StreamNotFound`。`cmd/server` 新增 `-auth-hook`、`-auth-hook-timeout`（默认 2s）、`-auth-hook-cache-ttl`（默认 10s，0 关闭）、`-auth-hook-default allow|deny`（默认 deny）、`-auth-hook-secret` 及 `FLOW_AUTH_HOOK*` 环境变量，优先级同其它鉴权参数（环境变量 < 命令行）；`/api/v1/config` 只暴露是否启用、超时、缓存和默认策略，不暴露 URL/secret。测试新增 `internal/authhook/authhook_test.go`（allow/deny、请求体与签名、500/超时 fallback、正负缓存与 key 隔离、TTL 过期、关闭缓存、并发去重、响应形式与 ttl 覆盖、nil/非法 URL），`internal/rtsp/auth_hook_test.go`（ANNOUNCE/DESCRIBE 拒绝与放行、超时默认策略、缓存命中、hook 收到的 stream/token/user/IP），`internal/rtmp/auth_hook_test.go`（publish/play 拒绝与放行、超时策略、缓存）。`gofmt -l .`、`go vet ./...`、`go test ./...` 全绿。e2e 新增 `test/e2e/auth_hook_e2e.py`（自行编译并启动实例 + 线程 hook 服务）：无 token 的 RTSP DESCRIBE/ANNOUNCE 返回 403，`?token=good` 分别返回 200；连续两次相同 DESCRIBE hook 调用数不变（缓存生效）；RTMP 错误 token 推流失败、正确 token 推流后 `ffprobe` 能解出 h264；hook 延迟 1s、超时 200ms 时 DESCRIBE 在 0.9s 内按默认策略返回 403。已知取舍：本任务只接入 RTSP/RTMP，HTTP-FLV/HLS/DASH/WebRTC/SRT 仍走各自的静态 token；缓存意味着撤销延迟最长等于 TTL；hook 是同步调用，只发生在建流动作上，媒体转发路径不受影响；未增加 hook 专用 Prometheus 指标。
 - [x] **O-4 健康检查与告警（P2）**
   - `/healthz`、`/readyz`；流中断/端口占用/会话异常时告警；
   - 验收：kill 推流端后健康状态与告警变化。

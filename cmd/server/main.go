@@ -19,6 +19,7 @@ import (
 
 	"flow/internal/access"
 	"flow/internal/admin"
+	"flow/internal/authhook"
 	"flow/internal/dash"
 	"flow/internal/discovery"
 	"flow/internal/health"
@@ -37,6 +38,13 @@ import (
 	"flow/internal/transcode"
 	"flow/internal/tsingest"
 	"flow/internal/webrtc"
+)
+
+// O-3 鉴权 hook 的默认值。抽成常量是为了区分“命令行没设”和“命令行设成
+// 默认值”，环境变量只在命令行没改默认值时生效（与其它鉴权参数一致）。
+const (
+	authHookDefaultTimeout  = 2 * time.Second
+	authHookDefaultCacheTTL = 10 * time.Second
 )
 
 // 入口：解析参数、搭好媒体源、并发启动 RTSP(:8554) 与 RTMP(:1935) 服务器。
@@ -104,6 +112,12 @@ func main() {
 	rtmpPlayToken := flag.String("rtmp-play-token", "", "T-3: RTMP token for play only (also FLOW_RTMP_PLAY_TOKEN)")
 	rtmpAuthFile := flag.String("rtmp-auth-file", "", "T-3: RTMP token file, lines publish:TOKEN / play:TOKEN / all:TOKEN / app:NAME (also FLOW_RTMP_AUTH_FILE)")
 	rtmpApps := flag.String("rtmp-app-whitelist", "", "T-3: comma-separated RTMP app whitelist (also FLOW_RTMP_APPS)")
+	// O-3：推/拉鉴权 HTTP hook。空表示关闭；默认策略用于 hook 超时/故障。
+	authHookURL := flag.String("auth-hook", "", "O-3: HTTP auth hook URL (also FLOW_AUTH_HOOK)")
+	authHookTimeout := flag.Duration("auth-hook-timeout", authHookDefaultTimeout, "O-3: per-request auth hook timeout (also FLOW_AUTH_HOOK_TIMEOUT)")
+	authHookCacheTTL := flag.Duration("auth-hook-cache-ttl", authHookDefaultCacheTTL, "O-3: auth decision cache TTL, 0 disables (also FLOW_AUTH_HOOK_CACHE_TTL)")
+	authHookDefault := flag.String("auth-hook-default", "deny", "O-3: allow or deny when the auth hook times out or fails (also FLOW_AUTH_HOOK_DEFAULT)")
+	authHookSecret := flag.String("auth-hook-secret", "", "O-3: HMAC-SHA256 secret for X-Flow-Signature (also FLOW_AUTH_HOOK_SECRET)")
 	rtmpChunkSize := flag.Uint("rtmp-chunk-size", 4096, "T-7: RTMP outbound chunk size advertised to peers (bytes, 1..16777215)")
 	publishPolicyFlag := flag.String("publish-policy", "replace", "T-8: duplicate publish policy: replace|reject|reject-if-active (applies to RTSP and RTMP)")
 	// T-9：RTMP 回源。逗号分隔，每项 [本地名=]rtmp://host[:port]/app/stream。
@@ -488,6 +502,43 @@ func main() {
 		fmt.Println("rtmp auth: enabled (tokens and/or app whitelist)")
 	}
 
+	// O-3：推/拉鉴权 HTTP hook。静态鉴权（RTSP Basic/Digest、RTMP token）
+	// 仍然先行校验，两者叠加；静态鉴权未配置时 hook 可以单独生效。
+	// 日志不打印 URL/secret，避免把内嵌凭据带出来。
+	hookCfg := authhook.Config{
+		URL:      envOrFlag(*authHookURL, "FLOW_AUTH_HOOK"),
+		Timeout:  durationEnvOrFlag(*authHookTimeout, authHookDefaultTimeout, "FLOW_AUTH_HOOK_TIMEOUT"),
+		CacheTTL: durationEnvOrFlag(*authHookCacheTTL, authHookDefaultCacheTTL, "FLOW_AUTH_HOOK_CACHE_TTL"),
+		Secret:   envOrFlag(*authHookSecret, "FLOW_AUTH_HOOK_SECRET"),
+	}
+	hookFallback := "deny"
+	switch strings.ToLower(envOrFlag(*authHookDefault, "FLOW_AUTH_HOOK_DEFAULT")) {
+	case "allow":
+		hookCfg.DefaultAllow = true
+		hookFallback = "allow"
+	case "deny":
+	default:
+		fmt.Fprintln(os.Stderr, "invalid -auth-hook-default (want allow or deny)")
+		os.Exit(2)
+	}
+	if hookCfg.Timeout <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -auth-hook-timeout (must be > 0)")
+		os.Exit(2)
+	}
+	if hookCfg.CacheTTL < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -auth-hook-cache-ttl (must be >= 0)")
+		os.Exit(2)
+	}
+	authHook, err := authhook.New(hookCfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if authHook.Enabled() {
+		fmt.Printf("auth hook: enabled (timeout %s, cache %s, fallback %s)\n",
+			hookCfg.Timeout, hookCfg.CacheTTL, hookFallback)
+	}
+
 	// 媒体源构造
 	// 不带 -live 本地文件回放源
 	video := source.NewH264Source("testdata/test.h264")
@@ -641,6 +692,7 @@ func main() {
 	rtspSrv.SetWhitelist(whitelist)
 	rtspSrv.SetRateLimit(rtspRate)
 	rtspSrv.SetBackoff(authBackoff)
+	rtspSrv.SetAuthHook(authHook)
 	// O-4：会话超时/断网被 Sweep 回收时上报会话异常告警。
 	rtspSrv.SetSessionExpireHook(func(id, remote string, _, lastActive time.Time) {
 		healthChecker.RecordSessionExpired("rtsp", id, remote, lastActive)
@@ -680,6 +732,7 @@ func main() {
 		srv.SetHandshakeTimeout(*handshakeTimeout)
 		srv.SetConnTimeout(*connTimeout)
 		srv.SetAuth(rtmpAuth)
+		srv.SetAuthHook(authHook)
 		srv.SetChunkSize(uint32(*rtmpChunkSize))
 		if originMgr != nil {
 			srv.SetOrigin(originMgr)
@@ -707,27 +760,31 @@ func main() {
 		adminSrv.SetToken(*adminToken)
 		adminSrv.SetHealth(healthChecker)
 		adminSrv.SetConfig(map[string]string{
-			"node":          node,
-			"live":          strconv.FormatBool(*live),
-			"publishPolicy": publishPolicy.String(),
-			"rtspAddr":      *rtspAddr,
-			"rtmpAddr":      *rtmpAddr,
-			"rtmpsAddr":     *rtmpsAddr,
-			"httpflvAddr":   *httpflvAddr,
-			"hlsAddr":       *hlsAddr,
-			"dashAddr":      *dashAddr,
-			"dvrWindow":     dvrWindow.String(),
-			"dvrDir":        *dvrDir,
-			"dvrMaxBytes":   strconv.FormatInt(*dvrMaxBytes, 10),
-			"srtAddr":       *srtAddr,
-			"webrtcAddr":    *webrtcAddr,
-			"snapshotAddr":  *snapshotAddr,
-			"multicastAddr": *multicastAddr,
-			"rtspAuthUsers": strconv.Itoa(len(users)),
-			"rtmpAuth":      strconv.FormatBool(rtmpAuth.Enabled()),
-			"discoveryMode": *discoveryMode,
-			"discovery":     strconv.FormatBool(discoveryClient != nil),
-			"streamIdle":    streamIdle.String(),
+			"node":             node,
+			"live":             strconv.FormatBool(*live),
+			"publishPolicy":    publishPolicy.String(),
+			"rtspAddr":         *rtspAddr,
+			"rtmpAddr":         *rtmpAddr,
+			"rtmpsAddr":        *rtmpsAddr,
+			"httpflvAddr":      *httpflvAddr,
+			"hlsAddr":          *hlsAddr,
+			"dashAddr":         *dashAddr,
+			"dvrWindow":        dvrWindow.String(),
+			"dvrDir":           *dvrDir,
+			"dvrMaxBytes":      strconv.FormatInt(*dvrMaxBytes, 10),
+			"srtAddr":          *srtAddr,
+			"webrtcAddr":       *webrtcAddr,
+			"snapshotAddr":     *snapshotAddr,
+			"multicastAddr":    *multicastAddr,
+			"rtspAuthUsers":    strconv.Itoa(len(users)),
+			"rtmpAuth":         strconv.FormatBool(rtmpAuth.Enabled()),
+			"authHook":         strconv.FormatBool(authHook.Enabled()),
+			"authHookDefault":  hookFallback,
+			"authHookTimeout":  hookCfg.Timeout.String(),
+			"authHookCacheTTL": hookCfg.CacheTTL.String(),
+			"discoveryMode":    *discoveryMode,
+			"discovery":        strconv.FormatBool(discoveryClient != nil),
+			"streamIdle":       streamIdle.String(),
 		})
 		if *adminToken != "" {
 			fmt.Printf("admin api listen on http://%s/api/v1/ (bearer token required)\n", adminListen)
@@ -1203,6 +1260,24 @@ func envOrFlag(flagValue, envName string) string {
 		return flagValue
 	}
 	return os.Getenv(envName)
+}
+
+// durationEnvOrFlag 只在命令行仍使用默认值时读取环境变量，
+// 保证“环境变量 < 命令行参数”的优先级。
+func durationEnvOrFlag(flagValue, defaultValue time.Duration, envName string) time.Duration {
+	if flagValue != defaultValue {
+		return flagValue
+	}
+	v := os.Getenv(envName)
+	if v == "" {
+		return flagValue
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v\n", envName, v, err)
+		os.Exit(2)
+	}
+	return d
 }
 
 // oneOrNone 把非空字符串包成 0/1 个元素的切片，方便合并鉴权配置。

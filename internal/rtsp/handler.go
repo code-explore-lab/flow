@@ -144,6 +144,21 @@ func (s *Server) handleConn(conn *Conn) {
 			s.backoff.Success(ip)
 		}
 
+		// O-3：静态凭据通过后，可选地把建立推/拉的动作交给外部鉴权服务。
+		// 只查 ANNOUNCE / DESCRIBE；SETUP/PLAY 依赖 DESCRIBE 建立的 Session，
+		// 不会绕过这里。hook 故障时按配置的默认策略处理。
+		if action, ok := authHookAction(req.Method); ok {
+			allowed, err := s.checkAuthHook(req, ip, action)
+			logAuthHookResult(req.Method, req.URI, ip, allowed, err)
+			if !allowed {
+				if err := writeAuthHookDenied(conn, hd); err != nil {
+					fmt.Println("write resp err:", err)
+					return
+				}
+				continue
+			}
+		}
+
 		var respErr error
 		switch req.Method {
 		case "OPTIONS":

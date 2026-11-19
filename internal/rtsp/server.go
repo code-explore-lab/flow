@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/authhook"
 	"flow/internal/health"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
@@ -50,6 +51,10 @@ type Server struct {
 	authScheme AuthScheme
 	// authSecret 用于给 Digest nonce 签名；进程内随机生成，不持久化。
 	authSecret [32]byte
+
+	// O-3：可选的推/拉鉴权 HTTP hook。nil 或未配置时跳过。
+	// 静态 Basic/Digest 先校验，通过后再交给 hook（两者叠加）。
+	authHook *authhook.Client
 
 	// cseqCheck 控制每条连接上的 CSeq 是否必须严格递增。
 	// cseqMaxGap > 0 时额外拒绝跳号超过该值的请求；0 表示不限制。

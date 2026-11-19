@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/authhook"
 	"flow/internal/health"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
@@ -53,6 +54,10 @@ type Server struct {
 
 	// T-3：RTMP token / app 白名单鉴权。nil 表示不鉴权。
 	auth *Auth
+
+	// O-3：可选的推/拉鉴权 HTTP hook。nil 或未配置时跳过。
+	// 静态 token/app 白名单先校验，通过后再交给 hook（两者叠加）。
+	authHook *authhook.Client
 
 	// T-7：connect 时向对端通告的 chunk size。0 表示用 connectChunkSize。
 	chunkSize uint32
@@ -134,6 +139,12 @@ func (s *Server) SetConnTimeout(d time.Duration) {
 // 必须在 Serve 之前调用。
 func (s *Server) SetAuth(a *Auth) {
 	s.auth = a
+}
+
+// SetAuthHook 注入 O-3 鉴权回调。nil 表示不启用。
+// 必须在 Serve 之前调用。
+func (s *Server) SetAuthHook(c *authhook.Client) {
+	s.authHook = c
 }
 
 // SetTLS 启用 RTMPS：从 PEM 文件加载证书与私钥，Serve 改用 tls.Listen。

@@ -328,6 +328,14 @@ func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
 		return errors.New("rtmp: publish without server")
 	}
 
+	// O-3：静态 token / app 白名单通过后，再交给外部鉴权服务。
+	// 拒绝沿用 T-3 的语义：不暴露具体原因，只回 Connection.Rejected。
+	allowed, hookErr := c.checkAuthHook("publish", rawName)
+	logRTMPAuthHook("publish", rawName, c.app, c.remoteIP(), allowed, hookErr)
+	if !allowed {
+		return c.rejectConnection(cmd.TransactionID, "Publish not authorized.")
+	}
+
 	// 同一条连接上重复 publish：先注销上一次推流，避免旧流残留在
 	// Registry、也保证发布计数不会只增不减。
 	c.stopPublish()

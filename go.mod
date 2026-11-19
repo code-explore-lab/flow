@@ -3,6 +3,7 @@ module flow
 go 1.27.0
 
 require (
+	github.com/Eyevinn/hi264 v0.12.3
 	github.com/datarhei/gosrt v0.13.0
 	github.com/pion/interceptor v0.1.51
 	github.com/pion/rtp v1.10.6
@@ -10,6 +11,7 @@ require (
 )
 
 require (
+	github.com/Eyevinn/mp4ff v0.62.0 // indirect
 	github.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.6.4 // indirect

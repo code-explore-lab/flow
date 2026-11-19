@@ -12,6 +12,7 @@ import (
 	"io"
 	"runtime"
 	"sync/atomic"
+	"time"
 )
 
 // Registry 是一组并发安全的计数器与仪表。用 New 构造。
@@ -81,6 +82,16 @@ type Registry struct {
 	whepSessions      atomic.Int64
 	whipSessionsTotal atomic.Uint64
 	whepSessionsTotal atomic.Uint64
+
+	// F-6 截图：按结果分类的请求数、缓存命中、解码次数与总耗时。
+	snapshotOK          atomic.Uint64
+	snapshotNotFound    atomic.Uint64
+	snapshotUnsupported atomic.Uint64
+	snapshotTimeout     atomic.Uint64
+	snapshotErrors      atomic.Uint64
+	snapshotCacheHits   atomic.Uint64
+	snapshotDecodes     atomic.Uint64
+	snapshotDecodeNanos atomic.Uint64
 }
 
 // New 创建一个空的注册表。
@@ -451,6 +462,43 @@ func (r *Registry) AddDashBytes(kind string, n int) {
 	}
 }
 
+// IncSnapshotRequest 按结果累计截图请求数。
+// result: ok / not_found / unsupported / timeout / error。
+func (r *Registry) IncSnapshotRequest(result string) {
+	if r == nil {
+		return
+	}
+	switch result {
+	case "ok":
+		r.snapshotOK.Add(1)
+	case "not_found":
+		r.snapshotNotFound.Add(1)
+	case "unsupported":
+		r.snapshotUnsupported.Add(1)
+	case "timeout":
+		r.snapshotTimeout.Add(1)
+	default:
+		r.snapshotErrors.Add(1)
+	}
+}
+
+// IncSnapshotCacheHit 记录一次缓存命中（没有真正解码）。
+func (r *Registry) IncSnapshotCacheHit() {
+	if r == nil {
+		return
+	}
+	r.snapshotCacheHits.Add(1)
+}
+
+// AddSnapshotDecode 记录一次解码耗时的次数与总和。
+func (r *Registry) AddSnapshotDecode(d time.Duration) {
+	if r == nil || d < 0 {
+		return
+	}
+	r.snapshotDecodes.Add(1)
+	r.snapshotDecodeNanos.Add(uint64(d))
+}
+
 // writeMetric 写一个指标的 HELP/TYPE 头和若干样本行。
 func writeMetric(w io.Writer, name, typ, help string, lines ...string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
@@ -560,6 +608,22 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	writeMetric(w, "flow_webrtc_sessions", "gauge", "当前活跃 WebRTC 会话数",
 		fmt.Sprintf(`flow_webrtc_sessions{kind="whip"} %d`, r.whipSessions.Load()),
 		fmt.Sprintf(`flow_webrtc_sessions{kind="whep"} %d`, r.whepSessions.Load()),
+	)
+	writeMetric(w, "flow_snapshot_requests_total", "counter", "截图请求数",
+		fmt.Sprintf(`flow_snapshot_requests_total{result="ok"} %d`, r.snapshotOK.Load()),
+		fmt.Sprintf(`flow_snapshot_requests_total{result="not_found"} %d`, r.snapshotNotFound.Load()),
+		fmt.Sprintf(`flow_snapshot_requests_total{result="unsupported"} %d`, r.snapshotUnsupported.Load()),
+		fmt.Sprintf(`flow_snapshot_requests_total{result="timeout"} %d`, r.snapshotTimeout.Load()),
+		fmt.Sprintf(`flow_snapshot_requests_total{result="error"} %d`, r.snapshotErrors.Load()),
+	)
+	writeMetric(w, "flow_snapshot_cache_hits_total", "counter", "截图缓存命中次数",
+		fmt.Sprintf("flow_snapshot_cache_hits_total %d", r.snapshotCacheHits.Load()),
+	)
+	writeMetric(w, "flow_snapshot_decodes_total", "counter", "实际执行解码的截图次数",
+		fmt.Sprintf("flow_snapshot_decodes_total %d", r.snapshotDecodes.Load()),
+	)
+	writeMetric(w, "flow_snapshot_decode_seconds_total", "counter", "截图解码累计耗时（秒）",
+		fmt.Sprintf("flow_snapshot_decode_seconds_total %g", float64(r.snapshotDecodeNanos.Load())/float64(time.Second)),
 	)
 	writeMetric(w, "flow_webrtc_sessions_total", "counter", "累计 WebRTC 会话数",
 		fmt.Sprintf(`flow_webrtc_sessions_total{kind="whip"} %d`, r.whipSessionsTotal.Load()),

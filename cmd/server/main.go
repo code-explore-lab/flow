@@ -28,6 +28,7 @@ import (
 	"flow/internal/record"
 	"flow/internal/rtmp"
 	"flow/internal/rtsp"
+	"flow/internal/snapshot"
 	"flow/internal/source"
 	"flow/internal/srt"
 	"flow/internal/stream"
@@ -172,6 +173,20 @@ func main() {
 	webrtcToken := flag.String("webrtc-token", "", "P-4: WHIP/WHEP token, passed as ?token=... or X-Flow-Token (empty disables)")
 	webrtcLoopback := flag.Bool("webrtc-loopback", false, "P-4: include loopback ICE candidates (local browser/tests)")
 	webrtcGatherTimeout := flag.Duration("webrtc-gather-timeout", 3*time.Second, "P-4: ICE gathering timeout for non-trickle answers")
+
+	// F-6：截图/缩略图。
+	snapshotAddr := flag.String("snapshot-addr", ":8085", "F-6: snapshot HTTP listen address (empty disables)")
+	snapshotTimeout := flag.Duration("snapshot-timeout", snapshot.DefaultTimeout, "F-6: how long to wait for a keyframe")
+	snapshotCache := flag.Duration("snapshot-cache", snapshot.DefaultCacheTTL, "F-6: reuse an encoded image for this long (0 disables)")
+	snapshotConcurrency := flag.Int("snapshot-concurrency", snapshot.DefaultConcurrency, "F-6: concurrent decode limit")
+	snapshotQuality := flag.Int("snapshot-quality", snapshot.DefaultQuality, "F-6: default JPEG quality (1..100)")
+	snapshotMaxWidth := flag.Int("snapshot-max-width", 0, "F-6: default thumbnail max width (0 = original size)")
+	snapshotFFmpeg := flag.String("snapshot-ffmpeg", "", "F-6: ffmpeg path for H.265 / undecodable H.264 (empty disables)")
+	snapshotFFmpegTimeout := flag.Duration("snapshot-ffmpeg-timeout", 5*time.Second, "F-6: ffmpeg decode timeout")
+	snapshotCORS := flag.String("snapshot-cors", "", "F-6: allowed CORS origins, comma-separated (\"*\" allows any; empty disables)")
+	snapshotReferer := flag.String("snapshot-referer", "", "F-6: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
+	snapshotRequireReferer := flag.Bool("snapshot-require-referer", false, "F-6: reject requests without a Referer when -snapshot-referer is set")
+	snapshotToken := flag.String("snapshot-token", "", "F-6: snapshot token, passed as ?token=... or X-Flow-Token (empty disables)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -224,6 +239,30 @@ func main() {
 	}
 	if *srtLatency <= 0 {
 		fmt.Fprintln(os.Stderr, "invalid -srt-latency (must be > 0)")
+		os.Exit(2)
+	}
+	if *snapshotQuality < 0 || *snapshotQuality > 100 {
+		fmt.Fprintln(os.Stderr, "invalid -snapshot-quality (must be 0..100)")
+		os.Exit(2)
+	}
+	if *snapshotConcurrency < 1 {
+		fmt.Fprintln(os.Stderr, "invalid -snapshot-concurrency (must be >= 1)")
+		os.Exit(2)
+	}
+	if *snapshotMaxWidth < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -snapshot-max-width (must be >= 0)")
+		os.Exit(2)
+	}
+	if *snapshotTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -snapshot-timeout (must be > 0)")
+		os.Exit(2)
+	}
+	if *snapshotCache < 0 {
+		fmt.Fprintln(os.Stderr, "invalid -snapshot-cache (must be >= 0)")
+		os.Exit(2)
+	}
+	if *snapshotFFmpegTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -snapshot-ffmpeg-timeout (must be > 0)")
 		os.Exit(2)
 	}
 	if err := validateHLSOptions(*hlsSegment, *hlsPart, *hlsWindow, *hlsIdle, *hlsMaxBytes); err != nil {
@@ -639,6 +678,30 @@ func main() {
 		}
 	}
 
+	// F-6：截图/缩略图。从注册表的视频源取最近一个 IDR，纯 Go 解码成
+	// JPEG/PNG；未配置 ffmpeg 时 H.265 返回 415。
+	var snapshotSrv *snapshot.Server
+	if *snapshotAddr != "" {
+		snapshotSrv = snapshot.New(reg, video)
+		snapshotSrv.SetMetrics(flowMetrics)
+		snapshotSrv.SetWhitelist(whitelist)
+		snapshotSrv.SetOptions(snapshot.Options{
+			Timeout:       *snapshotTimeout,
+			CacheTTL:      *snapshotCache,
+			Concurrency:   *snapshotConcurrency,
+			Quality:       *snapshotQuality,
+			MaxWidth:      *snapshotMaxWidth,
+			FFmpegPath:    *snapshotFFmpeg,
+			FFmpegTimeout: *snapshotFFmpegTimeout,
+		})
+		snapshotSrv.SetCORS(*snapshotCORS)
+		snapshotSrv.SetReferer(*snapshotReferer, *snapshotRequireReferer)
+		snapshotSrv.SetToken(*snapshotToken)
+		if originMgr != nil {
+			snapshotSrv.SetOrigin(originMgr)
+		}
+	}
+
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
 	if *metricsAddr != "" {
 		if err := startMetrics(ctx, *metricsAddr, flowMetrics, rtspSrv); err != nil {
@@ -673,6 +736,9 @@ func main() {
 	if webrtcSrv != nil {
 		wg.Add(1)
 	}
+	if snapshotSrv != nil {
+		wg.Add(1)
+	}
 	if hlsEnabled {
 		wg.Add(1)
 	}
@@ -704,6 +770,9 @@ func main() {
 	}
 	if webrtcSrv != nil {
 		go serve("webrtc", *webrtcAddr, webrtcSrv.Serve)
+	}
+	if snapshotSrv != nil {
+		go serve("snapshot", *snapshotAddr, snapshotSrv.Serve)
 	}
 	if hlsEnabled {
 		go serve("hls", *hlsAddr, hlsSrv.Serve)

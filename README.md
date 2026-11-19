@@ -45,6 +45,29 @@ go run ./cmd/server -webrtc-addr :8084 -webrtc-cors '*' -webrtc-loopback
 python test/e2e/webrtc_e2e.py      # 起服务 + headless Edge 全自动验收
 ```
 
+截图 / 缩略图（F-6，默认 `:8085`）：从流的最近一个 IDR 解码一帧，输出
+JPEG/PNG，供列表页或播前预览。H.264 用纯 Go 解码；H.265 或 hi264 不支持
+的 H.264 可配置 `-snapshot-ffmpeg` 回退到 ffmpeg，否则返回 415。
+
+```bash
+go run ./cmd/server -snapshot-addr :8085 -snapshot-max-width 480
+
+# 路径后缀选择格式；width/quality 覆盖默认缩略参数
+curl -o thumb.jpg "http://127.0.0.1:8085/snapshot/live/test.jpg?width=320&quality=80"
+curl -o frame.png "http://127.0.0.1:8085/snapshot/live/test.png"
+
+# fresh=1 忽略预热的 GOP，等下一个关键帧（直播画面而不是缓存 GOP）
+curl -o fresh.jpg "http://127.0.0.1:8085/snapshot/live/test.jpg?fresh=1"
+
+# H.265 兜底
+go run ./cmd/server -snapshot-ffmpeg ffmpeg
+```
+
+`-snapshot-cache`（默认 1s）让同一路流的重复请求复用已编码图片，
+`-snapshot-concurrency`（默认 2）限制同时解码数；`-snapshot-cors` /
+`-snapshot-referer` / `-snapshot-token` 与其它 HTTP 服务语义一致，
+`-snapshot-addr ""` 关闭该服务。
+
 RTMP 回源（从上游拉流并在本地重新发布，供 RTSP/RTMP/HTTP-FLV 下游拉取；
 上游断开后自动重连，下游保持连接）：
 
@@ -177,6 +200,7 @@ go tool pprof -http=127.0.0.1:8081 cpu.pprof
 | `internal/flvingest/` | FLV tag → `source.Frame`（推流/回源共用），含 PTS/CTS 与跨重连时间戳平移 |
 | `internal/httpflv/`, `internal/flvmux/` | HTTP-FLV 分发与 frame→FLV Tag 封装 |
 | `internal/webrtc/` | WHIP/WHEP 入口：pion 负责 ICE/DTLS/SRTP，媒体桥接共享注册表 |
+| `internal/snapshot/` | 截图：IDR → hi264 解码 → JPEG/PNG，含缓存、并发限制与 ffmpeg 兜底 |
 | `internal/rtp/` | RTP 打包/解包，H.264、Opus 与 AAC |
 | `internal/rtcp/` | RTCP 包解析：SR/RR、SDES、BYE、NACK |
 | `internal/rtpbuf/`, `internal/plc/` | 接收侧抖动缓冲、丢包补偿 |

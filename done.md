@@ -439,9 +439,10 @@
 - [ ] **F-5 多码率 / ABR**
   - 同一路源生成多档码率，按客户端能力选择；输出 master playlist；
   - 验收：播放器可切换档位且不断流。
-- [ ] **F-6 截图 / 缩略图**
+- [x] **F-6 截图 / 缩略图**
   - 从 IDR 解码一帧输出 JPEG/PNG，供预览；
   - 验收：接口返回可显示图片，CPU 开销可接受。
+  - ✅ 已实现：新增 `internal/snapshot`，链路是「注册表取视频源 → 预热订阅拿 SPS/PPS 和最近 GOP → 收齐同一 Timestamp 的 IDR slice → 解码 → 编码图片」。取帧按 `AUStart/AUEnd` 聚合多 slice 访问单元，同时用「时间戳变化」兜底推流端没打 AU 标记的情况；参数集优先用帧内最新的 VPS/SPS/PPS，缺失时回退 `stream.VideoCodec`。H.264 用 `github.com/Eyevinn/hi264`（纯 Go，无 cgo，支持 CAVLC/CABAC、8-bit 4:2:0 渐进、POC 0/2），解码后经 `yuv.WriteJPEGCS`/`WritePNGCS` 直接输出 JPEG/PNG；按 `ColorDescriptionValid`/`VideoFullRangeFlag` 传递色彩信息。缩略图用 Y/Cb/Cr 三平面最近邻缩放（宽高取偶数），不做二次编码。H.265 与 hi264 不支持的 H.264（POC type=1、隔行等）在配置 `-snapshot-ffmpeg` 时回退到 ffmpeg：拼 Annex-B（4 字节起始码）从 stdin 喂 `-frames:v 1`，按格式输出 mjpeg/image2pipe，超时由 `-snapshot-ffmpeg-timeout` 控制；未配置时 H.265 直接 415，避免每个请求都先等关键帧再失败。HTTP 层 `GET/HEAD /snapshot/<name>[.jpg|.jpeg|.png]`，支持 `?format=&quality=&width=&fresh=1`：`fresh=1` 用 `SubscribeLive` 跳过预热 GOP，等下一个关键帧；`width` 超过源宽时不放大；`quality` 只影响 JPEG。缓存以「流指针 + 格式/质量/宽度/fresh」为键、默认 TTL 1s，命中时直接复用编码结果并带 `X-Flow-Snapshot-Cache: hit`；解码用带缓冲的信号量限流（默认 2），这两点是控制 CPU 的关键。安全模型复用 HTTP-FLV/HLS 的语义：IP 白名单、CORS（支持 `*`/Origin 列表与预检）、Referer（支持 `*.example.com`，防 `evil.com/example.com` 绕过）、token（`?token=` 或 `X-Flow-Token`，常量时间比较），全部在解码前完成。指标新增 `flow_snapshot_requests_total{result=ok|not_found|unsupported|timeout|error}`、`flow_snapshot_cache_hits_total`、`flow_snapshot_decodes_total`、`flow_snapshot_decode_seconds_total`。`cmd/server` 新增 `-snapshot-addr`（默认 `:8085`）、`-snapshot-timeout`、`-snapshot-cache`、`-snapshot-concurrency`、`-snapshot-quality`、`-snapshot-max-width`、`-snapshot-ffmpeg`、`-snapshot-ffmpeg-timeout`、`-snapshot-cors`、`-snapshot-referer`、`-snapshot-require-referer`、`-snapshot-token` 并做参数校验；流名解析与 HTTP-FLV 一致（精确匹配 → 最后一段 → `-origin` 回源 → 本地 testdata）。测试新增 `internal/snapshot`：JPEG/PNG 解码与缩放尺寸、HEAD/404/415/503、token/CORS/Referer、缓存命中与指标、本地回退源、`fresh` 等待新关键帧，以及 ffmpeg HEVC 兜底（缺 ffmpeg 或 libx265 时跳过）。e2e：本地 testdata 640x480，`/snapshot/live/test.jpg?width=320` 返回可解码的 320x240 JPEG，PNG 160x120 正常；首次「取帧+解码+缩放+编码」54ms，命中缓存后 1~2ms，连续 5 次请求只解码 1 次；hi264 单独基准 1080p IDR 解码约 55ms，因此默认 1s 缓存 + 2 路并发下 CPU 开销可接受。局限：只解 IDR（不做帧间预测），因此截图滞后最多一个 GOP；H.265 依赖外部 ffmpeg；hi264 仅支持 8-bit 4:2:0 渐进 H.264。`gofmt -l .`、`go vet ./...`、`go test ./...` 全部通过。
 
 ---
 

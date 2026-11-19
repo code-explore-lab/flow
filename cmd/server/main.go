@@ -33,6 +33,7 @@ import (
 	"flow/internal/srt"
 	"flow/internal/stream"
 	"flow/internal/transcode"
+	"flow/internal/tsingest"
 	"flow/internal/webrtc"
 )
 
@@ -196,6 +197,14 @@ func main() {
 	transcodePreset := flag.String("transcode-preset", transcode.DefaultPreset, "F-4: software encoder preset")
 	transcodeGOP := flag.Duration("transcode-gop", transcode.DefaultGOP, "F-4: forced keyframe interval")
 	transcodeHW := flag.String("transcode-hw", "none", "F-4: hardware encoder: none|nvenc|qsv")
+
+	// P-6：MPEG-TS 输入。UDP（单播/组播）与本地文件解复用后写进同一个
+	// 注册表，RTSP/RTMP/HTTP-FLV/HLS 都能直接拉。
+	tsUDP := flag.String("ts-udp", "", "P-6: UDP TS inputs, comma-separated name=host:port, e.g. live/udp=239.1.1.1:5000 (empty disables)")
+	tsUDPIdle := flag.Duration("ts-udp-idle", 10*time.Second, "P-6: unpublish a UDP input after this long without packets")
+	tsFile := flag.String("ts-file", "", "P-6: file TS inputs, comma-separated name=path.ts (empty disables)")
+	tsFileLoop := flag.Bool("ts-file-loop", false, "P-6: restart -ts-file inputs at EOF with continuous timestamps")
+	tsFileRate := flag.Float64("ts-file-rate", 1, "P-6: -ts-file playback speed (1 = by PTS, 2 = 2x)")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -298,6 +307,24 @@ func main() {
 	}
 	if err := validateTranscodeOptions(*transcodeGOP, *transcodeHW); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	tsUDPInputs, err := tsingest.ParseUDPInputs(*tsUDP)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	tsFileInputs, err := tsingest.ParseFileInputs(*tsFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if *tsUDPIdle <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -ts-udp-idle (must be > 0)")
+		os.Exit(2)
+	}
+	if *tsFileRate <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -ts-file-rate (must be > 0)")
 		os.Exit(2)
 	}
 	publishPolicy, err := stream.ParsePublishPolicy(*publishPolicyFlag)
@@ -489,6 +516,15 @@ func main() {
 			fmt.Printf("transcode: %s → %s (%dx%d %s %d bps)\n",
 				p.Source, p.Output, p.Width, p.Height, p.Codec, p.Bitrate)
 		}
+	}
+
+	// P-6：TS 输入。UDP 空闲超时后摘流、下一包到达时重新发布；文件输入
+	// 按 PTS 节奏播放，播完（或 ctx 取消）后摘流。
+	for _, in := range tsUDPInputs {
+		fmt.Printf("ts-udp: %s ← %s (idle %s)\n", in.Name, in.Addr, *tsUDPIdle)
+	}
+	for _, in := range tsFileInputs {
+		fmt.Printf("ts-file: %s ← %s (loop=%v rate=%g)\n", in.Name, in.Path, *tsFileLoop, *tsFileRate)
 	}
 	// E-5：每个协议各自一份连接限流器（per-protocol 独立计数）。
 	rtspLimiter := limiter.New(*maxConns, *maxIPConns)
@@ -787,6 +823,7 @@ func main() {
 		wg.Add(1)
 	}
 	wg.Add(len(pulls))
+	wg.Add(len(tsUDPInputs) + len(tsFileInputs))
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
 		defer wg.Done()
@@ -836,6 +873,24 @@ func main() {
 			defer wg.Done()
 			cl.Run(ctx)
 		}(cl)
+	}
+	// P-6：UDP 输入长期运行（含收包空闲时），文件输入播完或 ctx 取消后返回。
+	for _, in := range tsUDPInputs {
+		go func(in tsingest.UDPInput) {
+			defer wg.Done()
+			if err := tsingest.RunUDP(ctx, reg, in.Name, tsingest.UDPOptions{Addr: in.Addr, Idle: *tsUDPIdle}); err != nil {
+				fmt.Printf("ts-udp %s: %v\n", in.Name, err)
+			}
+		}(in)
+	}
+	for _, in := range tsFileInputs {
+		go func(in tsingest.FileInput) {
+			defer wg.Done()
+			err := tsingest.RunFile(ctx, reg, in.Name, in.Path, tsingest.FileOptions{Loop: *tsFileLoop, Rate: *tsFileRate})
+			if err != nil {
+				fmt.Printf("ts-file %s: %v\n", in.Name, err)
+			}
+		}(in)
 	}
 	wg.Wait()
 }

@@ -8,7 +8,6 @@ import (
 
 	gosrt "github.com/datarhei/gosrt"
 
-	"flow/internal/media"
 	"flow/internal/mpegts"
 	"flow/internal/source"
 	"flow/internal/stream"
@@ -26,14 +25,9 @@ func (s *Server) servePlay(ctx context.Context, conn gosrt.Conn, name string) {
 		log.Printf("srt: read %q: no playable track (need H.264 video or AAC audio)", name)
 		return
 	}
-	if video != nil && media.IsHEVCCodec(video.Codec) {
-		log.Printf("srt: read %q: H.265 over SRT is not supported", name)
-		return
-	}
-
 	mux := mpegts.NewMuxer(conn)
 	if video != nil {
-		mux.SetVideoParams(video.SPS, video.PPS)
+		mux.SetVideoParamsFor(video.Codec, video.VPS, video.SPS, video.PPS)
 	}
 	if audio != nil {
 		if err := mux.SetAudioParams(audio.Config); err != nil {

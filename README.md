@@ -90,6 +90,27 @@ go run ./cmd/server -snapshot-ffmpeg ffmpeg
 500ms→10s 指数退避重启；重启后的输出时间轴接在上一次之后，下游不会看到
 时间戳回退。指标见 `flow_transcode_*`。
 
+MPEG-TS 输入（P-6）：UDP（单播/组播）与本地文件里的 MPEG-TS 直接解复用成
+H.264/H.265 + AAC 写进注册表，RTSP / RTMP / HTTP-FLV / HLS / DASH 都能拉，
+也可以继续通过 SRT（P-5）或 HLS 输出 TS。
+
+```bash
+# ffmpeg 通过 UDP 推 TS（组播地址会自动加入组）
+./flow -ts-udp "live/udp=239.1.1.1:5000"
+ffmpeg -re -i input.mp4 -c copy -f mpegts "udp://239.1.1.1:5000?pkt_size=1316"
+ffplay rtsp://127.0.0.1:8554/live/udp
+
+# 本地文件，按 PTS 实时播放；-ts-file-loop 循环，-ts-file-rate 调速度
+./flow -ts-file "live/file=clips/demo.ts" -ts-file-loop -ts-file-rate 1
+ffplay rtmp://127.0.0.1:1935/live/file
+```
+
+多个输入用逗号、分号或换行分隔（`name=host:port` / `name=path`）。UDP 输入
+超过 `-ts-udp-idle`（默认 10s）没有包会摘流，下一包到达时自动重新发布，
+发送端重启不需要重启 flow；一个端口只应有一个发送端（原始 TS 没有会话
+标识）。文件播完后摘流，`-ts-file-loop` 每圈把时间戳接在上一圈之后，下游
+不会看到回退；文件路径里不要包含逗号或分号。
+
 RTMP 回源（从上游拉流并在本地重新发布，供 RTSP/RTMP/HTTP-FLV 下游拉取；
 上游断开后自动重连，下游保持连接）：
 

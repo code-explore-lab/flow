@@ -30,7 +30,11 @@ type Muxer struct {
 
 	cc map[uint16]byte
 
-	sps, pps []byte
+	// videoCodec 是视频基本流的编码（"H264" / "H265"），决定 PMT 的
+	// stream_type、AUD 的字节和参数集顺序。默认 H.264。
+	videoCodec string
+	vps, sps   []byte
+	pps        []byte
 
 	hasVideo bool
 
@@ -60,6 +64,32 @@ func NewMuxer(w io.Writer) *Muxer {
 func (m *Muxer) SetVideoParams(sps, pps []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.videoCodec = "H264"
+	m.vps = m.vps[:0]
+	m.sps = append(m.sps[:0], sps...)
+	m.pps = append(m.pps[:0], pps...)
+	if len(sps) > 0 && len(pps) > 0 {
+		m.hasVideo = true
+		m.lastPSI = time.Time{}
+	}
+}
+
+// SetVideoParamsFor 按编码设置参数集：H.265 走 VPS/SPS/PPS，其余按 H.264。
+func (m *Muxer) SetVideoParamsFor(codec string, vps, sps, pps []byte) {
+	if media.IsHEVCCodec(codec) {
+		m.SetVideoParamsHEVC(vps, sps, pps)
+		return
+	}
+	m.SetVideoParams(sps, pps)
+}
+
+// SetVideoParamsHEVC 设置 H.265 的 VPS/SPS/PPS，关键帧前会自动补上。
+// 与 SetVideoParams 互斥，调用哪一个就决定 PMT 里的视频 stream_type。
+func (m *Muxer) SetVideoParamsHEVC(vps, sps, pps []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.videoCodec = "H265"
+	m.vps = append(m.vps[:0], vps...)
 	m.sps = append(m.sps[:0], sps...)
 	m.pps = append(m.pps[:0], pps...)
 	if len(sps) > 0 && len(pps) > 0 {
@@ -96,22 +126,30 @@ func (m *Muxer) SetAudioParams(asc []byte) error {
 	return nil
 }
 
-// WriteVideo 写入一个 H.264 访问单元。pts/dts 为 90kHz。
-// 不含 VCL NALU 的访问单元会被忽略。
+// WriteVideo 写入一个视频访问单元。pts/dts 为 90kHz。
+// 不含 VCL NALU 的访问单元会被忽略。编码由 SetVideoParams /
+// SetVideoParamsHEVC 决定（默认 H.264）。
 func (m *Muxer) WriteVideo(nalus [][]byte, pts, dts uint32) error {
+	codec := m.videoCodec
+	if codec == "" {
+		codec = "H264"
+	}
 	hasVCL := false
 	keyframe := false
-	hasSPS, hasPPS := false, false
+	hasVPS, hasSPS, hasPPS := false, false, false
 	for _, nalu := range nalus {
 		if len(nalu) == 0 {
 			continue
 		}
-		class := media.ClassifyVideoNAL("H264", nalu)
+		class := media.ClassifyVideoNAL(codec, nalu)
 		if class.IsVCL {
 			hasVCL = true
 		}
 		if class.IsIDR {
 			keyframe = true
+		}
+		if class.IsVPS {
+			hasVPS = true
 		}
 		if class.IsSPS {
 			hasSPS = true
@@ -138,8 +176,15 @@ func (m *Muxer) WriteVideo(nalus [][]byte, pts, dts uint32) error {
 		payload = append(payload, nalu...)
 	}
 
-	payload = append(payload, 0, 0, 0, 1, 0x09, 0xF0) // AUD
+	if codec == "H265" {
+		payload = append(payload, 0, 0, 0, 1, 0x46, 0x01) // AUD_NUT
+	} else {
+		payload = append(payload, 0, 0, 0, 1, 0x09, 0xF0) // AUD
+	}
 	if keyframe {
+		if codec == "H265" && !hasVPS && len(m.vps) > 0 {
+			appendNALU(m.vps)
+		}
 		if !hasSPS && len(m.sps) > 0 {
 			appendNALU(m.sps)
 		}
@@ -259,7 +304,11 @@ func (m *Muxer) buildPAT() []byte {
 func (m *Muxer) buildPMT() []byte {
 	var streams []byte
 	if m.hasVideo {
-		streams = append(streams, StreamTypeH264,
+		streamType := byte(StreamTypeH264)
+		if m.videoCodec == "H265" {
+			streamType = StreamTypeHEVC
+		}
+		streams = append(streams, streamType,
 			byte(0xE0|m.videoPID>>8), byte(m.videoPID), 0xF0, 0x00)
 	}
 	if m.hasAudio {

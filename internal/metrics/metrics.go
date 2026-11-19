@@ -92,6 +92,16 @@ type Registry struct {
 	snapshotCacheHits   atomic.Uint64
 	snapshotDecodes     atomic.Uint64
 	snapshotDecodeNanos atomic.Uint64
+
+	// F-4 转码：活跃转码器、帧数、丢帧、重启、输出字节与流水线延迟。
+	transcodeStreams      atomic.Int64
+	transcodeInput        atomic.Uint64
+	transcodeOutput       atomic.Uint64
+	transcodeDropped      atomic.Uint64
+	transcodeRestarts     atomic.Uint64
+	transcodeBytes        atomic.Uint64
+	transcodeLatencyNanos atomic.Uint64
+	transcodeLatencies    atomic.Uint64
 }
 
 // New 创建一个空的注册表。
@@ -499,6 +509,63 @@ func (r *Registry) AddSnapshotDecode(d time.Duration) {
 	r.snapshotDecodeNanos.Add(uint64(d))
 }
 
+// IncTranscodeStream / DecTranscodeStream 维护活跃转码器数量。
+func (r *Registry) IncTranscodeStream() {
+	if r != nil {
+		r.transcodeStreams.Add(1)
+	}
+}
+
+func (r *Registry) DecTranscodeStream() {
+	if r != nil {
+		r.transcodeStreams.Add(-1)
+	}
+}
+
+// IncTranscodeRestart 记录一次 ffmpeg 重启。
+func (r *Registry) IncTranscodeRestart() {
+	if r != nil {
+		r.transcodeRestarts.Add(1)
+	}
+}
+
+// AddTranscodeInputFrames 记录喂给 ffmpeg 的访问单元数。
+func (r *Registry) AddTranscodeInputFrames(n uint64) {
+	if r != nil && n > 0 {
+		r.transcodeInput.Add(n)
+	}
+}
+
+// AddTranscodeOutputFrames 记录 ffmpeg 输出的视频帧数。
+func (r *Registry) AddTranscodeOutputFrames(n uint64) {
+	if r != nil && n > 0 {
+		r.transcodeOutput.Add(n)
+	}
+}
+
+// AddTranscodeDroppedFrames 记录因消费太慢被帧源覆盖的 NALU 数。
+func (r *Registry) AddTranscodeDroppedFrames(n uint64) {
+	if r != nil && n > 0 {
+		r.transcodeDropped.Add(n)
+	}
+}
+
+// AddTranscodeBytes 记录写入输出流的视频负载字节数。
+func (r *Registry) AddTranscodeBytes(n int) {
+	if r != nil && n > 0 {
+		r.transcodeBytes.Add(uint64(n))
+	}
+}
+
+// AddTranscodeLatency 记录一帧从喂入 ffmpeg 到输出可用的耗时。
+func (r *Registry) AddTranscodeLatency(d time.Duration) {
+	if r == nil || d < 0 {
+		return
+	}
+	r.transcodeLatencies.Add(1)
+	r.transcodeLatencyNanos.Add(uint64(d))
+}
+
 // writeMetric 写一个指标的 HELP/TYPE 头和若干样本行。
 func writeMetric(w io.Writer, name, typ, help string, lines ...string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
@@ -628,6 +695,28 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	writeMetric(w, "flow_webrtc_sessions_total", "counter", "累计 WebRTC 会话数",
 		fmt.Sprintf(`flow_webrtc_sessions_total{kind="whip"} %d`, r.whipSessionsTotal.Load()),
 		fmt.Sprintf(`flow_webrtc_sessions_total{kind="whep"} %d`, r.whepSessionsTotal.Load()),
+	)
+	writeMetric(w, "flow_transcode_streams", "gauge", "当前活跃转码器数",
+		fmt.Sprintf("flow_transcode_streams %d", r.transcodeStreams.Load()),
+	)
+	writeMetric(w, "flow_transcode_input_frames_total", "counter", "喂给 ffmpeg 的视频访问单元数",
+		fmt.Sprintf("flow_transcode_input_frames_total %d", r.transcodeInput.Load()),
+	)
+	writeMetric(w, "flow_transcode_output_frames_total", "counter", "ffmpeg 输出的视频帧数",
+		fmt.Sprintf("flow_transcode_output_frames_total %d", r.transcodeOutput.Load()),
+	)
+	writeMetric(w, "flow_transcode_dropped_frames_total", "counter", "转码端因消费过慢被覆盖的 NALU 数",
+		fmt.Sprintf("flow_transcode_dropped_frames_total %d", r.transcodeDropped.Load()),
+	)
+	writeMetric(w, "flow_transcode_restarts_total", "counter", "ffmpeg 进程重启次数",
+		fmt.Sprintf("flow_transcode_restarts_total %d", r.transcodeRestarts.Load()),
+	)
+	writeMetric(w, "flow_transcode_output_bytes_total", "counter", "写入输出流的视频负载字节数",
+		fmt.Sprintf("flow_transcode_output_bytes_total %d", r.transcodeBytes.Load()),
+	)
+	writeMetric(w, "flow_transcode_latency_seconds_total", "counter", "转码流水线累计延迟（秒）；除以 flow_transcode_latency_events_total 得平均",
+		fmt.Sprintf("flow_transcode_latency_seconds_total %g", float64(r.transcodeLatencyNanos.Load())/float64(time.Second)),
+		fmt.Sprintf("flow_transcode_latency_events_total %d", r.transcodeLatencies.Load()),
 	)
 	// E-9：抓取时采样当前 goroutine 数，用于观察资源回收后是否回落。
 	writeMetric(w, "flow_goroutines", "gauge", "当前 goroutine 数",

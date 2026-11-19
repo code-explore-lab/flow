@@ -68,6 +68,28 @@ go run ./cmd/server -snapshot-ffmpeg ffmpeg
 `-snapshot-referer` / `-snapshot-token` 与其它 HTTP 服务语义一致，
 `-snapshot-addr ""` 关闭该服务。
 
+转码（F-4）：用外部 ffmpeg 进程把注册表里的一路流解码、缩放、重新编码，
+结果以新流名发布回同一份注册表，RTSP / RTMP / HTTP-FLV / HLS / DASH 都能
+直接拉；Go 侧只做帧源订阅、MPEG-TS 封装/解封装和进程管理，不需要 cgo。
+音频不解码，原样复制到输出流。
+
+```bash
+# 1080p 源 → 720p（输出流名默认 <源>_720p）
+./flow -transcode "live/src=w=1280,h=720"
+
+# 多档位；字段：w/h 或 size、codec=h264|h265、bitrate=3m、fps=30、out=
+./flow -transcode "live/src=size=1280x720,bitrate=3m;live/src=size=640x360,out=live/src_360p"
+
+# 硬件编码（需要显卡驱动与对应 ffmpeg 构建）
+./flow -transcode "live/src=size=1280x720" -transcode-hw nvenc
+```
+
+`-transcode-ffmpeg` 指定 ffmpeg 路径（默认 `ffmpeg`），`-transcode-preset`
+是软件编码器 preset（默认 `veryfast`），`-transcode-gop` 控制强制关键帧
+间隔（默认 2s，HLS/录制/中途加入依赖它）。ffmpeg 崩溃或消费过慢会按
+500ms→10s 指数退避重启；重启后的输出时间轴接在上一次之后，下游不会看到
+时间戳回退。指标见 `flow_transcode_*`。
+
 RTMP 回源（从上游拉流并在本地重新发布，供 RTSP/RTMP/HTTP-FLV 下游拉取；
 上游断开后自动重连，下游保持连接）：
 

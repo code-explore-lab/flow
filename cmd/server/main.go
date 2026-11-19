@@ -32,6 +32,7 @@ import (
 	"flow/internal/source"
 	"flow/internal/srt"
 	"flow/internal/stream"
+	"flow/internal/transcode"
 	"flow/internal/webrtc"
 )
 
@@ -187,6 +188,14 @@ func main() {
 	snapshotReferer := flag.String("snapshot-referer", "", "F-6: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
 	snapshotRequireReferer := flag.Bool("snapshot-require-referer", false, "F-6: reject requests without a Referer when -snapshot-referer is set")
 	snapshotToken := flag.String("snapshot-token", "", "F-6: snapshot token, passed as ?token=... or X-Flow-Token (empty disables)")
+
+	// F-4：转码。每个档位把源流缩放/重编码后以新流名发布回注册表，
+	// 下游 RTSP/RTMP/HTTP-FLV/HLS/DASH 都能直接拉。
+	transcodeSpec := flag.String("transcode", "", "F-4: transcode profiles, e.g. \"live/test=w=1280,h=720;live/test=size=640x360,out=live/test_360p\" (empty disables)")
+	transcodeFFmpeg := flag.String("transcode-ffmpeg", "ffmpeg", "F-4: ffmpeg binary used for transcoding")
+	transcodePreset := flag.String("transcode-preset", transcode.DefaultPreset, "F-4: software encoder preset")
+	transcodeGOP := flag.Duration("transcode-gop", transcode.DefaultGOP, "F-4: forced keyframe interval")
+	transcodeHW := flag.String("transcode-hw", "none", "F-4: hardware encoder: none|nvenc|qsv")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -279,6 +288,15 @@ func main() {
 		os.Exit(2)
 	}
 	if err := validateRecordOptions(*recordSegment, *recordQuota, *recordRetention, recordFormat); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	transcodeProfiles, err := transcode.ParseProfiles(*transcodeSpec)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := validateTranscodeOptions(*transcodeGOP, *transcodeHW); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
@@ -455,6 +473,23 @@ func main() {
 	}
 	// E-4：两个协议共用一个指标注册表，/metrics 与两个服务器都读它。
 	flowMetrics := metrics.New()
+
+	// F-4：转码管理器。同样轮询注册表，源流（重新）上线后按档位起
+	// ffmpeg；输出以新流名发布，和其他协议共用同一份注册表。
+	var transcodeMgr *transcode.Manager
+	if len(transcodeProfiles) > 0 {
+		transcodeMgr = transcode.NewManager(reg, transcode.Options{
+			FFmpegPath: *transcodeFFmpeg,
+			Preset:     *transcodePreset,
+			GOP:        *transcodeGOP,
+			HW:         *transcodeHW,
+			Metrics:    flowMetrics,
+		}, transcodeProfiles)
+		for _, p := range transcodeProfiles {
+			fmt.Printf("transcode: %s → %s (%dx%d %s %d bps)\n",
+				p.Source, p.Output, p.Width, p.Height, p.Codec, p.Bitrate)
+		}
+	}
 	// E-5：每个协议各自一份连接限流器（per-protocol 独立计数）。
 	rtspLimiter := limiter.New(*maxConns, *maxIPConns)
 	rtmpLimiter := limiter.New(*maxConns, *maxIPConns)
@@ -748,6 +783,9 @@ func main() {
 	if recordMgr != nil {
 		wg.Add(1)
 	}
+	if transcodeMgr != nil {
+		wg.Add(1)
+	}
 	wg.Add(len(pulls))
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
@@ -784,6 +822,12 @@ func main() {
 		go func() {
 			defer wg.Done()
 			recordMgr.Run(ctx)
+		}()
+	}
+	if transcodeMgr != nil {
+		go func() {
+			defer wg.Done()
+			transcodeMgr.Run(ctx)
 		}()
 	}
 	// T-9：每个上游一路 goroutine，ctx 取消后自动退出并注销本地流。
@@ -829,6 +873,20 @@ func validateDashOptions(update, delay time.Duration) error {
 }
 
 // validateRecordOptions 校验 F-3 的录制参数。
+// validateTranscodeOptions 校验 F-4 的参数。输出档位本身由
+// transcode.ParseProfiles 校验，这里只看全局编码选项。
+func validateTranscodeOptions(gop time.Duration, hw string) error {
+	if gop <= 0 {
+		return errors.New("invalid -transcode-gop (must be > 0)")
+	}
+	switch strings.ToLower(hw) {
+	case "", "none", "nvenc", "qsv":
+		return nil
+	default:
+		return fmt.Errorf("invalid -transcode-hw %q (want none, nvenc or qsv)", hw)
+	}
+}
+
 func validateRecordOptions(segment time.Duration, quota int64, retention time.Duration, format record.Format) error {
 	if segment <= 0 {
 		return errors.New("invalid -record-segment (must be > 0)")

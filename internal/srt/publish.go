@@ -26,7 +26,9 @@ func (s *Server) servePublish(ctx context.Context, conn gosrt.Conn, name string)
 	defer s.registry.Unpublish(name, published)
 
 	var (
-		sps, pps    []byte
+		vps, sps    []byte
+		pps         []byte
+		videoCodec  = "H264"
 		audioASC    []byte
 		audioRate   uint32
 		audioCh     uint8
@@ -38,12 +40,18 @@ func (s *Server) servePublish(ctx context.Context, conn gosrt.Conn, name string)
 	d.OnError = func(err error) { log.Printf("srt: publish %q: %v", name, err) }
 
 	d.OnVideo = func(au mpegts.VideoAU) {
+		if au.Codec != "" {
+			videoCodec = au.Codec
+		}
 		st.EnsureVideo()
 
 		paramsChanged := false
 		for _, nalu := range au.NALUs {
-			class := media.ClassifyVideoNAL("H264", nalu)
+			class := media.ClassifyVideoNAL(videoCodec, nalu)
 			switch {
+			case class.IsVPS && !bytes.Equal(vps, nalu):
+				vps = append([]byte(nil), nalu...)
+				paramsChanged = true
 			case class.IsSPS && !bytes.Equal(sps, nalu):
 				sps = append([]byte(nil), nalu...)
 				paramsChanged = true
@@ -53,7 +61,7 @@ func (s *Server) servePublish(ctx context.Context, conn gosrt.Conn, name string)
 			}
 		}
 		if len(sps) > 0 && len(pps) > 0 && (paramsChanged || !haveVideoPS) {
-			st.SetVideoParams("H264", nil, sps, pps)
+			st.SetVideoParams(videoCodec, vps, sps, pps)
 			haveVideoPS = true
 		}
 

@@ -21,8 +21,9 @@ const (
 
 	syncByte = 0x47
 
-	// StreamTypeH264 / StreamTypeAAC 是 PMT 里的 stream_type。
+	// StreamTypeH264 / StreamTypeHEVC / StreamTypeAAC 是 PMT 里的 stream_type。
 	StreamTypeH264 = 0x1B
+	StreamTypeHEVC = 0x24
 	StreamTypeAAC  = 0x0F
 )
 
@@ -36,11 +37,13 @@ const (
 
 const maxSectionSize = 4096
 
-// VideoAU 是一个 H.264 访问单元（一帧）。NALUs 不含 Annex-B 起始码。
+// VideoAU 是一个视频访问单元（一帧）。NALUs 不含 Annex-B 起始码。
+// Codec 为 "H264" / "H265"，由 PMT 的 stream_type 推导。
 type VideoAU struct {
 	NALUs    [][]byte
 	PTS, DTS uint32 // 90kHz
 	Keyframe bool
+	Codec    string
 }
 
 // CompositionTime 返回 PTS−DTS（90kHz，可为负）。
@@ -72,6 +75,7 @@ type Demuxer struct {
 	havePMT bool
 
 	videoPID, audioPID uint16
+	videoCodec         string // "H264" / "H265"
 
 	cc     map[uint16]byte
 	ccSeen map[uint16]bool
@@ -283,6 +287,7 @@ func (d *Demuxer) parsePAT(section []byte) {
 			d.pmtPID = pid
 			d.havePMT = false
 			d.videoPID, d.audioPID = 0, 0
+			d.videoCodec = ""
 		}
 		return
 	}
@@ -300,6 +305,7 @@ func (d *Demuxer) parsePMT(section []byte) {
 	}
 
 	var videoPID, audioPID uint16
+	var videoCodec string
 	for i+5 <= end {
 		streamType := section[i]
 		pid := binary.BigEndian.Uint16(section[i+1:]) & 0x1FFF
@@ -311,7 +317,11 @@ func (d *Demuxer) parsePMT(section []byte) {
 		switch streamType {
 		case StreamTypeH264:
 			if videoPID == 0 {
-				videoPID = pid
+				videoPID, videoCodec = pid, "H264"
+			}
+		case StreamTypeHEVC:
+			if videoPID == 0 {
+				videoPID, videoCodec = pid, "H265"
 			}
 		case StreamTypeAAC:
 			if audioPID == 0 {
@@ -323,12 +333,13 @@ func (d *Demuxer) parsePMT(section []byte) {
 	if videoPID == 0 && audioPID == 0 {
 		if !d.warnedUnsupported {
 			d.warnedUnsupported = true
-			d.errorf("mpegts: PMT has no supported stream (H.264/AAC)")
+			d.errorf("mpegts: PMT has no supported stream (H.264/H.265/AAC)")
 		}
 		return
 	}
 
 	d.videoPID, d.audioPID = videoPID, audioPID
+	d.videoCodec = videoCodec
 	d.havePMT = true
 }
 
@@ -434,16 +445,20 @@ func (d *Demuxer) handleVideoPES(payload []byte, pts, dts uint32) {
 	if len(nalus) == 0 {
 		return
 	}
-	for _, group := range groupAUs(nalus) {
+	codec := d.videoCodec
+	if codec == "" {
+		codec = "H264"
+	}
+	for _, group := range groupAUs(nalus, codec) {
 		keyframe := false
 		for _, nalu := range group {
-			if media.ClassifyVideoNAL("H264", nalu).IsIDR {
+			if media.ClassifyVideoNAL(codec, nalu).IsIDR {
 				keyframe = true
 				break
 			}
 		}
 		if d.OnVideo != nil {
-			d.OnVideo(VideoAU{NALUs: group, PTS: pts, DTS: dts, Keyframe: keyframe})
+			d.OnVideo(VideoAU{NALUs: group, PTS: pts, DTS: dts, Keyframe: keyframe, Codec: codec})
 		}
 	}
 }
@@ -545,10 +560,23 @@ func startCodeLen(p []byte, i int) int {
 	return 3
 }
 
+// isAudioDelimiter 判断 NALU 是否是访问单元分隔符（AUD）。
+// H.264 是类型 9，H.265 是类型 35（AUD_NUT）。
+func isAudioDelimiter(codec string, nalu []byte) bool {
+	typ, err := media.VideoNALType(codec, nalu)
+	if err != nil {
+		return false
+	}
+	if media.IsHEVCCodec(codec) {
+		return typ == 35
+	}
+	return typ == 9
+}
+
 // groupAUs 把一个 PES 里的 NALU 按访问单元分组。
 // AUD 或 first_mb_in_slice==0 的 VCL NALU 开启新的 AU；参数集/SEI
 // 与随后的第一个 VCL 属于同一 AU。
-func groupAUs(nalus [][]byte) [][][]byte {
+func groupAUs(nalus [][]byte, codec string) [][][]byte {
 	var groups [][][]byte
 	var cur [][]byte
 	hasVCL := false
@@ -565,9 +593,9 @@ func groupAUs(nalus [][]byte) [][][]byte {
 		if len(nalu) == 0 {
 			continue
 		}
-		class := media.ClassifyVideoNAL("H264", nalu)
-		isAUD := nalu[0]&0x1F == 9
-		startsAU := media.StartsVideoAU("H264", nalu)
+		class := media.ClassifyVideoNAL(codec, nalu)
+		isAUD := isAudioDelimiter(codec, nalu)
+		startsAU := media.StartsVideoAU(codec, nalu)
 
 		if isAUD && len(cur) > 0 {
 			flush()

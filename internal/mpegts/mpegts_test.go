@@ -34,7 +34,7 @@ func demuxAll(t *testing.T, data []byte) ([]VideoAU, []AudioAU) {
 	var videos []VideoAU
 	var audios []AudioAU
 	d.OnVideo = func(au VideoAU) {
-		cp := VideoAU{PTS: au.PTS, DTS: au.DTS, Keyframe: au.Keyframe}
+		cp := VideoAU{PTS: au.PTS, DTS: au.DTS, Keyframe: au.Keyframe, Codec: au.Codec}
 		for _, n := range au.NALUs {
 			cp.NALUs = append(cp.NALUs, append([]byte(nil), n...))
 		}
@@ -174,7 +174,7 @@ func TestDemuxChunkedInput(t *testing.T) {
 func TestGroupAUsSlices(t *testing.T) {
 	aud := []byte{0x09, 0xF0}
 	// 关键帧的第二个 slice 属于同一帧；P 帧开启新 AU。
-	groups := groupAUs([][]byte{aud, testSPS, testPPS, testIDR, testSlice, testP})
+	groups := groupAUs([][]byte{aud, testSPS, testPPS, testIDR, testSlice, testP}, "H264")
 	if len(groups) != 2 {
 		t.Fatalf("got %d groups, want 2", len(groups))
 	}
@@ -228,5 +228,74 @@ func TestMuxerPSIRefresh(t *testing.T) {
 	}
 	if buf.Len()-before <= second {
 		t.Error("PSI was not refreshed after the interval")
+	}
+}
+
+var (
+	hevcVPS = []byte{0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF}
+	hevcSPS = []byte{0x42, 0x01, 0x01, 0x01, 0x60, 0x00}
+	hevcPPS = []byte{0x44, 0x01, 0xC0, 0x73}
+	// IDR_W_RADL（类型 19），first_slice_segment_in_pic_flag = 1。
+	hevcIDR = []byte{0x26, 0x01, 0x80, 0xAA, 0xBB}
+	// TRAIL_R（类型 1），新的 slice。
+	hevcP = []byte{0x02, 0x01, 0x80, 0xCC}
+)
+
+// TestMuxDemuxRoundTripHEVC 验证 H.265 的 PMT stream_type、AUD 和 VPS/SPS/PPS
+// 注入，demux 侧能按 HEVC 语法重新识别出关键帧。
+func TestMuxDemuxRoundTripHEVC(t *testing.T) {
+	var buf bytes.Buffer
+	m := NewMuxer(&buf)
+	m.SetVideoParamsFor("H265", hevcVPS, hevcSPS, hevcPPS)
+
+	if err := m.WriteVideo([][]byte{hevcIDR}, 90000, 90000); err != nil {
+		t.Fatalf("WriteVideo: %v", err)
+	}
+	if err := m.WriteVideo([][]byte{hevcP}, 93000, 93000); err != nil {
+		t.Fatalf("WriteVideo: %v", err)
+	}
+
+	videos, _ := demuxAll(t, buf.Bytes())
+	if len(videos) != 2 {
+		t.Fatalf("got %d video AUs, want 2", len(videos))
+	}
+	v := videos[0]
+	if v.Codec != "H265" {
+		t.Errorf("AU codec = %q, want H265", v.Codec)
+	}
+	if !v.Keyframe {
+		t.Error("IDR AU was not marked as keyframe")
+	}
+	var haveVPS, haveSPS, havePPS bool
+	for _, n := range v.NALUs {
+		typ, err := media.VideoNALType("H265", n)
+		if err != nil {
+			continue
+		}
+		switch typ {
+		case media.HEVCNALTypeVPS:
+			haveVPS = true
+		case media.HEVCNALTypeSPS:
+			haveSPS = true
+		case media.HEVCNALTypePPS:
+			havePPS = true
+		}
+	}
+	if !haveVPS || !haveSPS || !havePPS {
+		t.Errorf("keyframe AU missing injected parameter sets: vps=%v sps=%v pps=%v", haveVPS, haveSPS, havePPS)
+	}
+	if videos[1].Keyframe {
+		t.Error("P AU was marked as keyframe")
+	}
+}
+
+func TestGroupAUsHEVC(t *testing.T) {
+	aud := []byte{0x46, 0x01}
+	groups := groupAUs([][]byte{aud, hevcVPS, hevcSPS, hevcPPS, hevcIDR, hevcP}, "H265")
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2", len(groups))
+	}
+	if len(groups[0]) != 5 || len(groups[1]) != 1 {
+		t.Errorf("group sizes = %d/%d, want 5/1", len(groups[0]), len(groups[1]))
 	}
 }

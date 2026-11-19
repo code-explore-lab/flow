@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"flow/internal/discovery"
+	"flow/internal/transcode"
 )
 
 func TestValidateHLSOptions(t *testing.T) {
@@ -36,6 +37,30 @@ func TestValidateHLSOptions(t *testing.T) {
 		if !tt.ok && err == nil {
 			t.Errorf("%s: expected error", tt.name)
 		}
+	}
+}
+
+func TestABRGroupsFromProfiles(t *testing.T) {
+	profiles, err := transcode.ParseProfiles(
+		"live/a=w=1280,h=720,bitrate=3m;live/a=w=640,h=360,bitrate=800k;" +
+			"live/b=w=640,h=360,bitrate=600k;live/c=size=320x180")
+	if err != nil {
+		t.Fatalf("ParseProfiles: %v", err)
+	}
+	groups := abrGroups(profiles)
+	if len(groups) != 1 {
+		t.Fatalf("groups = %d, want 1 (only live/a has >=2 variants)", len(groups))
+	}
+	g := groups[0]
+	if g.Source != "live/a" || len(g.Variants) != 2 {
+		t.Fatalf("group = %+v", g)
+	}
+	if g.Variants[0].Stream != "live/a_720p" || g.Variants[0].Width != 1280 ||
+		g.Variants[0].Bitrate != 3_000_000 || g.Variants[0].Codec != "H264" {
+		t.Errorf("variant[0] = %+v", g.Variants[0])
+	}
+	if g.Variants[1].Stream != "live/a_360p" || g.Variants[1].Height != 360 {
+		t.Errorf("variant[1] = %+v", g.Variants[1])
 	}
 }
 

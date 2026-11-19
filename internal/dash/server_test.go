@@ -15,6 +15,29 @@ type fakeProvider struct{ p *hls.Packager }
 
 func (f fakeProvider) PackagerFor(context.Context, string) *hls.Packager { return f.p }
 
+// fakeLadderProvider 按流名路由到不同 packager，并声明一组 ABR 档位。
+type fakeLadderProvider struct {
+	packs  map[string]*hls.Packager
+	ladder []hls.ABRVariant
+}
+
+func (f fakeLadderProvider) PackagerFor(_ context.Context, name string) *hls.Packager {
+	return f.packs[name]
+}
+
+func (f fakeLadderProvider) ABRRenditions(context.Context, string) ([]hls.ABRRendition, bool) {
+	if len(f.ladder) == 0 {
+		return nil, false
+	}
+	out := make([]hls.ABRRendition, 0, len(f.ladder))
+	for _, v := range f.ladder {
+		if p := f.packs[v.Stream]; p != nil {
+			out = append(out, hls.ABRRendition{Variant: v, Packager: p})
+		}
+	}
+	return out, true
+}
+
 func newTestServer(f *fixture) *Server {
 	s := New(fakeProvider{p: f.packager})
 	s.SetManifestOptions(Options{MinimumUpdatePeriod: time.Second, SegmentTarget: time.Second})
@@ -81,6 +104,88 @@ func TestServerManifestAndBinary(t *testing.T) {
 	}
 	if _, err := time.Parse("2006-01-02T15:04:05.000Z", rec.Body.String()); err != nil {
 		t.Errorf("utc body %q: %v", rec.Body.String(), err)
+	}
+}
+
+func TestServerABRManifest(t *testing.T) {
+	low := newNamedFixture(t, "live/demo_360p")
+	high := newNamedFixture(t, "live/demo_720p")
+	feedBaseline(t, low)
+	feedBaseline(t, high)
+
+	provider := fakeLadderProvider{
+		packs: map[string]*hls.Packager{
+			"live/demo_360p": low.packager,
+			"live/demo_720p": high.packager,
+		},
+		ladder: []hls.ABRVariant{
+			{Stream: "live/demo_360p", Width: 640, Height: 360, Bitrate: 400_000},
+			{Stream: "live/demo_720p", Width: 1280, Height: 720, Bitrate: 2_000_000},
+		},
+	}
+	s := New(provider)
+	s.SetManifestOptions(Options{MinimumUpdatePeriod: time.Second, SegmentTarget: time.Second})
+
+	rec := do(s, http.MethodGet, "/dash/live/demo/manifest.mpd", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := parseManifest(t, rec.Body.Bytes())
+	video := findAdaptation(m, "video")
+	if video == nil {
+		t.Fatal("no video AdaptationSet")
+	}
+	if len(video.Representations) != 2 {
+		t.Fatalf("video reps = %d, want 2", len(video.Representations))
+	}
+	if got := video.Representations[0].SegmentTemplate.Media; got != "/dash/live/demo_360p/video/seg-$Number$.m4s" {
+		t.Errorf("low media = %q", got)
+	}
+	if got := video.Representations[1].SegmentTemplate.Media; got != "/dash/live/demo_720p/video/seg-$Number$.m4s" {
+		t.Errorf("high media = %q", got)
+	}
+
+	// 段本身仍由各档自己的 /dash/<stream>/ 路由提供。
+	seg := low.packager.Video().Snapshot().Segments[0]
+	rec = do(s, http.MethodGet, "/dash/live/demo_360p/"+seg.URI, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("low segment status = %d", rec.Code)
+	}
+	want, _ := low.packager.Video().Data(seg.URI)
+	if rec.Body.String() != string(want) {
+		t.Errorf("low segment bytes mismatch")
+	}
+}
+
+func TestServerABRFallsBackToSingleStream(t *testing.T) {
+	f := newNamedFixture(t, "live/demo")
+	feedBaseline(t, f)
+
+	// 阶梯配置还在，但转码档位尚未发布：回退到源流的单 Representation MPD。
+	provider := fakeLadderProvider{
+		packs: map[string]*hls.Packager{"live/demo": f.packager},
+		ladder: []hls.ABRVariant{
+			{Stream: "live/demo_360p", Bitrate: 400_000},
+			{Stream: "live/demo_720p", Bitrate: 2_000_000},
+		},
+	}
+	s := New(provider)
+	s.SetManifestOptions(Options{MinimumUpdatePeriod: time.Second, SegmentTarget: time.Second})
+
+	rec := do(s, http.MethodGet, "/dash/live/demo/manifest.mpd", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	m := parseManifest(t, rec.Body.Bytes())
+	video := findAdaptation(m, "video")
+	if video == nil {
+		t.Fatal("no video AdaptationSet")
+	}
+	if len(video.Representations) != 1 {
+		t.Fatalf("video reps = %d, want fallback single rep", len(video.Representations))
+	}
+	if got := video.Representations[0].SegmentTemplate.Media; got != "video/seg-$Number$.m4s" {
+		t.Errorf("fallback media = %q", got)
 	}
 }
 

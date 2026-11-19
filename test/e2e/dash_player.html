@@ -92,6 +92,30 @@
   const fmt = (n, digits = 2) => Number.isFinite(n) ? n.toFixed(digits) : '—';
   const bits = (n) => n > 0 ? (n / 1000).toFixed(0) + ' kbps' : '—';
 
+  // 档位 API 在 dash.js v5 改名：v4 的 getBitrateInfoListFor/setQualityFor
+  // 换成了 getRepresentationsByType/setRepresentationForTypeByIndex。
+  function videoReps() {
+    if (!player) return [];
+    try {
+      if (typeof player.getRepresentationsByType === 'function') {
+        return player.getRepresentationsByType('video') || [];
+      }
+      if (typeof player.getBitrateInfoListFor === 'function') {
+        return player.getBitrateInfoListFor('video') || [];
+      }
+    } catch (e) {
+      return [];
+    }
+    return [];
+  }
+  const repIndex = (r, i) => Number.isFinite(r.index) ? r.index : i;
+  function repBitrate(r) {
+    if (Number.isFinite(r.bitrate)) return r.bitrate;
+    if (Number.isFinite(r.bitrateInKbit)) return r.bitrateInKbit * 1000;
+    if (Number.isFinite(r.bandwidth)) return r.bandwidth;
+    return 0;
+  }
+
   // 自动化探针读这里；status 只在真正开始出画后才是 playing。
   const flow = {
     status: 'loading',
@@ -105,6 +129,24 @@
       const latency = player && player.getCurrentLiveLatency ? player.getCurrentLiveLatency() : NaN;
       const buffer = player && player.getBufferLength ? player.getBufferLength('video') : NaN;
       const throughput = player && player.getAverageThroughput ? player.getAverageThroughput('video') : NaN;
+      const reps = videoReps();
+      const levels = reps.map((r, i) => ({
+        bitrate: repBitrate(r), width: r.width, height: r.height, index: repIndex(r, i),
+      }));
+      let currentLevel = -1;
+      if (player) {
+        if (typeof player.getCurrentRepresentationForType === 'function') {
+          const cur = player.getCurrentRepresentationForType('video');
+          if (cur) {
+            currentLevel = levels.findIndex((l) => l.index === repIndex(cur, -99));
+            if (currentLevel < 0) {
+              currentLevel = levels.findIndex((l) => repBitrate(l) === repBitrate(cur));
+            }
+          }
+        } else if (typeof player.getQualityFor === 'function') {
+          currentLevel = player.getQualityFor('video');
+        }
+      }
       return {
         status: flow.status,
         error: flow.error,
@@ -120,9 +162,23 @@
         width: video.videoWidth,
         height: video.videoHeight,
         volume: video.volume,
+        levels: levels,
+        currentLevel: currentLevel,
         logs: flow.logs.slice(-20),
         console: debug ? consoleLogs.slice(-40) : undefined,
       };
+    },
+    // 自动化验收接口：关闭 ABR 后固定选某一档。
+    setLevel(index) {
+      if (!player) return;
+      player.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: false } } } });
+      const reps = videoReps();
+      if (typeof player.setRepresentationForTypeByIndex === 'function') {
+        const target = reps[index] ? repIndex(reps[index], index) : index;
+        player.setRepresentationForTypeByIndex('video', target, true);
+      } else if (typeof player.setQualityFor === 'function') {
+        player.setQualityFor('video', index, true);
+      }
     },
   };
   window.__flow = flow;

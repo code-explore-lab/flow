@@ -3,6 +3,7 @@ package dash
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,113 @@ func TestBuildToken(t *testing.T) {
 		if !strings.Contains(st.Initialization, "?token=se%20cret") {
 			t.Errorf("%s init = %q", kind, st.Initialization)
 		}
+	}
+}
+
+func TestBuildABRManifest(t *testing.T) {
+	low := newNamedFixture(t, "live/demo_360p")
+	high := newNamedFixtureAt(t, "live/demo_720p", testEpoch.Add(5*time.Second))
+	feedBaseline(t, low)
+	feedBaseline(t, high)
+
+	now := testEpoch.Add(30 * time.Second)
+	b, err := BuildABR([]Rendition{
+		{Packager: low.packager, Base: "live/demo_360p"},
+		{Packager: high.packager, Base: "live/demo_720p"},
+	}, now, Options{SegmentTarget: time.Second})
+	if err != nil {
+		t.Fatalf("BuildABR: %v", err)
+	}
+	m := parseManifest(t, b)
+
+	// availabilityStartTime 取所有档位里最早的那个 epoch。
+	if m.AvailabilityStartTime != isoTime(testEpoch) {
+		t.Errorf("availabilityStartTime = %q, want %q", m.AvailabilityStartTime, isoTime(testEpoch))
+	}
+	if got := len(m.Periods[0].AdaptationSets); got != 2 {
+		t.Fatalf("adaptation sets = %d, want video+audio", got)
+	}
+	video := findAdaptation(m, "video")
+	if video == nil {
+		t.Fatal("no video AdaptationSet")
+	}
+	if len(video.Representations) != 2 {
+		t.Fatalf("video reps = %d, want 2", len(video.Representations))
+	}
+	wantBase := []string{"live/demo_360p", "live/demo_720p"}
+	for i, rep := range video.Representations {
+		wantID := fmt.Sprintf("video%d", i)
+		if rep.ID != wantID {
+			t.Errorf("rep[%d] id = %q, want %q", i, rep.ID, wantID)
+		}
+		if rep.Width != 640 || rep.Height != 480 {
+			t.Errorf("rep[%d] size = %dx%d", i, rep.Width, rep.Height)
+		}
+		if !strings.HasPrefix(rep.Codecs, "avc1.") {
+			t.Errorf("rep[%d] codecs = %q", i, rep.Codecs)
+		}
+		if rep.Bandwidth == 0 {
+			t.Errorf("rep[%d] bandwidth is zero", i)
+		}
+		if rep.SegmentTemplate.Media != "/dash/"+wantBase[i]+"/video/seg-$Number$.m4s" {
+			t.Errorf("rep[%d] media = %q", i, rep.SegmentTemplate.Media)
+		}
+		if rep.SegmentTemplate.Initialization != "/dash/"+wantBase[i]+"/video/init.mp4" {
+			t.Errorf("rep[%d] init = %q", i, rep.SegmentTemplate.Initialization)
+		}
+	}
+
+	// 音频只取第一档，切视频时音轨不动。
+	audio := findAdaptation(m, "audio")
+	if audio == nil {
+		t.Fatal("no audio AdaptationSet")
+	}
+	if len(audio.Representations) != 1 {
+		t.Fatalf("audio reps = %d, want 1", len(audio.Representations))
+	}
+	arep := audio.Representations[0]
+	if arep.SegmentTemplate.Media != "/dash/live/demo_360p/audio/seg-$Number$.m4s" {
+		t.Errorf("audio media = %q", arep.SegmentTemplate.Media)
+	}
+	if arep.SegmentTemplate.Initialization != "/dash/live/demo_360p/audio/init.mp4" {
+		t.Errorf("audio init = %q", arep.SegmentTemplate.Initialization)
+	}
+}
+
+func TestBuildABRToken(t *testing.T) {
+	f := newNamedFixture(t, "live/demo_360p")
+	feedBaseline(t, f)
+
+	b, err := BuildABR([]Rendition{{Packager: f.packager, Base: "live/demo_360p"}},
+		testEpoch.Add(10*time.Second), Options{Token: "se cret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := parseManifest(t, b)
+	video := findAdaptation(m, "video")
+	if video == nil {
+		t.Fatal("no video AdaptationSet")
+	}
+	st := video.Representations[0].SegmentTemplate
+	if !strings.Contains(st.Media, "?token=se%20cret") {
+		t.Errorf("media = %q", st.Media)
+	}
+	if !strings.Contains(st.Initialization, "?token=se%20cret") {
+		t.Errorf("init = %q", st.Initialization)
+	}
+	if !strings.Contains(st.Media, "/dash/live/demo_360p/video/seg-") {
+		t.Errorf("media = %q, want absolute /dash/base path", st.Media)
+	}
+}
+
+func TestBuildABRNoSegments(t *testing.T) {
+	f := newFixture(t)
+	_, err := BuildABR([]Rendition{{Packager: f.packager, Base: "live/demo"}}, testEpoch, Options{})
+	if !errors.Is(err, ErrNoSegments) {
+		t.Fatalf("err = %v, want ErrNoSegments", err)
+	}
+	if _, err := BuildABR(nil, testEpoch, Options{}); !errors.Is(err, ErrNoSegments) {
+		t.Fatalf("empty renditions err = %v, want ErrNoSegments", err)
 	}
 }
 

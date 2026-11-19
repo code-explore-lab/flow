@@ -144,6 +144,26 @@
     }, 500);
   }
 
+  // 自动化验收接口：读取档位状态并主动切档。
+  window.__flow = {
+    state: () => {
+      if (!hls) {
+        return { status: $('status').textContent, levels: [], currentLevel: -1, currentTime: 0 };
+      }
+      return {
+        status: $('status').textContent,
+        error: $('error').textContent,
+        currentTime: video.currentTime,
+        levels: (hls.levels || []).map((l) => ({
+          bitrate: l.bitrate, width: l.width, height: l.height, url: l.url,
+        })),
+        currentLevel: hls.currentLevel,
+        nextLevel: hls.nextLevel,
+      };
+    },
+    setLevel: (i) => { if (hls) hls.currentLevel = i; },
+  };
+
   if (window.Hls && Hls.isSupported()) {
     hls = new Hls({
       lowLatencyMode: true,

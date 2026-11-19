@@ -20,6 +20,16 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
+	return newNamedFixture(t, "live/demo")
+}
+
+func newNamedFixture(t *testing.T, name string) *fixture {
+	t.Helper()
+	return newNamedFixtureAt(t, name, testEpoch)
+}
+
+func newNamedFixtureAt(t *testing.T, name string, epoch time.Time) *fixture {
+	t.Helper()
 	sps, err := hex.DecodeString("6764001eacd940a03db011000003000100000300320f162d9600")
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +39,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 
-	st := &stream.Stream{Name: "live/demo"}
+	st := &stream.Stream{Name: name}
 	st.SetVideoParams("H264", nil, sps, pps)
 	st.SetAudioCodec(stream.AudioAAC, []byte{0x12, 0x10}, 44100, 2, 44100)
 	vp, ok := st.VideoParams()
@@ -44,14 +54,14 @@ func newFixture(t *testing.T) *fixture {
 	as := st.SourceFor("audio")
 
 	p, err := hls.NewPackager(hls.PackagerSpec{
-		Name:   "live/demo",
+		Name:   name,
 		Stream: st,
 		Video:  &hls.TrackSource{Subscriber: vs, Video: vp},
 		Audio:  &hls.TrackSource{Subscriber: as, Audio: ap},
 	}, hls.Options{
 		SegmentTarget: time.Second,
 		Window:        8,
-		Now:           func() time.Time { return testEpoch },
+		Now:           func() time.Time { return epoch },
 		Logf:          t.Logf,
 	})
 	if err != nil {

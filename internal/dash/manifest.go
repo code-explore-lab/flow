@@ -179,8 +179,22 @@ func Build(p *hls.Packager, now time.Time, opts Options) ([]byte, error) {
 
 func buildAdaptationSet(tr *hls.Track, segs []hls.SegmentInfo, opts Options) AdaptationSet {
 	kind := tr.Kind()
+	return AdaptationSet{
+		ID:               kind,
+		ContentType:      kind,
+		MimeType:         kind + "/mp4",
+		SegmentAlignment: "true",
+		StartWithSAP:     "1",
+		Representations:  []Representation{buildRepresentation(tr, segs, kind, "", opts)},
+	}
+}
+
+// buildRepresentation 生成一个 Representation。prefix 为空时用相对 URI
+// （单流 MPD）；ABR 多档时传 "/dash/<stream>/" 指向各档自己的段。
+func buildRepresentation(tr *hls.Track, segs []hls.SegmentInfo, id, prefix string, opts Options) Representation {
+	kind := tr.Kind()
 	rep := Representation{
-		ID:        kind,
+		ID:        id,
 		Codecs:    tr.Codec(),
 		Bandwidth: tr.Bandwidth(),
 	}
@@ -195,20 +209,155 @@ func buildAdaptationSet(tr *hls.Track, segs []hls.SegmentInfo, opts Options) Ada
 	}
 	rep.SegmentTemplate = &SegmentTemplate{
 		Timescale:      tr.Timescale(),
-		Initialization: withToken(segs[0].MapURI, opts.Token),
-		Media:          withToken(kind+"/seg-$Number$.m4s", opts.Token),
+		Initialization: withToken(prefix+segs[0].MapURI, opts.Token),
+		Media:          withToken(prefix+kind+"/seg-$Number$.m4s", opts.Token),
 		StartNumber:    segs[0].MSN,
 		Timeline:       &SegmentTimeline{S: timeline(segs, tr.Timescale())},
 	}
-	as := AdaptationSet{
-		ID:               kind,
-		ContentType:      kind,
-		MimeType:         kind + "/mp4",
-		SegmentAlignment: "true",
-		StartWithSAP:     "1",
-		Representations:  []Representation{rep},
+	return rep
+}
+
+// Rendition 是 ABR MPD 里的一档切片来源。Base 是该档在 DASH 服务器下的
+// 流名（/dash/<Base>/...）。
+type Rendition struct {
+	Packager *hls.Packager
+	Base     string
+}
+
+// BuildABR 用多档 packager 生成一个带多个视频 Representation 的 MPD。
+// 所有视频档放在同一个 AdaptationSet 里，客户端按带宽切档；音频内容各档
+// 相同，只取第一档，避免切换视频时音轨跟着重缓冲。
+func BuildABR(renditions []Rendition, now time.Time, opts Options) ([]byte, error) {
+	opts = opts.withDefaults()
+
+	type repSource struct {
+		track *hls.Track
+		segs  []hls.SegmentInfo
+		base  string
 	}
-	return as
+	var (
+		videos []repSource
+		audio  *repSource
+		epoch  time.Time
+	)
+	for _, r := range renditions {
+		if r.Packager == nil {
+			continue
+		}
+		used := false
+		if tr := r.Packager.Video(); tr != nil {
+			if segs := latestSegments(tr.Snapshot()); len(segs) > 0 {
+				videos = append(videos, repSource{track: tr, segs: segs, base: r.Base})
+				used = true
+			}
+		}
+		if audio == nil {
+			if tr := r.Packager.Audio(); tr != nil {
+				if segs := latestSegments(tr.Snapshot()); len(segs) > 0 {
+					audio = &repSource{track: tr, segs: segs, base: r.Base}
+					used = true
+				}
+			}
+		}
+		if used && (epoch.IsZero() || r.Packager.Epoch().Before(epoch)) {
+			epoch = r.Packager.Epoch()
+		}
+	}
+	if len(videos) == 0 && audio == nil {
+		return nil, ErrNoSegments
+	}
+
+	minStart, maxEnd := math.Inf(1), math.Inf(-1)
+	cover := func(tr *hls.Track, segs []hls.SegmentInfo) {
+		ts := float64(tr.Timescale())
+		for _, s := range segs {
+			start := float64(s.StartDTS) / ts
+			end := start + float64(segmentDurationTicks(s, tr.Timescale()))/ts
+			if start < minStart {
+				minStart = start
+			}
+			if end > maxEnd {
+				maxEnd = end
+			}
+		}
+	}
+	for _, v := range videos {
+		cover(v.track, v.segs)
+	}
+	if audio != nil {
+		cover(audio.track, audio.segs)
+	}
+	depth := maxEnd - minStart
+	if depth <= 0 {
+		depth = opts.SegmentTarget.Seconds()
+	}
+	delay := opts.SuggestedPresentationDelay
+	if delay <= 0 {
+		delay = 2 * opts.SegmentTarget
+	}
+	if depth > 0 && delay.Seconds() > depth*0.75 {
+		delay = time.Duration(depth * 0.5 * float64(time.Second))
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	if epoch.IsZero() {
+		epoch = now
+	}
+
+	period := Period{ID: "0", Start: "PT0S"}
+	if len(videos) > 0 {
+		as := AdaptationSet{
+			ID:               "video",
+			ContentType:      "video",
+			MimeType:         "video/mp4",
+			SegmentAlignment: "true",
+			StartWithSAP:     "1",
+		}
+		for i, v := range videos {
+			id := "video"
+			if len(videos) > 1 {
+				id = fmt.Sprintf("video%d", i)
+			}
+			as.Representations = append(as.Representations,
+				buildRepresentation(v.track, v.segs, id, "/dash/"+v.base+"/", opts))
+		}
+		period.AdaptationSets = append(period.AdaptationSets, as)
+	}
+	if audio != nil {
+		period.AdaptationSets = append(period.AdaptationSets, AdaptationSet{
+			ID:               "audio",
+			ContentType:      "audio",
+			MimeType:         "audio/mp4",
+			SegmentAlignment: "true",
+			StartWithSAP:     "1",
+			Representations: []Representation{
+				buildRepresentation(audio.track, audio.segs, "audio", "/dash/"+audio.base+"/", opts),
+			},
+		})
+	}
+
+	manifest := MPD{
+		Profiles:                   "urn:mpeg:dash:profile:isoff-live:2011",
+		Type:                       "dynamic",
+		AvailabilityStartTime:      isoTime(epoch),
+		PublishTime:                isoTime(now),
+		MinimumUpdatePeriod:        isoDuration(opts.MinimumUpdatePeriod),
+		MinBufferTime:              isoDuration(opts.SegmentTarget),
+		SuggestedPresentationDelay: isoDuration(delay),
+		TimeShiftBufferDepth:       isoDuration(time.Duration(depth * float64(time.Second))),
+		UTCTiming:                  UTCTiming{SchemeIDURI: "urn:mpeg:dash:utc:http-iso:2014", Value: "utc"},
+		Periods:                    []Period{period},
+	}
+	body, err := xml.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("dash: marshal MPD: %w", err)
+	}
+	out := make([]byte, 0, len(body)+64)
+	out = append(out, `<?xml version="1.0" encoding="utf-8"?>`+"\n"...)
+	out = append(out, body...)
+	out = append(out, '\n')
+	return out, nil
 }
 
 // timeline 把窗口内完整段转成 SegmentTimeline。

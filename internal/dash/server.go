@@ -32,6 +32,13 @@ type PackagerProvider interface {
 	PackagerFor(ctx context.Context, name string) *hls.Packager
 }
 
+// LadderProvider 可选地提供 F-5 的 ABR 阶梯：/dash/<source>/manifest.mpd
+// 会把各档转码输出聚合成一个多 Representation 的 MPD。hls.Server 实现了
+// 这个接口；未注入时 DASH 保持单流行为。
+type LadderProvider interface {
+	ABRRenditions(ctx context.Context, name string) ([]hls.ABRRendition, bool)
+}
+
 // Server MPEG-DASH 分发器。配置项必须在 Serve/第一个请求之前设置。
 type Server struct {
 	provider  PackagerProvider
@@ -246,6 +253,9 @@ func validStreamName(name string) bool {
 
 func (s *Server) serveManifest(w http.ResponseWriter, r *http.Request, name string) {
 	s.metrics.IncDashRequest("manifest")
+	if s.serveABRManifest(w, r, name) {
+		return
+	}
 	p := s.provider.PackagerFor(r.Context(), name)
 	if p == nil {
 		http.NotFound(w, r)
@@ -269,7 +279,54 @@ func (s *Server) serveManifest(w http.ResponseWriter, r *http.Request, name stri
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	s.writeManifest(w, r, b)
+}
 
+// serveABRManifest 尝试生成多档 MPD。阶梯里没有任何已发布的档位时返回
+// false，让调用方回退到单流 MPD（与 HLS master 的回退行为一致）。
+func (s *Server) serveABRManifest(w http.ResponseWriter, r *http.Request, name string) bool {
+	lp, ok := s.provider.(LadderProvider)
+	if !ok {
+		return false
+	}
+	ready, ok := lp.ABRRenditions(r.Context(), name)
+	if !ok || len(ready) == 0 {
+		return false
+	}
+
+	rends := make([]Rendition, 0, len(ready))
+	var packs []*hls.Packager
+	seen := make(map[string]bool, len(ready))
+	for _, rr := range ready {
+		stream := rr.Variant.Stream
+		if seen[stream] {
+			continue
+		}
+		seen[stream] = true
+		rends = append(rends, Rendition{Packager: rr.Packager, Base: stream})
+		packs = append(packs, rr.Packager)
+	}
+	if len(rends) == 0 {
+		return false
+	}
+
+	s.waitReadyAll(r.Context(), packs)
+	if r.Context().Err() != nil {
+		return true // 客户端已断开，不必再写响应
+	}
+
+	opts := s.opts
+	opts.Token = s.token
+	b, err := BuildABR(rends, time.Now(), opts)
+	if err != nil {
+		// 还没切出完整段时回退单流路径，由它给出 404/503 或正常 MPD。
+		return false
+	}
+	s.writeManifest(w, r, b)
+	return true
+}
+
+func (s *Server) writeManifest(w http.ResponseWriter, r *http.Request, b []byte) {
 	h := w.Header()
 	h.Set("Content-Type", manifestContentType)
 	h.Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -285,7 +342,22 @@ func (s *Server) serveManifest(w http.ResponseWriter, r *http.Request, name stri
 // waitReady 等音视频轨各自至少产生一个完整段；超时或流结束时返回，
 // 由 Build 决定是否还能生成 MPD。
 func (s *Server) waitReady(ctx context.Context, p *hls.Packager) {
+	s.waitReadyUntil(ctx, p, time.Now().Add(maxBlockWait))
+}
+
+// waitReadyAll 让多个 packager 共用一个等待截止时间，避免 ABR 档位多时
+// 每个档位各阻塞 maxBlockWait。
+func (s *Server) waitReadyAll(ctx context.Context, ps []*hls.Packager) {
 	deadline := time.Now().Add(maxBlockWait)
+	for _, p := range ps {
+		s.waitReadyUntil(ctx, p, deadline)
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) waitReadyUntil(ctx context.Context, p *hls.Packager, deadline time.Time) {
 	for {
 		if Ready(p) {
 			return

@@ -72,6 +72,7 @@ type Server struct {
 	idle           time.Duration
 	canBlockReload bool
 	metrics        *metrics.Registry
+	abr            map[string]ABRGroup
 
 	audioOnce  sync.Once
 	audioCodec *stream.AudioCodec
@@ -493,6 +494,25 @@ func (s *Server) localAudioParams() *stream.AudioCodec {
 
 func (s *Server) serveMaster(w http.ResponseWriter, r *http.Request, name string) {
 	s.metrics.IncHLSRequest("master")
+	if g, ok := s.abrGroup(name); ok {
+		if variants, audios, version, ok := s.serveABRMaster(r.Context(), name, g); ok {
+			m := &MasterPlaylist{
+				Version:             version,
+				IndependentSegments: true,
+				Variants:            variants,
+				Audios:              audios,
+				Token:               s.token,
+			}
+			b, err := m.Generate()
+			if err != nil {
+				s.opts.logf("hls[%s]: ABR master playlist: %v", name, err)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			s.writePlaylist(w, r, b)
+			return
+		}
+	}
 	p := s.packagerFor(r.Context(), name)
 	if p == nil {
 		http.NotFound(w, r)

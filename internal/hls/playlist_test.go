@@ -475,6 +475,50 @@ func TestMasterPlaylistVideoOnly(t *testing.T) {
 	}
 }
 
+func TestMasterPlaylistMultipleAudios(t *testing.T) {
+	m := &MasterPlaylist{
+		Version: 9,
+		Audios: []AudioRendition{
+			{GroupID: "aud0", Name: "audio", URI: "/hls/a/audio.m3u8", Channels: 2, Default: true, Autoselect: true},
+			{GroupID: "aud1", Name: "audio", URI: "/hls/b/audio.m3u8", Channels: 2, Autoselect: true},
+		},
+		Variants: []Variant{
+			{URI: "/hls/a/video.m3u8", Bandwidth: 500000, Resolution: "640x360", AudioGroup: "aud0"},
+			{URI: "/hls/b/video.m3u8", Bandwidth: 2000000, Resolution: "1280x720", AudioGroup: "aud1"},
+		},
+	}
+	got, err := m.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	s := string(got)
+	for _, want := range []string{
+		`GROUP-ID="aud0"`, `GROUP-ID="aud1"`,
+		`DEFAULT=YES,AUTOSELECT=YES`, `DEFAULT=NO,AUTOSELECT=YES`,
+		`AUDIO="aud0"`, `AUDIO="aud1"`,
+		`BANDWIDTH=500000`, `BANDWIDTH=2000000`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("master missing %q:\n%s", want, s)
+		}
+	}
+	if strings.Count(s, "#EXT-X-STREAM-INF:") != 2 {
+		t.Errorf("variants = %d, want 2:\n%s", strings.Count(s, "#EXT-X-STREAM-INF:"), s)
+	}
+
+	// 没有 variant 引用的音频组应被拒绝；重复组 ID 也拒绝。
+	unused := *m
+	unused.Variants = []Variant{{URI: "v.m3u8", Bandwidth: 1, AudioGroup: "aud0"}}
+	if _, err := unused.Generate(); err == nil {
+		t.Error("unused audio group accepted")
+	}
+	dup := *m
+	dup.Audios = append(append([]AudioRendition(nil), m.Audios...), m.Audios[0])
+	if _, err := dup.Generate(); err == nil {
+		t.Error("duplicate audio group accepted")
+	}
+}
+
 func TestMasterPlaylistAudioOnly(t *testing.T) {
 	m := &MasterPlaylist{
 		Version: 9,

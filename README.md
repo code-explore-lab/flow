@@ -90,6 +90,12 @@ go run ./cmd/server -snapshot-ffmpeg ffmpeg
 500ms→10s 指数退避重启；重启后的输出时间轴接在上一次之后，下游不会看到
 时间戳回退。指标见 `flow_transcode_*`。
 
+多码率 ABR（F-5）：同一 `Source` 的多个转码档位会自动组成 ABR 阶梯
+（`-transcode-abr=true`，默认开启）。`/hls/<source>/master.m3u8` 按码率
+升序输出多个 `EXT-X-STREAM-INF`，每档带自己的音频 rendition；
+`/dash/<source>/manifest.mpd` 把它们放进同一个 video AdaptationSet（多
+Representation），音频取最低档。播放器在段边界切档。
+
 MPEG-TS 输入（P-6）：UDP（单播/组播）与本地文件里的 MPEG-TS 直接解复用成
 H.264/H.265 + AAC 写进注册表，RTSP / RTMP / HTTP-FLV / HLS / DASH 都能拉，
 也可以继续通过 SRT（P-5）或 HLS 输出 TS。

@@ -279,7 +279,10 @@ type MasterPlaylist struct {
 	IndependentSegments bool
 	Variants            []Variant
 	Audio               *AudioRendition
-	Token               string
+	// Audios 是额外的音频 rendition。ABR 每一档的音频时间轴独立，
+	// 因此每个 variant 引用自己的一组（AUDIO="aud0"/"aud1"...）。
+	Audios []AudioRendition
+	Token  string
 }
 
 // Variant 一个视频（或音频）变体。
@@ -315,29 +318,31 @@ func (p *MasterPlaylist) Generate() ([]byte, error) {
 	if version < 7 {
 		return nil, fmt.Errorf("hls: invalid master version %d", version)
 	}
+	renditions := make([]AudioRendition, 0, len(p.Audios)+1)
 	if p.Audio != nil {
-		if p.Audio.GroupID == "" || p.Audio.Name == "" || p.Audio.URI == "" {
+		renditions = append(renditions, *p.Audio)
+	}
+	renditions = append(renditions, p.Audios...)
+
+	groups := make(map[string]bool, len(renditions))
+	for _, a := range renditions {
+		if a.GroupID == "" || a.Name == "" || a.URI == "" {
 			return nil, errors.New("hls: audio rendition needs GROUP-ID, NAME and URI")
 		}
-		for _, field := range []string{p.Audio.GroupID, p.Audio.Name, p.Audio.Language} {
+		if groups[a.GroupID] {
+			return nil, fmt.Errorf("hls: duplicate audio group %q", a.GroupID)
+		}
+		for _, field := range []string{a.GroupID, a.Name, a.Language} {
 			if err := checkQuoted(field); err != nil {
 				return nil, fmt.Errorf("hls: audio rendition: %w", err)
 			}
 		}
-		if err := checkURI(p.Audio.URI); err != nil {
+		if err := checkURI(a.URI); err != nil {
 			return nil, fmt.Errorf("hls: audio rendition: %w", err)
 		}
-		used := false
-		for _, v := range p.Variants {
-			if v.AudioGroup == p.Audio.GroupID {
-				used = true
-				break
-			}
-		}
-		if !used {
-			return nil, errors.New("hls: no variant references the audio rendition group")
-		}
+		groups[a.GroupID] = true
 	}
+	used := make(map[string]bool, len(renditions))
 	for _, v := range p.Variants {
 		if v.Bandwidth == 0 {
 			return nil, fmt.Errorf("hls: variant %q has zero bandwidth", v.URI)
@@ -350,13 +355,17 @@ func (p *MasterPlaylist) Generate() ([]byte, error) {
 				return nil, fmt.Errorf("hls: variant %q: %w", v.URI, err)
 			}
 		}
-		if v.AudioGroup != "" && p.Audio == nil {
-			return nil, fmt.Errorf("hls: variant %q references audio group %q but no audio rendition",
-				v.URI, v.AudioGroup)
+		if v.AudioGroup != "" {
+			if !groups[v.AudioGroup] {
+				return nil, fmt.Errorf("hls: variant %q references unknown audio group %q",
+					v.URI, v.AudioGroup)
+			}
+			used[v.AudioGroup] = true
 		}
-		if v.AudioGroup != "" && p.Audio != nil && v.AudioGroup != p.Audio.GroupID {
-			return nil, fmt.Errorf("hls: variant %q references unknown audio group %q",
-				v.URI, v.AudioGroup)
+	}
+	for _, a := range renditions {
+		if !used[a.GroupID] {
+			return nil, fmt.Errorf("hls: no variant references audio group %q", a.GroupID)
 		}
 	}
 
@@ -366,28 +375,28 @@ func (p *MasterPlaylist) Generate() ([]byte, error) {
 	if p.IndependentSegments {
 		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 	}
-	if p.Audio != nil {
+	for _, a := range renditions {
 		attrs := []string{
 			"TYPE=AUDIO",
-			fmt.Sprintf("GROUP-ID=\"%s\"", p.Audio.GroupID),
-			fmt.Sprintf("NAME=\"%s\"", p.Audio.Name),
+			fmt.Sprintf("GROUP-ID=\"%s\"", a.GroupID),
+			fmt.Sprintf("NAME=\"%s\"", a.Name),
 		}
-		if p.Audio.Language != "" {
-			attrs = append(attrs, fmt.Sprintf("LANGUAGE=\"%s\"", p.Audio.Language))
+		if a.Language != "" {
+			attrs = append(attrs, fmt.Sprintf("LANGUAGE=\"%s\"", a.Language))
 		}
 		def := "NO"
 		auto := "NO"
-		if p.Audio.Default {
+		if a.Default {
 			def = "YES"
 		}
-		if p.Audio.Default || p.Audio.Autoselect {
+		if a.Default || a.Autoselect {
 			auto = "YES"
 		}
 		attrs = append(attrs, "DEFAULT="+def, "AUTOSELECT="+auto)
-		if p.Audio.Channels > 0 {
-			attrs = append(attrs, fmt.Sprintf("CHANNELS=\"%d\"", p.Audio.Channels))
+		if a.Channels > 0 {
+			attrs = append(attrs, fmt.Sprintf("CHANNELS=\"%d\"", a.Channels))
 		}
-		attrs = append(attrs, fmt.Sprintf("URI=\"%s\"", appendToken(p.Audio.URI, p.Token)))
+		attrs = append(attrs, fmt.Sprintf("URI=\"%s\"", appendToken(a.URI, p.Token)))
 		fmt.Fprintf(&b, "#EXT-X-MEDIA:%s\n", strings.Join(attrs, ","))
 	}
 	for _, v := range p.Variants {

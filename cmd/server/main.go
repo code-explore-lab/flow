@@ -197,6 +197,7 @@ func main() {
 	transcodePreset := flag.String("transcode-preset", transcode.DefaultPreset, "F-4: software encoder preset")
 	transcodeGOP := flag.Duration("transcode-gop", transcode.DefaultGOP, "F-4: forced keyframe interval")
 	transcodeHW := flag.String("transcode-hw", "none", "F-4: hardware encoder: none|nvenc|qsv")
+	transcodeABR := flag.Bool("transcode-abr", true, "F-5: expose same-source transcode profiles as an HLS ABR master playlist")
 
 	// P-6：MPEG-TS 输入。UDP（单播/组播）与本地文件解复用后写进同一个
 	// 注册表，RTSP/RTMP/HTTP-FLV/HLS 都能直接拉。
@@ -680,6 +681,15 @@ func main() {
 		if originMgr != nil {
 			hlsSrv.SetOrigin(originMgr)
 		}
+		// F-5：同一源的多档转码输出合成一个 ABR 阶梯。
+		if *transcodeABR {
+			if groups := abrGroups(transcodeProfiles); len(groups) > 0 {
+				hlsSrv.SetABR(groups)
+				for _, g := range groups {
+					fmt.Printf("abr: %s (%d variants)\n", g.Source, len(g.Variants))
+				}
+			}
+		}
 	}
 	if hlsEnabled {
 		hlsSrv.SetWhitelist(whitelist)
@@ -940,6 +950,33 @@ func validateTranscodeOptions(gop time.Duration, hw string) error {
 	default:
 		return fmt.Errorf("invalid -transcode-hw %q (want none, nvenc or qsv)", hw)
 	}
+}
+
+// abrGroups 把同一源流的两档及以上转码输出归为一个 HLS ABR 阶梯。
+// 只有一档的源保持原来的单流 master，不做无意义的聚合。
+func abrGroups(profiles []transcode.Profile) []hls.ABRGroup {
+	var order []string
+	bySource := make(map[string][]hls.ABRVariant, len(profiles))
+	for _, p := range profiles {
+		if _, ok := bySource[p.Source]; !ok {
+			order = append(order, p.Source)
+		}
+		bySource[p.Source] = append(bySource[p.Source], hls.ABRVariant{
+			Stream:    p.Output,
+			Width:     p.Width,
+			Height:    p.Height,
+			Bitrate:   uint32(p.Bitrate),
+			FrameRate: p.FPS,
+			Codec:     p.Codec,
+		})
+	}
+	out := make([]hls.ABRGroup, 0, len(order))
+	for _, src := range order {
+		if vs := bySource[src]; len(vs) >= 2 {
+			out = append(out, hls.ABRGroup{Source: src, Variants: vs})
+		}
+	}
+	return out
 }
 
 func validateRecordOptions(segment time.Duration, quota int64, retention time.Duration, format record.Format) error {

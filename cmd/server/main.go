@@ -25,6 +25,7 @@ import (
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/origin"
+	"flow/internal/record"
 	"flow/internal/rtmp"
 	"flow/internal/rtsp"
 	"flow/internal/source"
@@ -137,6 +138,14 @@ func main() {
 	hlsReferer := flag.String("hls-referer", "", "P-2: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
 	hlsRequireReferer := flag.Bool("hls-require-referer", false, "P-2: reject requests without a Referer when -hls-referer is set")
 	hlsToken := flag.String("hls-token", "", "P-2: playback token, passed as ?token=... or X-Flow-Token (empty disables)")
+	// F-3：把注册表里的实时流转封装成 MP4/FLV/TS 文件。
+	recordNames := flag.String("record", "", "F-3: comma-separated stream names to record (\"*\" = all; empty disables)")
+	recordDir := flag.String("record-dir", "recordings", "F-3: recording output directory")
+	recordFormatFlag := flag.String("record-format", "mp4", "F-3: recording container: mp4|flv|ts")
+	recordSegment := flag.Duration("record-segment", 60*time.Second, "F-3: rotate to a new file at the first keyframe after this duration")
+	recordQuota := flag.Int64("record-quota", 0, "F-3: total byte budget for recordings in -record-dir (0 = unlimited; oldest files are removed first)")
+	recordRetention := flag.Duration("record-retention", 0, "F-3: delete completed recordings older than this (0 = keep forever)")
+	recordResume := flag.Bool("record-resume", true, "F-3: append to an unfinished file after a crash (state is kept in <dir>/<stream>.state)")
 	// P-3：MPEG-DASH 分发。复用 P-2 的切片管线，因此切片参数仍由 -hls-* 控制；
 	// 这里只新增端口、MPD 刷新周期和安全策略。
 	dashAddr := flag.String("dash-addr", ":8083", "P-3: MPEG-DASH listen address (empty disables)")
@@ -222,6 +231,15 @@ func main() {
 		os.Exit(2)
 	}
 	if err := validateDashOptions(*dashUpdate, *dashDelay); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	recordFormat, err := record.ParseFormat(*recordFormatFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := validateRecordOptions(*recordSegment, *recordQuota, *recordRetention, recordFormat); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
@@ -371,6 +389,22 @@ func main() {
 	// RTSP / RTMP / RTMPS 三个 Server 同时生效。
 	reg := stream.NewRegistry()
 	reg.SetPublishPolicy(publishPolicy)
+
+	// F-3：录制管理器。只录制注册表里命中名字的流；轮询启动，
+	// 因此 RTMP 首帧建立轨之后才会真正开始。
+	var recordMgr *record.Manager
+	if recordList := splitCommaList(*recordNames); len(recordList) > 0 {
+		recordMgr = record.NewManager(reg, record.Options{
+			Dir:             *recordDir,
+			Format:          recordFormat,
+			SegmentDuration: *recordSegment,
+			Quota:           *recordQuota,
+			Retention:       *recordRetention,
+			Resume:          *recordResume,
+		}, recordList)
+		fmt.Printf("record: %s to %s (segment %s, quota %d, resume=%v)\n",
+			strings.Join(recordList, ","), *recordDir, *recordSegment, *recordQuota, *recordResume)
+	}
 
 	// S-3：本地空闲回收。推流端进程被强杀/半开 TCP 时协议层收不到 FIN，
 	// 这里按「最近一次媒体写入」兜底摘除并关闭源，下游读到流结束而非挂死。
@@ -645,6 +679,9 @@ func main() {
 	if dashEnabled {
 		wg.Add(1)
 	}
+	if recordMgr != nil {
+		wg.Add(1)
+	}
 	wg.Add(len(pulls))
 	// 任何一个监听失败就取消 ctx，让另一个也退出。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
@@ -673,6 +710,12 @@ func main() {
 	}
 	if dashEnabled {
 		go serve("dash", *dashAddr, dashSrv.Serve)
+	}
+	if recordMgr != nil {
+		go func() {
+			defer wg.Done()
+			recordMgr.Run(ctx)
+		}()
 	}
 	// T-9：每个上游一路 goroutine，ctx 取消后自动退出并注销本地流。
 	for _, cl := range pulls {
@@ -712,6 +755,23 @@ func validateDashOptions(update, delay time.Duration) error {
 	}
 	if delay < 0 {
 		return errors.New("invalid -dash-delay (must be >= 0)")
+	}
+	return nil
+}
+
+// validateRecordOptions 校验 F-3 的录制参数。
+func validateRecordOptions(segment time.Duration, quota int64, retention time.Duration, format record.Format) error {
+	if segment <= 0 {
+		return errors.New("invalid -record-segment (must be > 0)")
+	}
+	if quota < 0 {
+		return errors.New("invalid -record-quota (must be >= 0)")
+	}
+	if retention < 0 {
+		return errors.New("invalid -record-retention (must be >= 0)")
+	}
+	if format != record.FormatMP4 && format != record.FormatFLV && format != record.FormatTS {
+		return errors.New("invalid -record-format (want mp4, flv or ts)")
 	}
 	return nil
 }

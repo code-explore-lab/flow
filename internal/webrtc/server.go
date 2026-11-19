@@ -34,6 +34,7 @@ import (
 	pion "github.com/pion/webrtc/v4"
 
 	"flow/internal/access"
+	"flow/internal/health"
 	"flow/internal/metrics"
 	"flow/internal/stream"
 )
@@ -267,6 +268,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
+	health.NotifyListenerReady(ctx)
 	s.listenAddr.Store(ln.Addr())
 
 	srv := &http.Server{

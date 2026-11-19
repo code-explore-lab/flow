@@ -21,6 +21,7 @@ import (
 	"flow/internal/admin"
 	"flow/internal/dash"
 	"flow/internal/discovery"
+	"flow/internal/health"
 	"flow/internal/hls"
 	"flow/internal/httpflv"
 	"flow/internal/limiter"
@@ -80,6 +81,10 @@ func main() {
 	// O-1：HTTP 管理 API。空表示关闭；没有 token 时只允许回环监听。
 	adminAddr := flag.String("admin-addr", "", "O-1: management HTTP API listen address, e.g. 127.0.0.1:9091 (empty disables)")
 	adminToken := flag.String("admin-token", "", "O-1: bearer token for the management API (required for non-loopback listeners)")
+	// O-4：健康检查与告警。默认保持原行为：任一监听口 bind 失败就退出；
+	// 设为 false 时保留其它监听口继续运行，失败协议在 /readyz 和
+	// /api/v1/alerts 里标记为 down，便于排查端口占用。
+	listenFatal := flag.Bool("listen-failure-fatal", true, "O-4: exit when a protocol listener fails to bind (false keeps other listeners running so /readyz can report it)")
 	// E-5：连接/会话上限与超时。
 	maxConns := flag.Int("max-conns", 0, "E-5: max concurrent TCP connections per protocol (0 = unlimited)")
 	maxSessions := flag.Int("max-sessions", 0, "E-5: max concurrent RTSP sessions (0 = unlimited)")
@@ -512,11 +517,17 @@ func main() {
 	// S-3：本地空闲回收。推流端进程被强杀/半开 TCP 时协议层收不到 FIN，
 	// 这里按「最近一次媒体写入」兜底摘除并关闭源，下游读到流结束而非挂死。
 	// 回源（S-1）和 -pull（T-9）的流在各自构造时已标记豁免。
+	var janitor *stream.Janitor
 	if *streamIdle > 0 {
-		janitor := stream.NewJanitor(reg, *streamIdle)
+		janitor = stream.NewJanitor(reg, *streamIdle)
 		go janitor.Run(ctx)
 		fmt.Printf("stream janitor: drop streams with no media for %s (relay streams exempt)\n", janitor.Idle())
 	}
+	// O-4：健康聚合。监听口状态由各 Serve 在 bind 成功后上报；流的上下线
+	// 通过注册表观察者实时感知，静默流由周期扫描 + Janitor.SweepOnce 兜底。
+	healthChecker := health.New(health.Options{Registry: reg, Janitor: janitor})
+	go healthChecker.Run(ctx)
+	fmt.Printf("health: stream alert window %s, scan interval 1s\n", healthChecker.ActiveWindow())
 	// E-4：两个协议共用一个指标注册表，/metrics 与两个服务器都读它。
 	flowMetrics := metrics.New()
 
@@ -614,6 +625,10 @@ func main() {
 	rtspSrv.SetWhitelist(whitelist)
 	rtspSrv.SetRateLimit(rtspRate)
 	rtspSrv.SetBackoff(authBackoff)
+	// O-4：会话超时/断网被 Sweep 回收时上报会话异常告警。
+	rtspSrv.SetSessionExpireHook(func(id, remote string, _, lastActive time.Time) {
+		healthChecker.RecordSessionExpired("rtsp", id, remote, lastActive)
+	})
 	if originMgr != nil {
 		rtspSrv.SetOrigin(originMgr)
 	}
@@ -674,6 +689,7 @@ func main() {
 		}
 		adminSrv = admin.New(reg, backends...)
 		adminSrv.SetToken(*adminToken)
+		adminSrv.SetHealth(healthChecker)
 		adminSrv.SetConfig(map[string]string{
 			"node":          node,
 			"live":          strconv.FormatBool(*live),
@@ -839,7 +855,7 @@ func main() {
 
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
 	if *metricsAddr != "" {
-		if err := startMetrics(ctx, *metricsAddr, flowMetrics, rtspSrv); err != nil {
+		if err := startMetrics(ctx, *metricsAddr, flowMetrics, rtspSrv, healthChecker); err != nil {
 			fmt.Fprintf(os.Stderr, "metrics: %v\n", err)
 			os.Exit(2)
 		}
@@ -891,12 +907,49 @@ func main() {
 	}
 	wg.Add(len(pulls))
 	wg.Add(len(tsUDPInputs) + len(tsFileInputs))
-	// 任何一个监听失败就取消 ctx，让另一个也退出。
+
+	// O-4：先登记所有将启用的监听口（pending），Serve bind 成功后通过
+	// health.NotifyListenerReady 置为 up；失败则由下面的 serve 包装置为
+	// down。可选协议只在真正启用时登记。
+	healthChecker.RegisterListener("rtsp", *rtspAddr)
+	healthChecker.RegisterListener("rtmp", *rtmpAddr)
+	if rtmpsSrv != nil {
+		healthChecker.RegisterListener("rtmps", *rtmpsAddr)
+	}
+	if httpflvSrv != nil {
+		healthChecker.RegisterListener("httpflv", *httpflvAddr)
+	}
+	if srtSrv != nil {
+		healthChecker.RegisterListener("srt", *srtAddr)
+	}
+	if webrtcSrv != nil {
+		healthChecker.RegisterListener("webrtc", *webrtcAddr)
+	}
+	if snapshotSrv != nil {
+		healthChecker.RegisterListener("snapshot", *snapshotAddr)
+	}
+	if adminSrv != nil {
+		healthChecker.RegisterListener("admin", adminListen)
+	}
+	if hlsEnabled {
+		healthChecker.RegisterListener("hls", *hlsAddr)
+	}
+	if dashEnabled {
+		healthChecker.RegisterListener("dash", *dashAddr)
+	}
+
+	// 默认行为与之前一致：任何一个监听失败就取消 ctx，让其它协议也退出。
+	// -listen-failure-fatal=false 时保留其它监听口，失败原因交给
+	// health（/readyz 503 + port_bind_failed 告警）暴露。
 	serve := func(name string, addr string, f func(context.Context, string) error) {
 		defer wg.Done()
-		if err := f(ctx, addr); err != nil {
+		serveCtx := health.WithListenerReady(ctx, func() { healthChecker.ListenerUp(name) })
+		if err := f(serveCtx, addr); err != nil {
+			healthChecker.ListenerDown(name, err)
 			fmt.Printf("%s listen failed on %s: %v\n", name, addr, err)
-			stop()
+			if *listenFatal {
+				stop()
+			}
 		}
 	}
 	go serve("rtsp", *rtspAddr, rtspSrv.Serve)
@@ -1203,7 +1256,7 @@ func startPprof(ctx context.Context, raw string) error {
 
 // startMetrics 启动 Prometheus 文本端点（E-4），仅回环可达。
 // 全局计数器来自 metrics.Registry，活跃会话的丢包 gauge 来自 rtsp.Server。
-func startMetrics(ctx context.Context, raw string, reg *metrics.Registry, loss *rtsp.Server) error {
+func startMetrics(ctx context.Context, raw string, reg *metrics.Registry, loss *rtsp.Server, healthChecker *health.Checker) error {
 	addr, err := loopbackListenAddr(raw)
 	if err != nil {
 		return err
@@ -1213,6 +1266,8 @@ func startMetrics(ctx context.Context, raw string, reg *metrics.Registry, loss *
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		reg.WritePrometheus(w)
 		loss.WriteLossMetrics(w)
+		// O-4：flow_ready / flow_alerts / 监听口状态。
+		healthChecker.WritePrometheus(w)
 	})
 	return serveLoopback(ctx, addr, mux, "metrics")
 }

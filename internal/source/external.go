@@ -51,6 +51,9 @@ type ExternalSource struct {
 	// lastWrite 是最近一次 Write 的时间（Unix 纳秒）。T-8 用它判断一条
 	// 已发布流是否还在出帧，供 reject-if-active 区分活跃推流和僵尸连接。
 	lastWrite atomic.Int64
+	// wrote 表示是否至少写入过一帧。LastWrite 在构造时就置为当前时间，
+	// 不能拿来区分「刚发布还没出帧」和「已经出过帧」；O-4 的告警需要后者。
+	wrote atomic.Bool
 }
 
 // NewExternalSource 创建一个空的视频推流源（缓存参数集/IDR 供预热），
@@ -125,6 +128,12 @@ func (s *ExternalSource) LastWrite() time.Time {
 	return time.Unix(0, s.lastWrite.Load())
 }
 
+// Wrote 报告这个源是否至少收到过一帧。用于把「推流刚建立、首帧还没到」
+// 和「正常出过帧后中断」区分开。
+func (s *ExternalSource) Wrote() bool {
+	return s.wrote.Load()
+}
+
 // GOP 缓存上限：只保留最近一个关键帧起的有限窗口，防止长 GOP 无限增长。
 const (
 	maxGOPFrames = 256
@@ -138,6 +147,7 @@ const (
 // 写进 ring（读者从当前写位置开始读，不会重复收到缓存帧）。
 func (s *ExternalSource) Write(f Frame) {
 	s.lastWrite.Store(time.Now().UnixNano())
+	s.wrote.Store(true)
 	if s.cacheParamSets {
 		s.mu.Lock()
 		defer s.mu.Unlock()

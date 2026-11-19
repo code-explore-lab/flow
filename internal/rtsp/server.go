@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/health"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/session"
@@ -31,6 +32,11 @@ type Server struct {
 	audioPath string // 文件模式 SDP 里取 AudioSpecificConfig 用的源文件
 
 	sessions *session.Manager
+
+	// sessionExpireHook 是 O-4 的会话异常通知：会话因超时/断网被 Sweep
+	// 回收时调用，main 转发给 health.Checker 产生 session_expired 告警。
+	// 只在 Serve 前配置。
+	sessionExpireHook func(id, remote string, created, lastActive time.Time)
 
 	// 已发布流注册表（ANNOUNCE 创建，拉流端按 URL 路径查找）。P1-8。
 	// 与 RTMP 共用同一份 internal/stream.Registry；New 默认自建一份，
@@ -144,6 +150,13 @@ func (s *Server) SetLimits(l *limiter.ConnLimiter) {
 // 必须在 Serve 之前调用。
 func (s *Server) SetMaxSessions(n int) {
 	s.sessions.SetMax(n)
+}
+
+// SetSessionExpireHook 注册会话超时回收的回调（O-4）。只在 Sweep 回收
+// 路径触发；客户端正常 TEARDOWN 不会调用。传 nil 取消。
+// 必须在 Serve 之前调用。
+func (s *Server) SetSessionExpireHook(fn func(id, remote string, created, lastActive time.Time)) {
+	s.sessionExpireHook = fn
 }
 
 // SetWhitelist 注入 IP 白名单（E-8）。nil 表示不启用白名单。
@@ -317,6 +330,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		return err
 	}
 	defer listener.Close()
+	health.NotifyListenerReady(ctx)
 	fmt.Printf("%s server listen on %s (Ctrl+C to stop)\n", scheme, addr)
 	if s.live {
 		fmt.Println("input: stdin (live H.264, audio disabled)")
@@ -422,6 +436,9 @@ func (s *Server) installExpireHook() {
 			sess.ID, s.sessions.Timeout(), sess.LastRTCP().Format(time.RFC3339))
 		if st, ok := sess.Data.(*Session); ok && st.conn != nil {
 			s.closeConnIfIdle(st.conn, sess.ID)
+		}
+		if hook := s.sessionExpireHook; hook != nil {
+			hook(sess.ID, sess.RemoteIP, sess.CreatedAt, sess.LastActivity())
 		}
 	}
 }

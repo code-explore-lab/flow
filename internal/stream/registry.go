@@ -440,7 +440,8 @@ type Registry struct {
 	activeWindow time.Duration
 
 	// observer 非 nil 时在 Publish/Unpublish 完成后（锁外）收到通知。
-	observer Observer
+	// S-3 的发现上报和 O-4 的健康告警各自注册一个，互不覆盖。
+	observers []Observer
 }
 
 // NewRegistry 创建一个空注册表，默认替换同名流。
@@ -509,6 +510,20 @@ func (s *Stream) LastActivity() time.Time {
 	return last
 }
 
+// HasMedia 报告这条流是否至少有一轨真正写入过媒体。与 Active 不同，
+// 它不看时间窗口：用于区分「刚发布、首帧还没到」和「出过帧后中断」。
+func (s *Stream) HasMedia() bool {
+	s.mu.Lock()
+	video, audio := s.Video, s.Audio
+	s.mu.Unlock()
+	for _, t := range []*Track{video, audio} {
+		if t != nil && t.Src != nil && t.Src.Wrote() {
+			return true
+		}
+	}
+	return false
+}
+
 // SetIdleExempt 控制这条流是否豁免空闲回收。回源/-pull 在创建流时置 true。
 func (s *Stream) SetIdleExempt(v bool) { s.idleExempt.Store(v) }
 
@@ -539,12 +554,36 @@ type NamedStream struct {
 }
 
 // SetObserver 设置注册表变更观察者（S-3 发现上报）。传 nil 取消。
-// 只在 Serve/后台任务启动前调用；观察者会在 Publish/Unpublish 的调用方
-// goroutine 上被同步调用，必须非阻塞。
+// 会替换之前通过 SetObserver/AddObserver 注册的全部观察者；需要多个
+// 订阅方时用 AddObserver。只在 Serve/后台任务启动前调用；观察者会在
+// Publish/Unpublish 的调用方 goroutine 上被同步调用，必须非阻塞。
 func (r *Registry) SetObserver(o Observer) {
 	r.mu.Lock()
-	r.observer = o
+	if o == nil {
+		r.observers = nil
+	} else {
+		r.observers = []Observer{o}
+	}
 	r.mu.Unlock()
+}
+
+// AddObserver 追加一个变更观察者，不影响已注册的观察者（O-4 的告警
+// 与 S-3 的发现上报可以同时订阅）。传 nil 忽略。
+func (r *Registry) AddObserver(o Observer) {
+	if o == nil {
+		return
+	}
+	r.mu.Lock()
+	r.observers = append(r.observers, o)
+	r.mu.Unlock()
+}
+
+// observersLocked 返回观察者切片的副本，调用方必须在锁外执行回调。
+func (r *Registry) observersLocked() []Observer {
+	if len(r.observers) == 0 {
+		return nil
+	}
+	return append([]Observer(nil), r.observers...)
 }
 
 // Snapshot 返回当前登记的全部流，按流名排序，供 janitor 扫描和心跳上报。
@@ -573,11 +612,11 @@ func (r *Registry) Reap(name string, s *Stream, idle time.Duration) bool {
 		return false
 	}
 	delete(r.m, name)
-	obs := r.observer
+	obs := r.observersLocked()
 	r.mu.Unlock()
 
-	if obs != nil {
-		obs(EventUnpublished, name, s)
+	for _, o := range obs {
+		o(EventUnpublished, name, s)
 	}
 	s.Close()
 	return true
@@ -609,17 +648,17 @@ func (r *Registry) Publish(name string, s *Stream) (*Stream, error) {
 		}
 	}
 	r.m[name] = s
-	obs := r.observer
+	obs := r.observersLocked()
 	r.mu.Unlock()
 
 	if old != nil && old != s {
-		if obs != nil {
-			obs(EventUnpublished, name, old)
+		for _, o := range obs {
+			o(EventUnpublished, name, old)
 		}
 		old.Close()
 	}
-	if obs != nil {
-		obs(EventPublished, name, s)
+	for _, o := range obs {
+		o(EventPublished, name, s)
 	}
 	return s, nil
 }
@@ -636,11 +675,13 @@ func (r *Registry) Unpublish(name string, s *Stream) {
 		delete(r.m, name)
 		deleted = true
 	}
-	obs := r.observer
+	obs := r.observersLocked()
 	r.mu.Unlock()
 
-	if deleted && obs != nil {
-		obs(EventUnpublished, name, s)
+	if deleted {
+		for _, o := range obs {
+			o(EventUnpublished, name, s)
+		}
 	}
 	s.Close()
 }

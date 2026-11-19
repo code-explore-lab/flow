@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/health"
 	"flow/internal/metrics"
 	"flow/internal/source"
 	"flow/internal/stream"
@@ -73,6 +74,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
+	health.NotifyListenerReady(ctx)
 	srv := &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 5 * time.Second,

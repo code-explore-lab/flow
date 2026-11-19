@@ -26,6 +26,7 @@ import (
 
 	gosrt "github.com/datarhei/gosrt"
 
+	"flow/internal/health"
 	"flow/internal/metrics"
 	"flow/internal/stream"
 )
@@ -125,6 +126,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
+	health.NotifyListenerReady(ctx)
 	s.listenAddr.Store(ln.Addr())
 
 	done := make(chan struct{})

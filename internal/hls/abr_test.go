@@ -93,14 +93,14 @@ func TestABRMasterPlaylist(t *testing.T) {
 		ts.URL + "/hls/live/src_360p",
 		ts.URL + "/hls/live/src_720p",
 	} {
-		pl := getPlaylist(t, base+"/video.m3u8")
-		if len(pl.entries) == 0 {
-			t.Errorf("%s: video playlist has no segments", base)
-		}
-		al := getPlaylist(t, base+"/audio.m3u8")
-		if len(al.entries) == 0 {
-			t.Errorf("%s: audio playlist has no segments", base)
-		}
+		// 打包器异步消费帧，写完后立刻取 playlist 偶尔会早于首个 segment
+		// 落盘；轮询到出现 segment 再断言，避免竞态导致的偶发失败。
+		waitUntil(t, 5*time.Second, base+" video playlist", func() bool {
+			return len(getPlaylist(t, base+"/video.m3u8").entries) > 0
+		})
+		waitUntil(t, 5*time.Second, base+" audio playlist", func() bool {
+			return len(getPlaylist(t, base+"/audio.m3u8").entries) > 0
+		})
 	}
 }
 

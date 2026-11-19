@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/health"
 	"flow/internal/limiter"
 	"flow/internal/metrics"
 	"flow/internal/source"
@@ -174,6 +175,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		return err
 	}
 	defer listener.Close()
+	health.NotifyListenerReady(ctx)
 	fmt.Printf("%s server listen on %s (Ctrl+C to stop)\n", scheme, addr)
 
 	// 收到退出信号后关掉 listener，让下面阻塞的 Accept 立即返回。

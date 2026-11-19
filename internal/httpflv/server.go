@@ -29,6 +29,7 @@ import (
 	"flow/internal/access"
 	"flow/internal/flv"
 	"flow/internal/flvmux"
+	"flow/internal/health"
 	"flow/internal/media"
 	"flow/internal/metrics"
 	"flow/internal/source"
@@ -116,6 +117,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
+	health.NotifyListenerReady(ctx)
 	srv := &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 5 * time.Second,

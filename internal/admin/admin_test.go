@@ -2,11 +2,13 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"flow/internal/health"
 	"flow/internal/stream"
 )
 
@@ -215,6 +217,97 @@ func TestTokenAuth(t *testing.T) {
 	rec, _ = do(t, s, http.MethodGet, "/api/v1/streams", map[string]string{"X-Flow-Token": "s3cret"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("header token status = %d, want 200", rec.Code)
+	}
+}
+
+// TestProbesBypassToken 验证 k8s 探针不需要 token，而其余管理接口仍要求。
+func TestProbesBypassToken(t *testing.T) {
+	s, _ := newTestServer(&fakeBackend{protocol: "rtsp"})
+	s.SetToken("s3cret")
+
+	rec, body := do(t, s, http.MethodGet, "/healthz", nil)
+	if rec.Code != http.StatusOK || body["status"] != "ok" {
+		t.Fatalf("healthz = %d %v", rec.Code, body)
+	}
+	rec, body = do(t, s, http.MethodGet, "/readyz", nil)
+	if rec.Code != http.StatusOK || body["ready"] != true {
+		t.Fatalf("readyz = %d %v", rec.Code, body)
+	}
+
+	rec, _ = do(t, s, http.MethodGet, "/api/v1/health", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("health API without token = %d, want 401", rec.Code)
+	}
+	rec, _ = do(t, s, http.MethodGet, "/api/v1/alerts", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("alerts API without token = %d, want 401", rec.Code)
+	}
+	rec, _ = do(t, s, http.MethodGet, "/api/v1/health", map[string]string{"Authorization": "Bearer s3cret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health API with token = %d, want 200", rec.Code)
+	}
+}
+
+// TestReadyzReflectsListenerFailure 验证监听口 down 时 /readyz 返回 503，
+// 并带上可读原因；恢复后回到 200。
+func TestReadyzReflectsListenerFailure(t *testing.T) {
+	s, reg := newTestServer()
+	h := health.New(health.Options{Registry: reg})
+	s.SetHealth(h)
+	h.RegisterListener("rtsp", ":8554")
+
+	rec, body := do(t, s, http.MethodGet, "/readyz", nil)
+	if rec.Code != http.StatusServiceUnavailable || body["ready"] != false {
+		t.Fatalf("pending readyz = %d %v", rec.Code, body)
+	}
+	reasons, _ := body["reasons"].([]any)
+	if len(reasons) != 1 {
+		t.Fatalf("reasons = %v, want 1", body["reasons"])
+	}
+
+	h.ListenerUp("rtsp")
+	rec, body = do(t, s, http.MethodGet, "/readyz", nil)
+	if rec.Code != http.StatusOK || body["ready"] != true {
+		t.Fatalf("ready readyz = %d %v", rec.Code, body)
+	}
+
+	h.ListenerDown("rtsp", errors.New("listen tcp :8554: bind: address already in use"))
+	rec, body = do(t, s, http.MethodGet, "/readyz", nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("down readyz = %d, want 503", rec.Code)
+	}
+	if got, _ := body["reasons"].([]any); len(got) != 1 {
+		t.Fatalf("reasons = %v", body["reasons"])
+	}
+
+	// liveness 不受监听口失败影响。
+	rec, _ = do(t, s, http.MethodGet, "/healthz", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz after listener down = %d, want 200", rec.Code)
+	}
+}
+
+// TestAlertsEndpoint 验证告警查询接口返回当前活跃与历史。
+func TestAlertsEndpoint(t *testing.T) {
+	s, reg := newTestServer()
+	h := health.New(health.Options{Registry: reg})
+	s.SetHealth(h)
+	h.RecordSessionExpired("rtsp", "sess-9", "10.0.0.9", time.Now().Add(-time.Minute))
+
+	rec, body := do(t, s, http.MethodGet, "/api/v1/alerts", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alerts status = %d", rec.Code)
+	}
+	active, _ := body["active"].([]any)
+	if len(active) != 1 {
+		t.Fatalf("active = %v, want 1", body["active"])
+	}
+	a := active[0].(map[string]any)
+	if a["kind"] != health.AlertSessionExpired || a["subject"] != "rtsp/sess-9" {
+		t.Fatalf("alert = %v", a)
+	}
+	if history, _ := body["history"].([]any); len(history) != 1 {
+		t.Fatalf("history = %v, want 1", body["history"])
 	}
 }
 

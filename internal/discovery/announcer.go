@@ -75,7 +75,8 @@ func NewAnnouncer(client *Client, reg *stream.Registry, advertise map[string]str
 		// Observer 必须非阻塞，这里只投递一个信号；真正的收集/发送
 		// 在 Run 的 goroutine 里做。
 		a := &Announcer{client: client, reg: reg, advertise: cp, interval: interval, activeWindow: activeWindow, maxHops: 1, dirty: make(chan struct{}, 1)}
-		reg.SetObserver(a.onEvent)
+		// O-4 的健康告警也会订阅注册表变更，这里用 AddObserver 避免覆盖。
+		reg.AddObserver(a.onEvent)
 		return a
 	}
 	return &Announcer{client: client, advertise: cp, interval: interval, activeWindow: activeWindow, maxHops: 1, dirty: make(chan struct{}, 1)}

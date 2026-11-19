@@ -310,3 +310,34 @@ func TestPublishPolicyRejectConcurrent(t *testing.T) {
 		t.Fatalf("registry Len = %d, want 1", r.Len())
 	}
 }
+
+// TestAddObserverMultiple 验证 O-4 的健康告警和 S-3 的发现上报可以同时
+// 订阅注册表变更：AddObserver 追加而不是覆盖。
+func TestAddObserverMultiple(t *testing.T) {
+	reg := NewRegistry()
+	var mu sync.Mutex
+	seen := map[string][]string{}
+	for _, who := range []string{"health", "discovery"} {
+		who := who
+		reg.AddObserver(func(ev Event, name string, _ *Stream) {
+			mu.Lock()
+			seen[who] = append(seen[who], ev.String()+":"+name)
+			mu.Unlock()
+		})
+	}
+
+	st := &Stream{}
+	if _, err := reg.Publish("live/x", st); err != nil {
+		t.Fatal(err)
+	}
+	reg.Unpublish("live/x", st)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, who := range []string{"health", "discovery"} {
+		got := seen[who]
+		if len(got) != 2 || got[0] != "published:live/x" || got[1] != "unpublished:live/x" {
+			t.Fatalf("%s observer events = %v", who, got)
+		}
+	}
+}

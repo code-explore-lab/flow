@@ -13,8 +13,16 @@
 //	DELETE /api/v1/sessions/<id>    踢掉一个会话
 //	GET    /api/v1/config           脱敏后的运行时配置
 //
+// O-4 的健康探针也挂在这个服务上：
+//
+//	GET    /healthz                 liveness，进程活着即 200（免鉴权）
+//	GET    /readyz                  readiness，监听口全部 up + 注册表可用（免鉴权）
+//	GET    /api/v1/health           完整健康快照（流、监听口、告警）
+//	GET    /api/v1/alerts           当前活跃告警 + 历史（受 token 保护）
+//
 // 管理接口能中断推流，默认只应监听回环地址；cmd/server 在未配置 token
-// 时强制回环，非回环监听必须同时设置 bearer token。
+// 时强制回环，非回环监听必须同时设置 bearer token。k8s/负载均衡探针
+// 不会带 token，因此只有 /healthz 和 /readyz 两个探针路径免鉴权。
 package admin
 
 import (
@@ -29,6 +37,7 @@ import (
 	"strings"
 	"time"
 
+	"flow/internal/health"
 	"flow/internal/stream"
 )
 
@@ -95,6 +104,7 @@ type Server struct {
 	token    string
 	config   map[string]string
 	started  time.Time
+	health   *health.Checker
 	handler  http.Handler
 }
 
@@ -118,12 +128,18 @@ func (s *Server) SetToken(token string) { s.token = token }
 // SetConfig 设置 /api/v1/config 返回的键值。调用方负责脱敏。
 func (s *Server) SetConfig(m map[string]string) { s.config = m }
 
+// SetHealth 注入 O-4 的健康聚合器。nil 时 /healthz 与 /readyz 退化为
+// 「进程活着即就绪」，/api/v1/health 与 /api/v1/alerts 返回空视图。
+// 必须在 Serve 之前调用。
+func (s *Server) SetHealth(h *health.Checker) { s.health = h }
+
 // Serve 启动 HTTP 服务，ctx 取消时关闭监听。
 func (s *Server) Serve(ctx context.Context, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
+	health.NotifyListenerReady(ctx)
 	srv := &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -140,9 +156,16 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	return err
 }
 
-// ServeHTTP 校验 token 后分发到具体路由。
+// probePath 报告路径是否是免鉴权的健康探针。
+// k8s/负载均衡探针通常不带任何凭据，这两个端点只暴露聚合状态，不含流名、
+// 会话或配置，因此可以安全放行；其它管理接口仍要求 token。
+func probePath(p string) bool {
+	return p == "/healthz" || p == "/readyz"
+}
+
+// ServeHTTP 校验 token 后分发到具体路由；健康探针免鉴权。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
+	if !probePath(r.URL.Path) && !s.authorized(r) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="flow-admin"`)
 		writeError(w, http.StatusUnauthorized, "invalid or missing token")
 		return
@@ -158,7 +181,62 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/v1/sessions", s.handleSessions)
 	mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleKickSession)
 	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+	mux.HandleFunc("GET /api/v1/alerts", s.handleAlerts)
 	return mux
+}
+
+// handleHealthz liveness：进程活着就 200，不检查监听口和流。
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	if s.health == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		return
+	}
+	snap := s.health.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":        "ok",
+		"uptimeSeconds": snap.UptimeSeconds,
+		"activeAlerts":  len(snap.Alerts.Active),
+	})
+}
+
+// handleReadyz readiness：所有已启用监听口 bind 成功且注册表可用时 200，
+// 否则 503。活跃流数量不影响结果。
+func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	if s.health == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ready": true, "reasons": []string{}, "registry": "ok",
+		})
+		return
+	}
+	r := s.health.Readiness()
+	status := http.StatusOK
+	if !r.Ready {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, r)
+}
+
+// handleHealth 返回完整健康快照（受 token 保护）。
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	if s.health == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ok", "ready": true, "registry": "ok",
+			"listeners": []any{}, "streams": []any{},
+			"alerts": map[string]any{
+				"active": []any{}, "history": []any{}, "counters": map[string]uint64{},
+			},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.health.Snapshot())
+}
+
+// handleAlerts 返回当前活跃告警与历史（受 token 保护）。
+func (s *Server) handleAlerts(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.health.Alerts())
 }
 
 // authorized 校验 Authorization: Bearer / X-Flow-Token。

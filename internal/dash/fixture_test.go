@@ -81,6 +81,30 @@ func writeVideo(vs *source.ExternalSource, from, count int) {
 	}
 }
 
+// writeVideoB 写视频帧，cts 给出每个访问单元的 CTS（PTS − DTS），用来模拟
+// 带 B 帧的重排延迟。Timestamp 是 PTS，CompositionTime 是 CTS。
+func writeVideoB(vs *source.ExternalSource, from, count int, cts func(i int) int32) {
+	for i := from; i < from+count; i++ {
+		key := i%25 == 0
+		nalu := []byte{0x41, 0x9A, byte(i), byte(i >> 8)}
+		if key {
+			nalu = []byte{0x65, 0x88, byte(i), byte(i >> 8)}
+		}
+		c := cts(i)
+		vs.Write(source.Frame{
+			Data:            nalu,
+			Timestamp:       uint32(int64(i)*3600 + int64(c)),
+			CompositionTime: c,
+			Keyframe:        key,
+			AUStart:         true,
+			AUEnd:           true,
+		})
+		if i%10 == 9 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func writeAudio(as *source.ExternalSource, from, count int) {
 	for i := from; i < from+count; i++ {
 		as.Write(source.Frame{

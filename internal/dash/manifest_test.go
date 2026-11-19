@@ -104,12 +104,15 @@ func TestBuildManifest(t *testing.T) {
 	if len(entries) != len(vsnap.Segments) {
 		t.Fatalf("video timeline entries = %d, segments = %d", len(entries), len(vsnap.Segments))
 	}
-	if entries[0].T == nil || *entries[0].T != vsnap.Segments[0].StartPTS {
-		t.Errorf("first t = %v, want %d", entries[0].T, vsnap.Segments[0].StartPTS)
+	if entries[0].T == nil || *entries[0].T != vsnap.Segments[0].StartDTS {
+		t.Errorf("first t = %v, want %d", entries[0].T, vsnap.Segments[0].StartDTS)
 	}
 	for i, e := range entries {
 		if e.D != vsnap.Segments[i].DurationTicks {
 			t.Errorf("entry %d d = %d, want %d", i, e.D, vsnap.Segments[i].DurationTicks)
+		}
+		if i > 0 && e.T != nil {
+			t.Errorf("entry %d has a spurious explicit t=%d (timeline should be contiguous)", i, *e.T)
 		}
 	}
 
@@ -213,7 +216,7 @@ func TestBuildOnlyLatestInitVersion(t *testing.T) {
 	var want []int64
 	for _, s := range f.packager.Video().Snapshot().Segments {
 		if s.MapURI == newMap {
-			want = append(want, s.StartPTS)
+			want = append(want, s.StartDTS)
 		}
 	}
 	if len(st.Timeline.S) != len(want) {
@@ -221,6 +224,62 @@ func TestBuildOnlyLatestInitVersion(t *testing.T) {
 	}
 	if len(want) > 0 && (st.Timeline.S[0].T == nil || *st.Timeline.S[0].T != want[0]) {
 		t.Errorf("first t = %v, want %d", st.Timeline.S[0].T, want[0])
+	}
+}
+
+// 带 B 帧时相邻段首样本的 CTS 不同；时间线必须用 DTS（与 tfdt 一致），
+// 不能因为 PTS 差分在段之间写出几十毫秒的假间隙。
+func TestTimelineContiguousWithBFrameCTS(t *testing.T) {
+	f := newFixture(t)
+	writeVideoB(f.video, 0, 80, func(i int) int32 {
+		if i == 50 {
+			return 2089 // 第 3 段首样本比上一段晚 23ms 呈现
+		}
+		return 0
+	})
+	writeAudio(f.audio, 0, 160)
+	waitSegments(t, f.packager.Video(), 3)
+
+	segs := f.packager.Video().Snapshot().Segments
+	if len(segs) < 3 {
+		t.Fatalf("segments = %d, want >= 3", len(segs))
+	}
+	if segs[2].StartPTS == segs[2].StartDTS {
+		t.Fatalf("fixture did not exercise CTS: seg[2] PTS=%d DTS=%d",
+			segs[2].StartPTS, segs[2].StartDTS)
+	}
+
+	b, err := Build(f.packager, testEpoch.Add(10*time.Second), Options{SegmentTarget: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := parseManifest(t, b)
+	video := findAdaptation(m, "video")
+	if video == nil {
+		t.Fatal("no video AdaptationSet")
+	}
+	entries := video.Representations[0].SegmentTemplate.Timeline.S
+	if len(entries) != len(segs) {
+		t.Fatalf("timeline entries = %d, segments = %d", len(entries), len(segs))
+	}
+	if entries[0].T == nil || *entries[0].T != segs[0].StartDTS {
+		t.Fatalf("first t = %v, want %d", entries[0].T, segs[0].StartDTS)
+	}
+
+	// 从首段的显式 t 往后累加 d，每一段的隐含起点都必须等于它的 StartDTS；
+	// 中途不允许再出现显式 t。
+	start := *entries[0].T
+	for i, e := range entries {
+		if i > 0 && e.T != nil {
+			t.Errorf("entry %d: explicit t=%d inside a continuous run", i, *e.T)
+		}
+		if start != segs[i].StartDTS {
+			t.Errorf("entry %d starts at %d, want DTS %d", i, start, segs[i].StartDTS)
+		}
+		if e.D != segs[i].DurationTicks {
+			t.Errorf("entry %d d = %d, want %d", i, e.D, segs[i].DurationTicks)
+		}
+		start += e.D
 	}
 }
 

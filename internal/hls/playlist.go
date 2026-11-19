@@ -21,6 +21,7 @@ type SegmentInfo struct {
 	DurationTicks int64 // 段时长（轨道 timescale），DASH SegmentTimeline 使用
 	PDT           time.Time
 	URI           string
+	StartDTS      int64 // 首样本（合成）DTS，等于段内 tfdt；DASH @t 用它
 	StartPTS      int64 // 轨道时间轴上的首样本 PTS；playlist 不输出，调试/测延迟用
 }
 

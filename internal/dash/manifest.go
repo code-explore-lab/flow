@@ -117,11 +117,12 @@ func Build(p *hls.Packager, now time.Time, opts Options) ([]byte, error) {
 	}
 
 	// 窗口实际覆盖的媒体时间，用于 timeShiftBufferDepth 和延迟上限。
+	// 与 SegmentTimeline 保持同一条（DTS）时间轴。
 	minStart, maxEnd := math.Inf(1), math.Inf(-1)
 	for _, r := range reps {
 		ts := float64(r.track.Timescale())
 		for _, s := range r.segments {
-			start := float64(s.StartPTS) / ts
+			start := float64(s.StartDTS) / ts
 			end := start + float64(segmentDurationTicks(s, r.track.Timescale()))/ts
 			if start < minStart {
 				minStart = start
@@ -212,20 +213,27 @@ func buildAdaptationSet(tr *hls.Track, segs []hls.SegmentInfo, opts Options) Ada
 
 // timeline 把窗口内完整段转成 SegmentTimeline。
 //
-// 第一项一定写 @t；后续段与上一段首尾相接时省略 @t（按 DASH 语义续接），
-// 出现跳变（discontinuity、B 帧 PTS 偏移）时显式写 @t。
+// @t 取段首样本的（合成）DTS，与段内 tfdt 是同一条时间轴；@d 用 Segmenter
+// 给的 DTS 时长，因此同一连续序列的 段首 DTS 严格等于上一段的 DTS 时长之和。
+// 只有首段、discontinuity / init 版本切换、以及时间轴真的跳变时才显式写 @t，
+// 其余按 DASH 语义隐式续接。
+//
+// 不能用 StartPTS：带 B 帧时相邻段首样本的 CTS 不同（PTS = DTS + CTS），
+// 用 PTS 差分会在时间线上留下几十毫秒的假间隙，播放器会当成不连续处理。
 func timeline(segs []hls.SegmentInfo, timescale uint32) []TimelineEntry {
 	out := make([]TimelineEntry, 0, len(segs))
 	var prevEnd int64
 	first := true
-	for _, s := range segs {
+	for i, s := range segs {
 		d := segmentDurationTicks(s, timescale)
 		if d <= 0 {
 			d = 1
 		}
-		t := s.StartPTS
+		t := s.StartDTS
 		entry := TimelineEntry{D: d}
-		if first || t != prevEnd {
+		explicit := first || t != prevEnd ||
+			s.Discontinuity || (i > 0 && s.MapURI != segs[i-1].MapURI)
+		if explicit {
 			tt := t
 			entry.T = &tt
 		}

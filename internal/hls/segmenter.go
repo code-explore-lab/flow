@@ -81,9 +81,12 @@ type Segment struct {
 	MapVersion    int // 该段使用的 init 版本（参数集变化时递增）
 	Duration      time.Duration
 	DurationTicks int64
-	StartPTS      int64
-	PartCount     int
-	Data          []byte // styp + 各 part 字节
+	// StartDTS 是首样本的（合成）DTS，也是段内 tfdt 的取值。P-3 DASH 的
+	// SegmentTimeline @t 用它，保证 MPD 与 fMP4 时间轴一致。
+	StartDTS  int64
+	StartPTS  int64
+	PartCount int
+	Data      []byte // styp + 各 part 字节
 }
 
 // OpenSegment 当前正在生成的父段的快照，供生成 LL-HLS 的 PRELOAD-HINT 等使用。
@@ -512,6 +515,7 @@ func (s *Segmenter) closeSegmentAt(endDTS int64) ([]Event, error) {
 		MapVersion:    s.segMap,
 		Duration:      ticksToDuration(dur, s.timescale),
 		DurationTicks: dur,
+		StartDTS:      s.segStartDTS,
 		StartPTS:      s.segStartPTS,
 		PartCount:     s.segPartCount,
 		Data:          data,

@@ -824,6 +824,7 @@ func (t *Track) handleEvents(events []Event) {
 				DurationTicks: s.DurationTicks,
 				PDT:           t.pdt(s.StartPTS),
 				URI:           t.segmentURI(s.MSN),
+				StartDTS:      s.StartDTS,
 				StartPTS:      s.StartPTS,
 			}
 			t.segments = append(t.segments, &storedSegment{info: info, mapVersion: s.MapVersion, data: s.Data})

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,6 +30,7 @@ import (
 	"flow/internal/source"
 	"flow/internal/srt"
 	"flow/internal/stream"
+	"flow/internal/webrtc"
 )
 
 // 入口：解析参数、搭好媒体源、并发启动 RTSP(:8554) 与 RTMP(:1935) 服务器。
@@ -149,6 +151,18 @@ func main() {
 	srtAddr := flag.String("srt-addr", ":9000", "P-5: SRT listen address (empty disables)")
 	srtPassphrase := flag.String("srt-passphrase", "", "P-5: SRT encryption passphrase, 10-80 chars (empty disables)")
 	srtLatency := flag.Duration("srt-latency", srt.DefaultLatency, "P-5: SRT receive latency")
+	// P-4：WebRTC（WHIP 推 / WHEP 拉）。ICE/DTLS/SRTP 交给 pion/webrtc，
+	// 媒体仍走仓库自己的 RTP 封包/解包，并写进同一个注册表。
+	webrtcAddr := flag.String("webrtc-addr", ":8084", "P-4: WebRTC (WHIP/WHEP) HTTP listen address (empty disables)")
+	webrtcPublicIP := flag.String("webrtc-public-ip", "", "P-4: comma-separated public IPs for NAT 1:1 ICE candidates")
+	webrtcICEServers := flag.String("webrtc-ice-servers", "", "P-4: comma-separated STUN/TURN URLs, e.g. stun:stun.l.google.com:19302")
+	webrtcICEUser := flag.String("webrtc-ice-username", "", "P-4: TURN username applied to all -webrtc-ice-servers")
+	webrtcICEPass := flag.String("webrtc-ice-credential", "", "P-4: TURN credential")
+	webrtcUDPPorts := flag.String("webrtc-udp-ports", "", "P-4: ICE UDP port range min:max (empty = ephemeral)")
+	webrtcCORS := flag.String("webrtc-cors", "", "P-4: allowed CORS origins, comma-separated (\"*\" allows any; empty disables)")
+	webrtcToken := flag.String("webrtc-token", "", "P-4: WHIP/WHEP token, passed as ?token=... or X-Flow-Token (empty disables)")
+	webrtcLoopback := flag.Bool("webrtc-loopback", false, "P-4: include loopback ICE candidates (local browser/tests)")
+	webrtcGatherTimeout := flag.Duration("webrtc-gather-timeout", 3*time.Second, "P-4: ICE gathering timeout for non-trickle answers")
 	flag.Parse()
 	// Exit (2) 在 unix 惯例：**命令行参数错误**；Exit (1) 一般是运行时错误（比如读文件失败）
 	if *authMode != "basic" && *authMode != "digest" {
@@ -559,6 +573,38 @@ func main() {
 		}
 	}
 
+	// P-4：WebRTC（WHIP/WHEP）。推上来的 H.264/Opus 写进同一个注册表，
+	// WHEP 再从注册表订阅，因此与 RTSP/RTMP/HTTP-FLV/SRT/HLS/DASH 互通。
+	var webrtcSrv *webrtc.Server
+	if *webrtcAddr != "" {
+		webrtcSrv = webrtc.New(reg)
+		webrtcSrv.SetMetrics(flowMetrics)
+		webrtcSrv.SetWhitelist(whitelist)
+		webrtcSrv.SetCORS(*webrtcCORS)
+		webrtcSrv.SetToken(*webrtcToken)
+		webrtcSrv.SetIncludeLoopback(*webrtcLoopback)
+		webrtcSrv.SetGatherTimeout(*webrtcGatherTimeout)
+		if err := webrtcSrv.SetPublicIPs(splitCommaList(*webrtcPublicIP)); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		webrtcSrv.SetICEServers(splitCommaList(*webrtcICEServers), *webrtcICEUser, *webrtcICEPass)
+		if *webrtcUDPPorts != "" {
+			minPort, maxPort, err := parsePortRange(*webrtcUDPPorts)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+			if err := webrtcSrv.SetUDPPortRange(minPort, maxPort); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+		}
+		if originMgr != nil {
+			webrtcSrv.SetOrigin(originMgr)
+		}
+	}
+
 	// E-4：Prometheus 指标端点。必须显式开启，且只允许回环地址。
 	if *metricsAddr != "" {
 		if err := startMetrics(ctx, *metricsAddr, flowMetrics, rtspSrv); err != nil {
@@ -590,6 +636,9 @@ func main() {
 	if srtSrv != nil {
 		wg.Add(1)
 	}
+	if webrtcSrv != nil {
+		wg.Add(1)
+	}
 	if hlsEnabled {
 		wg.Add(1)
 	}
@@ -615,6 +664,9 @@ func main() {
 	}
 	if srtSrv != nil {
 		go serve("srt", *srtAddr, srtSrv.Serve)
+	}
+	if webrtcSrv != nil {
+		go serve("webrtc", *webrtcAddr, webrtcSrv.Serve)
 	}
 	if hlsEnabled {
 		go serve("hls", *hlsAddr, hlsSrv.Serve)
@@ -745,6 +797,23 @@ func splitCommaList(s string) []string {
 		}
 	}
 	return out
+}
+
+// parsePortRange 解析 "min:max" 形式的 UDP 端口范围（P-4 ICE）。
+func parsePortRange(s string) (uint16, uint16, error) {
+	minStr, maxStr, ok := strings.Cut(strings.TrimSpace(s), ":")
+	if !ok {
+		return 0, 0, fmt.Errorf("invalid -webrtc-udp-ports %q (want min:max)", s)
+	}
+	minPort, err := strconv.ParseUint(strings.TrimSpace(minStr), 10, 16)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid -webrtc-udp-ports %q: %w", s, err)
+	}
+	maxPort, err := strconv.ParseUint(strings.TrimSpace(maxStr), 10, 16)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid -webrtc-udp-ports %q: %w", s, err)
+	}
+	return uint16(minPort), uint16(maxPort), nil
 }
 
 // loopbackListenAddr 规范化调试/指标端点的监听地址，并强制只监听回环。

@@ -74,6 +74,13 @@ type Registry struct {
 
 	dashBytesInit    atomic.Uint64
 	dashBytesSegment atomic.Uint64
+
+	// P-4 WebRTC：WHIP 推流与 WHEP 拉流的会话数。一个 HTTP 会话就是一条
+	// 已协商的 PeerConnection，不会像 RTSP 那样一条连接多个会话。
+	whipSessions      atomic.Int64
+	whepSessions      atomic.Int64
+	whipSessionsTotal atomic.Uint64
+	whepSessionsTotal atomic.Uint64
 }
 
 // New 创建一个空的注册表。
@@ -148,7 +155,35 @@ func (r *Registry) ActiveViewers() int {
 	if r == nil {
 		return 0
 	}
-	return int(r.sessions.Load() + r.plays.Load() + r.srtPlays.Load())
+	return int(r.sessions.Load() + r.plays.Load() + r.srtPlays.Load() + r.whepSessions.Load())
+}
+
+// IncWebRTCSession 记录一个新建的 WHIP/WHEP 会话（kind: "whip" / "whep"）。
+func (r *Registry) IncWebRTCSession(kind string) {
+	if r == nil {
+		return
+	}
+	switch kind {
+	case "whip":
+		r.whipSessions.Add(1)
+		r.whipSessionsTotal.Add(1)
+	case "whep":
+		r.whepSessions.Add(1)
+		r.whepSessionsTotal.Add(1)
+	}
+}
+
+// DecWebRTCSession 记录一个 WHIP/WHEP 会话关闭。
+func (r *Registry) DecWebRTCSession(kind string) {
+	if r == nil {
+		return
+	}
+	switch kind {
+	case "whip":
+		r.whipSessions.Add(-1)
+	case "whep":
+		r.whepSessions.Add(-1)
+	}
 }
 
 // IncSessionTotal 累计创建过的 RTSP 会话数。
@@ -521,6 +556,14 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	writeMetric(w, "flow_dash_bytes_served_total", "counter", "MPEG-DASH 已发送资源字节数",
 		fmt.Sprintf(`flow_dash_bytes_served_total{kind="init"} %d`, r.dashBytesInit.Load()),
 		fmt.Sprintf(`flow_dash_bytes_served_total{kind="segment"} %d`, r.dashBytesSegment.Load()),
+	)
+	writeMetric(w, "flow_webrtc_sessions", "gauge", "当前活跃 WebRTC 会话数",
+		fmt.Sprintf(`flow_webrtc_sessions{kind="whip"} %d`, r.whipSessions.Load()),
+		fmt.Sprintf(`flow_webrtc_sessions{kind="whep"} %d`, r.whepSessions.Load()),
+	)
+	writeMetric(w, "flow_webrtc_sessions_total", "counter", "累计 WebRTC 会话数",
+		fmt.Sprintf(`flow_webrtc_sessions_total{kind="whip"} %d`, r.whipSessionsTotal.Load()),
+		fmt.Sprintf(`flow_webrtc_sessions_total{kind="whep"} %d`, r.whepSessionsTotal.Load()),
 	)
 	// E-9：抓取时采样当前 goroutine 数，用于观察资源回收后是否回落。
 	writeMetric(w, "flow_goroutines", "gauge", "当前 goroutine 数",

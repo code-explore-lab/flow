@@ -1,14 +1,17 @@
 # flow
 
-Go 实现的 RTSP / RTMP / HTTP-FLV 流媒体服务器：本地文件或 stdin 摄像头作为
-媒体源，三种协议按流名共享同一组源，任一协议推上来的流其他协议都能直接拉取。
+Go 实现的 RTSP / RTMP / HTTP-FLV / HLS / DASH / SRT / WebRTC 流媒体服务器：
+本地文件或 stdin 摄像头作为媒体源，所有协议按流名共享同一组源，任一协议
+推上来的流其他协议都能直接拉取。
 
 ## 构建与运行
 
 ```bash
 go build ./...
 
-go run ./cmd/server        # RTSP :8554，RTMP :1935，HTTP-FLV :8080
+# RTSP :8554，RTMP :1935，HTTP-FLV :8080，HLS :8082，DASH :8083，
+# SRT :9000，WebRTC（WHIP/WHEP）:8084
+go run ./cmd/server
 ```
 
 播放本地测试媒体（`testdata/` 会自动作为兜底源）：
@@ -24,6 +27,23 @@ HTTP-FLV 支持跨域与防盗链：`-httpflv-cors` 配置允许的 Origin，
 `-httpflv-referer` / `-httpflv-require-referer` 校验 Referer，
 `-httpflv-token` 要求 `?token=` 或 `X-Flow-Token` 头；
 `-httpflv-addr` 传空可关闭该服务。
+
+WebRTC（P-4）用 WHIP 推、WHEP 拉，浏览器直接收发 H.264 + Opus，
+传输走 ICE/DTLS/SRTP，媒体进同一个注册表：
+
+```bash
+go run ./cmd/server -webrtc-addr :8084 -webrtc-cors '*' -webrtc-loopback
+
+# 推流：POST application/sdp 到 /whip/<name>，返回 201 + Location + ETag
+# 拉流：POST application/sdp 到 /whep/<name>
+# 结束：DELETE <Location>，trickle：PATCH <Location>
+```
+
+浏览器验收页（正文见 [webrtc.md](webrtc.md)）：
+
+```bash
+python test/e2e/webrtc_e2e.py      # 起服务 + headless Edge 全自动验收
+```
 
 RTMP 回源（从上游拉流并在本地重新发布，供 RTSP/RTMP/HTTP-FLV 下游拉取；
 上游断开后自动重连，下游保持连接）：
@@ -156,7 +176,8 @@ go tool pprof -http=127.0.0.1:8081 cpu.pprof
 | `internal/origin/` | 按需回源/级联（`-origin`）：模板匹配、跨协议拉流、退避重连与本地缓存 |
 | `internal/flvingest/` | FLV tag → `source.Frame`（推流/回源共用），含 PTS/CTS 与跨重连时间戳平移 |
 | `internal/httpflv/`, `internal/flvmux/` | HTTP-FLV 分发与 frame→FLV Tag 封装 |
-| `internal/rtp/` | RTP 打包/解包，H.264 与 AAC |
+| `internal/webrtc/` | WHIP/WHEP 入口：pion 负责 ICE/DTLS/SRTP，媒体桥接共享注册表 |
+| `internal/rtp/` | RTP 打包/解包，H.264、Opus 与 AAC |
 | `internal/rtcp/` | RTCP 包解析：SR/RR、SDES、BYE、NACK |
 | `internal/rtpbuf/`, `internal/plc/` | 接收侧抖动缓冲、丢包补偿 |
 | `internal/flv/`, `internal/media/` | FLV 封装、H.264/AAC 解复用与 SDP |

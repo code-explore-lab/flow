@@ -493,12 +493,14 @@ def free_static_server() -> ThreadingHTTPServer:
     return srv
 
 
-def launch_chrome(chrome: str, profile: str) -> tuple[subprocess.Popen, int]:
+def launch_chrome(chrome: str, profile: str,
+                  extra_args: tuple[str, ...] = ()) -> tuple[subprocess.Popen, int]:
     port = free_port()
     proc = subprocess.Popen(
         [chrome, "--headless=new", "--disable-gpu", "--no-first-run",
          "--no-default-browser-check", "--mute-audio", "--disable-extensions",
          "--autoplay-policy=no-user-gesture-required", "--remote-allow-origins=*",
+         *extra_args,
          f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )

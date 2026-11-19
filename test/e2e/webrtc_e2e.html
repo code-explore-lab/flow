@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flow WebRTC 验收（WHIP 推 / WHEP 拉）</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0f1115; color: #e6e8eb; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 1180px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 6px; }
+  .sub { color: #7d8795; margin: 0 0 16px; font-size: 13px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel { background: #171a21; border: 1px solid #262b35; border-radius: 8px; padding: 12px; }
+  .panel h2 { font-size: 13px; color: #9aa4b2; margin: 0 0 8px; font-weight: 600; }
+  canvas, video { width: 100%; background: #000; border-radius: 6px; aspect-ratio: 16/9; display: block; }
+  dl { display: grid; grid-template-columns: 130px 1fr; gap: 5px 10px; margin: 10px 0 0; }
+  dt { color: #9aa4b2; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #status { margin-top: 14px; color: #9aa4b2; }
+  #error { color: #ff6b6b; white-space: pre-wrap; }
+  .ok { color: #4ade80; } .bad { color: #ff6b6b; }
+  .hint { color: #7d8795; font-size: 12px; margin-top: 12px; }
+  @media (max-width: 860px) { .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>flow WebRTC 验收：WHIP 推 / WHEP 拉</h1>
+  <p class="sub">画布底部有一条黑白条码，编码了绘制时刻（毫秒）；拉流端逐帧解码后与本地时钟相减，
+    得到真实的采集→显示延迟（含编码、网络、抖动缓冲、解码）。</p>
+  <div class="row">
+    <section class="panel">
+      <h2>WHIP 推流（画布时钟源）</h2>
+      <canvas id="src" width="640" height="360"></canvas>
+      <dl>
+        <dt>连接</dt><dd id="pushState">—</dd>
+        <dt>编码</dt><dd id="pushCodec">—</dd>
+        <dt>分辨率</dt><dd id="pushSize">—</dd>
+        <dt>码率</dt><dd id="pushBitrate">—</dd>
+        <dt>RTT</dt><dd id="pushRtt">—</dd>
+        <dt>HTTP</dt><dd id="whipHttp">—</dd>
+      </dl>
+    </section>
+    <section class="panel">
+      <h2>WHEP 拉流</h2>
+      <video id="dst" autoplay muted playsinline></video>
+      <dl>
+        <dt>连接</dt><dd id="playState">—</dd>
+        <dt>编码</dt><dd id="playCodec">—</dd>
+        <dt>分辨率</dt><dd id="playSize">—</dd>
+        <dt>解码帧</dt><dd id="playFrames">—</dd>
+        <dt>抖动缓冲</dt><dd id="playJitter">—</dd>
+        <dt>端到端延迟</dt><dd id="playLatency">—</dd>
+        <dt>p50 / p95 / max</dt><dd id="playLatencyStats">—</dd>
+      </dl>
+    </section>
+  </div>
+  <div id="status">starting…</div>
+  <div id="error"></div>
+  <p class="hint">脚本可通过 <code>window.__flow.state()</code> 读取状态、<code>window.__flow.stop()</code> 结束会话。</p>
+</main>
+<script>
+(() => {
+  "use strict";
+
+  const q = new URLSearchParams(location.search);
+  const BASE = (q.get("base") || "").replace(/\/+$/, "");
+  const NAME = q.get("name") || "live/e2e";
+  const TOKEN = q.get("token") || "";
+  const WITH_AUDIO = q.get("audio") !== "0";
+  const W = 640, H = 360;
+  // 条码布局：32 bit 毫秒时间戳 + 8 bit CRC，每 bit 12px，居中放在画面底部。
+  // CRC 用来丢弃解码误码的帧，否则单个比特翻转会造成几百毫秒的假延迟。
+  const BITS = 40, BITW = 12, STRIPX = (W - 40 * 12) / 2, STRIPY = 300, STRIPH = 44;
+  const MAX_SAMPLES = 300;
+
+  const $ = id => document.getElementById(id);
+  const srcCanvas = $("src");
+  const ctx = srcCanvas.getContext("2d");
+  const dstVideo = $("dst");
+  const measure = document.createElement("canvas");
+  measure.width = W; measure.height = H;
+  const mctx = measure.getContext("2d", { willReadFrequently: true });
+
+  const state = {
+    status: "starting",
+    error: "",
+    http: {},
+    push: { state: "new", connected: false, codec: "", bytesSent: 0, framesEncoded: 0, rttMs: null },
+    play: {
+      state: "new", connected: false, codec: "", framesDecoded: 0, framesReceived: 0,
+      packetsLost: 0, jitterMs: null, jitterBufferMs: null, rttMs: null,
+      width: 0, height: 0,
+      latency: { count: 0, p50: null, p95: null, max: null, last: null, samples: [] },
+    },
+    audio: { enabled: WITH_AUDIO, push: false, play: false },
+  };
+
+  let pcPush = null, pcPlay = null, stopTracks = [];
+  let whipLocation = "", whipETag = "", whepLocation = "", whepETag = "";
+  let stopped = false;
+
+  // ------------------------------------------------------------ 画布时间码
+
+  const t0 = performance.now();
+  let lastDrawnMs = 0;
+
+  function draw() {
+    if (stopped) return;
+    const now = Date.now();
+    lastDrawnMs = now;
+    const phase = ((performance.now() - t0) / 1000) % 4;
+
+    // 上半部分做持续运动，保证编码器始终有实时内容。
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, `hsl(${(phase * 90) % 360} 60% 22%)`);
+    g.addColorStop(1, `hsl(${(phase * 90 + 120) % 360} 60% 12%)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    for (let i = 0; i < 7; i++) {
+      const x = ((phase * 220 + i * 97) % (W + 80)) - 80;
+      ctx.fillRect(x, 24 + i * 22, 56, 12);
+    }
+
+    const ms = String(now % 1000).padStart(3, "0");
+    const hms = new Date(now).toISOString().slice(11, 19);
+    ctx.fillStyle = "#fff";
+    ctx.font = "600 44px ui-monospace, monospace";
+    ctx.fillText(`${hms}.${ms}`, 40, 120);
+    ctx.font = "400 16px ui-monospace, monospace";
+    ctx.fillStyle = "#c9d2de";
+    ctx.fillText("WHIP → flow → WHEP", 40, 148);
+
+    // 条码：白 = 1，黑 = 0，MSB 在前；前 32 位是时间戳，后 8 位是 CRC-8。
+    ctx.fillStyle = "#000";
+    ctx.fillRect(STRIPX - 8, STRIPY - 4, BITS * BITW + 16, STRIPH);
+    const value = now >>> 0;
+    const crc = crc8(value);
+    for (let i = 0; i < BITS; i++) {
+      // 前 32 位是时间戳，后 8 位是 CRC；JS 位运算只有 32 位，分段取。
+      const bit = i < 32 ? (value >>> (31 - i)) & 1 : (crc >>> (39 - i)) & 1;
+      ctx.fillStyle = bit ? "#fff" : "#000";
+      ctx.fillRect(STRIPX + i * BITW + 2, STRIPY + 4, BITW - 4, STRIPH - 8);
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  // 对 4 字节（MSB 在前）做 CRC-8，多项式 0x07。
+  function crc8(value) {
+    let crc = 0;
+    for (let shift = 24; shift >= 0; shift -= 8) {
+      crc ^= (value >>> shift) & 0xff;
+      for (let b = 0; b < 8; b++) {
+        crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+      }
+    }
+    return crc;
+  }
+
+  // 解码一行像素里的条码；边缘模糊或 CRC 不匹配的帧返回 null。
+  function decodeStamp(row) {
+    let value = 0, crc = 0, ambiguous = 0;
+    for (let i = 0; i < BITS; i++) {
+      const o = Math.floor(i * BITW + BITW / 2) * 4;
+      const luma = 0.299 * row[o] + 0.587 * row[o + 1] + 0.114 * row[o + 2];
+      if (luma > 96 && luma < 168) ambiguous++;
+      const bit = luma >= 132 ? 1 : 0;
+      if (i < 32) value = (value << 1) | bit;
+      else crc = (crc << 1) | bit;
+    }
+    if (ambiguous > 2) return null;
+    value = value >>> 0;
+    return crc === crc8(value) ? value : null;
+  }
+
+  // ------------------------------------------------------------ HTTP
+
+  function url(path) {
+    return BASE + path + (TOKEN ? (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN) : "");
+  }
+
+  async function postSDP(kind, sdp) {
+    const res = await fetch(url(`/${kind}/${NAME}`), {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: sdp,
+    });
+    const body = await res.text();
+    if (res.status !== 201) throw new Error(`POST /${kind}/${NAME} -> ${res.status}: ${body.slice(0, 300)}`);
+    return { answer: body, location: res.headers.get("Location") || "", etag: res.headers.get("ETag") || "" };
+  }
+
+  async function deleteSession(location, etag) {
+    if (!location) return 0;
+    try {
+      const res = await fetch(BASE + location, {
+        method: "DELETE",
+        headers: etag ? { "If-Match": etag } : {},
+      });
+      return res.status;
+    } catch {
+      return -1;
+    }
+  }
+
+  function waitGather(pc, ms = 3000) {
+    if (pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise(resolve => {
+      const timer = setTimeout(done, ms);
+      function done() { clearTimeout(timer); pc.removeEventListener("icegatheringstatechange", check); resolve(); }
+      function check() { if (pc.iceGatheringState === "complete") done(); }
+      pc.addEventListener("icegatheringstatechange", check);
+    });
+  }
+
+  // 从 answer 的 m=<kind> 段里取协商后的编码（只列实际选中的 payload type）。
+  function sdpCodecs(sdp, kind) {
+    const pts = new Set();
+    const names = {};
+    let inMedia = false;
+    for (const line of sdp.split(/\r?\n/)) {
+      if (line.startsWith("m=")) {
+        inMedia = line.startsWith("m=" + kind + " ");
+        if (inMedia) for (const pt of line.split(" ").slice(3)) pts.add(pt);
+        continue;
+      }
+      if (!inMedia) continue;
+      const m = line.match(/^a=rtpmap:(\d+) ([^/]+)\//);
+      if (m) names[m[1]] = m[2].toLowerCase();
+    }
+    return [...pts].filter(pt => names[pt]).map(pt => names[pt]);
+  }
+
+  function negotiated(answer) {
+    const out = [];
+    for (const kind of ["video", "audio"]) {
+      const c = sdpCodecs(answer, kind);
+      if (c.length) out.push(`${kind}: ${[...new Set(c)].join(",")}`);
+    }
+    return out.join(" | ");
+  }
+
+  // ------------------------------------------------------------ 推流
+
+  async function publish(stream) {
+    pcPush = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    pcPush.onconnectionstatechange = () => {
+      state.push.state = pcPush.connectionState;
+      state.push.connected = pcPush.connectionState === "connected";
+    };
+    for (const track of stream.getTracks()) {
+      state.audio.push = state.audio.push || track.kind === "audio";
+      pcPush.addTrack(track, stream);
+    }
+    const offer = await pcPush.createOffer();
+    await pcPush.setLocalDescription(offer);
+    await waitGather(pcPush);
+    const r = await postSDP("whip", pcPush.localDescription.sdp);
+    whipLocation = r.location; whipETag = r.etag;
+    state.http.whip = { status: 201, location: r.location, etag: r.etag };
+    await pcPush.setRemoteDescription({ type: "answer", sdp: r.answer });
+    state.push.codec = negotiated(r.answer);
+  }
+
+  // ------------------------------------------------------------ 拉流
+
+  async function play() {
+    pcPlay = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    pcPlay.onconnectionstatechange = () => {
+      state.play.state = pcPlay.connectionState;
+      state.play.connected = pcPlay.connectionState === "connected";
+    };
+    pcPlay.addTransceiver("video", { direction: "recvonly" });
+    if (WITH_AUDIO) pcPlay.addTransceiver("audio", { direction: "recvonly" });
+
+    const remote = new MediaStream();
+    pcPlay.ontrack = ev => {
+      state.audio.play = state.audio.play || ev.track.kind === "audio";
+      if (ev.track.kind !== "video") return;
+      remote.addTrack(ev.track);
+      dstVideo.srcObject = remote;
+      dstVideo.play().catch(() => {});
+    };
+
+    const offer = await pcPlay.createOffer();
+    await pcPlay.setLocalDescription(offer);
+    await waitGather(pcPlay);
+    const r = await postSDP("whep", pcPlay.localDescription.sdp);
+    whepLocation = r.location; whepETag = r.etag;
+    state.http.whep = { status: 201, location: r.location, etag: r.etag };
+    try {
+      await pcPlay.setRemoteDescription({ type: "answer", sdp: r.answer });
+    } catch (e) {
+      throw new Error(`${e.message}\n--- answer ---\n${r.answer}`);
+    }
+
+    state.play.codec = negotiated(r.answer);
+
+    // 每个解码帧回调一次，直接从解码后的画面里读时间码。
+    const loop = () => {
+      if (stopped) return;
+      mctx.drawImage(dstVideo, 0, 0, W, H);
+      const row = mctx.getImageData(STRIPX, STRIPY + Math.floor(STRIPH / 2), BITS * BITW, 1).data;
+      const stamp = decodeStamp(row);
+      if (stamp !== null && stamp > 0) {
+        const delay = (Date.now() - stamp) >>> 0;
+        // 忽略误码样本；延迟超过 5s 一定不是有效测量。
+        if (delay < 5000) {
+          const s = state.play.latency.samples;
+          s.push(delay);
+          if (s.length > MAX_SAMPLES) s.shift();
+          state.play.latency.last = delay;
+          updateLatency();
+        }
+      }
+      dstVideo.requestVideoFrameCallback(loop);
+    };
+    dstVideo.requestVideoFrameCallback(loop);
+  }
+
+  function updateLatency() {
+    const s = [...state.play.latency.samples].sort((a, b) => a - b);
+    state.play.latency.count = s.length;
+    state.play.latency.p50 = s.length ? s[Math.floor(s.length * 0.5)] : null;
+    state.play.latency.p95 = s.length ? s[Math.min(s.length - 1, Math.floor(s.length * 0.95))] : null;
+    state.play.latency.max = s.length ? s[s.length - 1] : null;
+    $("playLatency").textContent = state.play.latency.last === null ? "—" : `${state.play.latency.last} ms`;
+    $("playLatencyStats").textContent = s.length
+      ? `${state.play.latency.p50} / ${state.play.latency.p95} / ${state.play.latency.max} ms`
+      : "—";
+  }
+
+  // ------------------------------------------------------------ 统计轮询
+
+  async function pollStats() {
+    if (stopped) return;
+    try {
+      if (pcPush && pcPush.connectionState !== "closed") {
+        const stats = await pcPush.getStats();
+        stats.forEach(r => {
+          if (r.type === "outbound-rtp" && r.kind === "video") {
+            state.push.bytesSent = r.bytesSent || 0;
+            state.push.framesEncoded = r.framesEncoded || 0;
+          }
+          if (r.type === "candidate-pair" && r.state === "succeeded" && r.currentRoundTripTime != null) {
+            state.push.rttMs = Math.round(r.currentRoundTripTime * 1000);
+          }
+        });
+      }
+      if (pcPlay && pcPlay.connectionState !== "closed") {
+        const stats = await pcPlay.getStats();
+        stats.forEach(r => {
+          if (r.type === "inbound-rtp" && r.kind === "video") {
+            state.play.framesDecoded = r.framesDecoded || 0;
+            state.play.framesReceived = r.framesReceived || 0;
+            state.play.packetsLost = r.packetsLost || 0;
+            state.play.jitterMs = r.jitter != null ? Math.round(r.jitter * 1000) : null;
+            if (r.jitterBufferDelay != null && r.jitterBufferEmittedCount) {
+              state.play.jitterBufferMs = Math.round((r.jitterBufferDelay / r.jitterBufferEmittedCount) * 1000);
+            }
+            state.play.width = dstVideo.videoWidth || 0;
+            state.play.height = dstVideo.videoHeight || 0;
+          }
+          if (r.type === "candidate-pair" && r.state === "succeeded" && r.currentRoundTripTime != null) {
+            state.play.rttMs = Math.round(r.currentRoundTripTime * 1000);
+          }
+        });
+      }
+    } catch { /* 关闭中的统计不可用 */ }
+    render();
+    setTimeout(pollStats, 500);
+  }
+
+  function render() {
+    const fmt = (v, unit) => (v === null || v === undefined ? "—" : `${v}${unit || ""}`);
+    $("pushState").textContent = state.push.state;
+    $("pushState").className = state.push.connected ? "ok" : "bad";
+    $("pushCodec").textContent = state.push.codec || "—";
+    $("pushSize").textContent = `${W}x${H}`;
+    $("pushBitrate").textContent = state.push.framesEncoded
+      ? `${Math.round((state.push.bytesSent * 8) / 1000)} kbps` : "—";
+    $("pushRtt").textContent = fmt(state.push.rttMs, " ms");
+    $("whipHttp").textContent = state.http.whip
+      ? `${state.http.whip.status} · ${state.http.whip.location || "-"}` : "—";
+    $("playState").textContent = state.play.state;
+    $("playState").className = state.play.connected ? "ok" : "bad";
+    $("playCodec").textContent = state.play.codec || "—";
+    $("playSize").textContent = state.play.width ? `${state.play.width}x${state.play.height}` : "—";
+    $("playFrames").textContent = String(state.play.framesDecoded);
+    $("playJitter").textContent = fmt(state.play.jitterBufferMs, " ms");
+  }
+
+  // ------------------------------------------------------------ 启动
+
+  async function start() {
+    try {
+      draw();
+      const stream = srcCanvas.captureStream(30);
+      if (WITH_AUDIO) {
+        const ac = new AudioContext();
+        await ac.resume().catch(() => {});
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        gain.gain.value = 0.05;
+        const dst = ac.createMediaStreamDestination();
+        osc.frequency.value = 440;
+        osc.connect(gain).connect(dst);
+        osc.start();
+        for (const track of dst.stream.getAudioTracks()) stream.addTrack(track);
+        stopTracks.push(() => { try { osc.stop(); } catch {} ac.close(); });
+      }
+
+      await publish(stream);
+      $("status").textContent = "WHIP 已推流，等待连接…";
+      await play();
+      state.status = "playing";
+      $("status").textContent = "WHIP 推流 + WHEP 拉流已建立";
+      pollStats();
+    } catch (e) {
+      state.status = "error";
+      state.error = String(e && e.stack || e);
+      $("error").textContent = state.error;
+      $("status").textContent = "failed";
+    }
+  }
+
+  window.__flow = {
+    state() {
+      const s = JSON.parse(JSON.stringify(state));
+      s.latency = {
+        count: state.play.latency.count, p50: state.play.latency.p50,
+        p95: state.play.latency.p95, max: state.play.latency.max,
+        last: state.play.latency.last,
+      };
+      s.http.delete = state.http.delete || null;
+      return s;
+    },
+    async stop() {
+      stopped = true;
+      state.http.delete = {
+        whip: await deleteSession(whipLocation, whipETag),
+        whep: await deleteSession(whepLocation, whepETag),
+      };
+      for (const fn of stopTracks) { try { fn(); } catch {} }
+      if (pcPush) pcPush.close();
+      if (pcPlay) pcPlay.close();
+      dstVideo.srcObject = null;
+      return state.http.delete;
+    },
+    // 供探针使用：直接拿到最近的延迟样本（state() 里不返回完整数组）。
+    samples() { return [...state.play.latency.samples]; },
+  };
+
+  start();
+})();
+</script>
+</body>
+</html>

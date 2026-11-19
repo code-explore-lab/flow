@@ -18,6 +18,7 @@ type SegmentInfo struct {
 	Discontinuity bool
 	MapURI        string
 	Duration      float64
+	DurationTicks int64 // 段时长（轨道 timescale），DASH SegmentTimeline 使用
 	PDT           time.Time
 	URI           string
 	StartPTS      int64 // 轨道时间轴上的首样本 PTS；playlist 不输出，调试/测延迟用

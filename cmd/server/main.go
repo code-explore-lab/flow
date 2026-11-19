@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/dash"
 	"flow/internal/discovery"
 	"flow/internal/hls"
 	"flow/internal/httpflv"
@@ -134,6 +135,15 @@ func main() {
 	hlsReferer := flag.String("hls-referer", "", "P-2: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
 	hlsRequireReferer := flag.Bool("hls-require-referer", false, "P-2: reject requests without a Referer when -hls-referer is set")
 	hlsToken := flag.String("hls-token", "", "P-2: playback token, passed as ?token=... or X-Flow-Token (empty disables)")
+	// P-3：MPEG-DASH 分发。复用 P-2 的切片管线，因此切片参数仍由 -hls-* 控制；
+	// 这里只新增端口、MPD 刷新周期和安全策略。
+	dashAddr := flag.String("dash-addr", ":8083", "P-3: MPEG-DASH listen address (empty disables)")
+	dashUpdate := flag.Duration("dash-update", 2*time.Second, "P-3: MPD minimumUpdatePeriod")
+	dashDelay := flag.Duration("dash-delay", 0, "P-3: MPD suggestedPresentationDelay (0 = 2x -hls-segment)")
+	dashCORS := flag.String("dash-cors", "", "P-3: allowed CORS origins, comma-separated (\"*\" allows any; empty disables CORS headers)")
+	dashReferer := flag.String("dash-referer", "", "P-3: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
+	dashRequireReferer := flag.Bool("dash-require-referer", false, "P-3: reject requests without a Referer when -dash-referer is set")
+	dashToken := flag.String("dash-token", "", "P-3: playback token, appended to MPD segment URLs (empty disables)")
 	// P-5：SRT 推拉流。SRT 里承载 MPEG-TS，与注册表互通后 RTSP/RTMP/
 	// HTTP-FLV 都能拉同一路流。
 	srtAddr := flag.String("srt-addr", ":9000", "P-5: SRT listen address (empty disables)")
@@ -194,6 +204,10 @@ func main() {
 		os.Exit(2)
 	}
 	if err := validateHLSOptions(*hlsSegment, *hlsPart, *hlsWindow, *hlsIdle, *hlsMaxBytes); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := validateDashOptions(*dashUpdate, *dashDelay); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
@@ -490,14 +504,15 @@ func main() {
 
 	// P-2：HLS/LL-HLS 复用同一份注册表与本地回退源。默认 :8082；
 	// -hls-addr 为空时整体关闭（其它 -hls-* 参数仍做校验）。
+	//
+	// P-3：DASH 直接复用这个 hls.Server 的 manager。只要 HLS 或 DASH 有一个
+	// 开启，就构造包装宿主；HLS 关闭时它不监听端口，只负责按需切片。
+	hlsEnabled := *hlsAddr != ""
+	dashEnabled := *dashAddr != ""
 	var hlsSrv *hls.Server
-	if *hlsAddr != "" {
+	if hlsEnabled || dashEnabled {
 		hlsSrv = hls.New(reg, video, audio)
 		hlsSrv.SetMetrics(flowMetrics)
-		hlsSrv.SetWhitelist(whitelist)
-		hlsSrv.SetCORS(*hlsCORS)
-		hlsSrv.SetReferer(*hlsReferer, *hlsRequireReferer)
-		hlsSrv.SetToken(*hlsToken)
 		hlsSrv.SetPackaging(hls.Options{
 			SegmentTarget: *hlsSegment,
 			PartTarget:    *hlsPart,
@@ -507,6 +522,28 @@ func main() {
 		if originMgr != nil {
 			hlsSrv.SetOrigin(originMgr)
 		}
+	}
+	if hlsEnabled {
+		hlsSrv.SetWhitelist(whitelist)
+		hlsSrv.SetCORS(*hlsCORS)
+		hlsSrv.SetReferer(*hlsReferer, *hlsRequireReferer)
+		hlsSrv.SetToken(*hlsToken)
+	}
+
+	// P-3：MPEG-DASH。默认 :8083；与 HLS 共用同一份切片结果。
+	var dashSrv *dash.Server
+	if dashEnabled {
+		dashSrv = dash.New(hlsSrv)
+		dashSrv.SetMetrics(flowMetrics)
+		dashSrv.SetWhitelist(whitelist)
+		dashSrv.SetCORS(*dashCORS)
+		dashSrv.SetReferer(*dashReferer, *dashRequireReferer)
+		dashSrv.SetToken(*dashToken)
+		dashSrv.SetManifestOptions(dash.Options{
+			MinimumUpdatePeriod:        *dashUpdate,
+			SegmentTarget:              *hlsSegment,
+			SuggestedPresentationDelay: *dashDelay,
+		})
 	}
 
 	// P-5：SRT 服务器。与其它协议共享注册表和指标；配置了口令后只接受
@@ -553,7 +590,10 @@ func main() {
 	if srtSrv != nil {
 		wg.Add(1)
 	}
-	if hlsSrv != nil {
+	if hlsEnabled {
+		wg.Add(1)
+	}
+	if dashEnabled {
 		wg.Add(1)
 	}
 	wg.Add(len(pulls))
@@ -576,8 +616,11 @@ func main() {
 	if srtSrv != nil {
 		go serve("srt", *srtAddr, srtSrv.Serve)
 	}
-	if hlsSrv != nil {
+	if hlsEnabled {
 		go serve("hls", *hlsAddr, hlsSrv.Serve)
+	}
+	if dashEnabled {
+		go serve("dash", *dashAddr, dashSrv.Serve)
 	}
 	// T-9：每个上游一路 goroutine，ctx 取消后自动退出并注销本地流。
 	for _, cl := range pulls {
@@ -606,6 +649,17 @@ func validateHLSOptions(segment, part time.Duration, window int, idle time.Durat
 	}
 	if maxBytes < 0 {
 		return errors.New("invalid -hls-max-bytes (must be >= 0)")
+	}
+	return nil
+}
+
+// validateDashOptions 校验 P-3 的 MPD 参数。
+func validateDashOptions(update, delay time.Duration) error {
+	if update <= 0 {
+		return errors.New("invalid -dash-update (must be > 0)")
+	}
+	if delay < 0 {
+		return errors.New("invalid -dash-delay (must be >= 0)")
 	}
 	return nil
 }

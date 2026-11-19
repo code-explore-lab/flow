@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flow MPEG-DASH 播放验收（dash.js）</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0f1115; color: #e6e8eb; font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 16px; }
+  .row { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; }
+  video { width: 100%; background: #000; border-radius: 8px; aspect-ratio: 16/9; }
+  .panel { background: #171a21; border: 1px solid #262b35; border-radius: 8px; padding: 12px; }
+  .panel h2 { font-size: 13px; color: #9aa4b2; margin: 0 0 8px; font-weight: 600; }
+  dl { display: grid; grid-template-columns: 150px 1fr; gap: 6px 10px; margin: 0; }
+  dt { color: #9aa4b2; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #status { margin-top: 10px; color: #9aa4b2; min-height: 20px; }
+  #error { color: #ff6b6b; white-space: pre-wrap; }
+  #clock { font-size: 28px; font-variant-numeric: tabular-nums; letter-spacing: 1px; }
+  .hint { color: #7d8795; font-size: 12px; margin-top: 10px; }
+  input[type=text] { width: 100%; box-sizing: border-box; background: #0f1115; color: #e6e8eb;
+    border: 1px solid #303642; border-radius: 6px; padding: 8px; }
+  @media (max-width: 820px) { .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>flow MPEG-DASH 播放验收（dash.js）</h1>
+  <p><input id="src" type="text" spellcheck="false" placeholder="manifest.mpd URL"></p>
+  <div class="row">
+    <div>
+      <video id="video" controls autoplay muted playsinline></video>
+      <div id="status">loading…</div>
+      <div id="error"></div>
+    </div>
+    <aside class="panel">
+      <h2>播放状态</h2>
+      <dl>
+        <dt>dash.js</dt><dd id="version">—</dd>
+        <dt>live latency</dt><dd id="latency">—</dd>
+        <dt>buffer</dt><dd id="buffer">—</dd>
+        <dt>throughput</dt><dd id="throughput">—</dd>
+        <dt>fragments</dt><dd id="fragments">0</dd>
+        <dt>currentTime</dt><dd id="currentTime">—</dd>
+      </dl>
+      <h2 style="margin-top:14px">本机时钟</h2>
+      <div id="clock">--:--:--</div>
+      <p class="hint">用手机拍屏幕可测 glass-to-glass；脚本验收只看
+        <code>window.__flow.state().status === "playing"</code> 且已播放 &gt; 2s。</p>
+    </aside>
+  </div>
+</main>
+
+<script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+<script>
+  // 离线验收时可以把 dash.all.min.js 放到同目录；CDN 不可达则回退到本地副本。
+  if (!window.dashjs) {
+    document.write('<script src="dash.all.min.js"><\/script>');
+  }
+</script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const video = $('video');
+  const params = new URLSearchParams(location.search);
+  const src = params.get('src') || 'http://127.0.0.1:8083/dash/live/demo/manifest.mpd';
+  const debug = params.get('debug') === '1';
+  $('src').value = src;
+
+  // ?debug=1 时把 dash.js 自己的日志也收进探针，便于定位解析/能力问题。
+  const consoleLogs = [];
+  if (debug) {
+    ['log', 'info', 'warn', 'error'].forEach((level) => {
+      const orig = console[level].bind(console);
+      console[level] = (...args) => {
+        consoleLogs.push({
+          level,
+          msg: args.map((v) => {
+            if (typeof v === 'string') return v;
+            try { return JSON.stringify(v); } catch (e) { return String(v); }
+          }).join(' '),
+        });
+        if (consoleLogs.length > 300) consoleLogs.shift();
+        orig(...args);
+      };
+    });
+  }
+
+  const set = (id, v) => { $(id).textContent = v; };
+  const fmt = (n, digits = 2) => Number.isFinite(n) ? n.toFixed(digits) : '—';
+  const bits = (n) => n > 0 ? (n / 1000).toFixed(0) + ' kbps' : '—';
+
+  // 自动化探针读这里；status 只在真正开始出画后才是 playing。
+  const flow = {
+    status: 'loading',
+    error: '',
+    fragments: 0,
+    played: 0,          // 累计播放秒数（currentTime 增量之和）
+    lastTime: 0,
+    started: false,
+    logs: [],           // 最近事件/请求，供自动化定位失败原因
+    state() {
+      const latency = player && player.getCurrentLiveLatency ? player.getCurrentLiveLatency() : NaN;
+      const buffer = player && player.getBufferLength ? player.getBufferLength('video') : NaN;
+      const throughput = player && player.getAverageThroughput ? player.getAverageThroughput('video') : NaN;
+      return {
+        status: flow.status,
+        error: flow.error,
+        src: src,
+        currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+        buffered: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
+        played: flow.played,
+        paused: video.paused,
+        fragments: flow.fragments,
+        latencySeconds: Number.isFinite(latency) ? latency : null,
+        bufferSeconds: Number.isFinite(buffer) ? buffer : null,
+        throughputKbps: Number.isFinite(throughput) ? throughput / 1000 : null,
+        width: video.videoWidth,
+        height: video.videoHeight,
+        volume: video.volume,
+        logs: flow.logs.slice(-20),
+        console: debug ? consoleLogs.slice(-40) : undefined,
+      };
+    },
+  };
+  window.__flow = flow;
+
+  const log = (entry) => {
+    flow.logs.push(entry);
+    if (flow.logs.length > 80) flow.logs.shift();
+  };
+  window.addEventListener('error', (e) => log({ at: 'window', msg: String(e.message) }));
+  window.addEventListener('unhandledrejection',
+    (e) => log({ at: 'rejection', msg: String((e.reason && e.reason.message) || e.reason) }));
+
+  // 记录请求结果：dash.js 的失败往往只体现在 XHR 状态码上。
+  const xhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this.__flowUrl = String(url);
+    this.addEventListener('loadend', () => {
+      log({ at: 'xhr', url: this.__flowUrl, status: this.status });
+    });
+    return xhrOpen.call(this, method, url, ...rest);
+  };
+
+  setInterval(() => {
+    $('clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }, 250);
+
+  function fail(msg) {
+    flow.status = 'error';
+    flow.error = msg;
+    set('error', msg);
+    set('status', 'error');
+    document.title = 'flow DASH — error';
+  }
+
+  if (!window.dashjs) {
+    fail('dash.js 未加载：CDN 不可达且同目录没有 dash.all.min.js。');
+    return;
+  }
+  // 部分 Chrome 构建不含 H.264/AAC；dash.js 只会表现为 "No streams to play"。
+  if (typeof MediaSource !== 'function' ||
+      !MediaSource.isTypeSupported('video/mp4; codecs="avc1.64001e"')) {
+    fail('当前浏览器不支持 H.264 MSE（换 Edge/Safari，或用带专有编解码器的 Chrome）。');
+    return;
+  }
+
+  set('version', dashjs.Version || 'dash.js');
+
+  let player = null;
+  try {
+    player = dashjs.MediaPlayer().create();
+  } catch (e) {
+    fail('创建 dash.js player 失败: ' + e);
+    return;
+  }
+
+  const E = dashjs.MediaPlayer.events;
+  player.on(E.MANIFEST_LOADED, () => {
+    set('status', 'manifest loaded, buffering…');
+  });
+  player.on(E.STREAM_INITIALIZED, () => {
+    set('status', 'stream initialized, buffering…');
+  });
+  player.on(E.FRAGMENT_LOADING_COMPLETED, () => {
+    flow.fragments += 1;
+    set('fragments', String(flow.fragments));
+  });
+  player.on(E.PLAYBACK_PLAYING, () => {
+    flow.started = true;
+    set('status', 'playing');
+  });
+  player.on(E.PLAYBACK_PAUSED, () => {
+    if (flow.status === 'playing') set('status', 'paused');
+  });
+  player.on(E.PLAYBACK_TIME_UPDATED, () => {
+    const t = video.currentTime;
+    if (t > flow.lastTime) flow.played += Math.min(t - flow.lastTime, 1);
+    flow.lastTime = t;
+    if (flow.played > 2 && flow.status !== 'error') flow.status = 'playing';
+  });
+  player.on(E.ERROR, (e) => {
+    const err = (e && e.error) || {};
+    const msg = `${err.code || ''} ${err.message || ''} ${err.data || ''}`.trim();
+    log({ at: 'dash', msg: msg, fatal: Boolean(e && e.fatal) });
+    // 非致命错误只展示，不改变 status；致命错误保留给人工验收。
+    if (err.code === 'mediasource' || err.code === 'capability') fail(msg);
+    else set('error', msg);
+  });
+
+  if (debug) {
+    player.updateSettings({ debug: { logLevel: dashjs.Debug.LOG_LEVEL_DEBUG } });
+  }
+
+  player.initialize(video, src, true);
+  setInterval(() => {
+    const s = flow.state();
+    set('latency', s.latencySeconds === null ? '—' : fmt(s.latencySeconds) + ' s');
+    set('buffer', s.bufferSeconds === null ? '—' : fmt(s.bufferSeconds) + ' s');
+    set('throughput', bits(s.throughputKbps));
+    set('fragments', String(s.fragments));
+    set('currentTime', fmt(s.currentTime));
+    if (flow.status === 'playing') document.title = `flow DASH — ${fmt(s.currentTime)}s`;
+  }, 500);
+})();
+</script>
+</body>
+</html>

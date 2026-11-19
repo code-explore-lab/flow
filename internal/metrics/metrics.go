@@ -65,6 +65,15 @@ type Registry struct {
 	hlsSegmentsAudio atomic.Uint64
 	hlsPartsVideo    atomic.Uint64
 	hlsPartsAudio    atomic.Uint64
+
+	// P-3 DASH：HTTP 请求/字节。切片统计复用上面的 flow_hls_*（同一份 packager）。
+	dashRequestsManifest atomic.Uint64
+	dashRequestsInit     atomic.Uint64
+	dashRequestsSegment  atomic.Uint64
+	dashRequestsUTC      atomic.Uint64
+
+	dashBytesInit    atomic.Uint64
+	dashBytesSegment atomic.Uint64
 }
 
 // New 创建一个空的注册表。
@@ -375,6 +384,38 @@ func (r *Registry) IncHLSPart(track string) {
 	}
 }
 
+// IncDashRequest 按资源类型累计 MPEG-DASH HTTP 请求数。
+// kind: manifest / init / segment / utc。
+func (r *Registry) IncDashRequest(kind string) {
+	if r == nil {
+		return
+	}
+	switch kind {
+	case "manifest":
+		r.dashRequestsManifest.Add(1)
+	case "init":
+		r.dashRequestsInit.Add(1)
+	case "segment":
+		r.dashRequestsSegment.Add(1)
+	case "utc":
+		r.dashRequestsUTC.Add(1)
+	}
+}
+
+// AddDashBytes 按资源类型累计 MPEG-DASH 已发送字节数。
+// kind: init / segment。
+func (r *Registry) AddDashBytes(kind string, n int) {
+	if r == nil || n <= 0 {
+		return
+	}
+	switch kind {
+	case "init":
+		r.dashBytesInit.Add(uint64(n))
+	case "segment":
+		r.dashBytesSegment.Add(uint64(n))
+	}
+}
+
 // writeMetric 写一个指标的 HELP/TYPE 头和若干样本行。
 func writeMetric(w io.Writer, name, typ, help string, lines ...string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
@@ -470,6 +511,16 @@ func (r *Registry) WritePrometheus(w io.Writer) {
 	writeMetric(w, "flow_hls_parts_total", "counter", "HLS 产出的 part 数",
 		fmt.Sprintf(`flow_hls_parts_total{track="video"} %d`, r.hlsPartsVideo.Load()),
 		fmt.Sprintf(`flow_hls_parts_total{track="audio"} %d`, r.hlsPartsAudio.Load()),
+	)
+	writeMetric(w, "flow_dash_requests_total", "counter", "MPEG-DASH HTTP 请求数",
+		fmt.Sprintf(`flow_dash_requests_total{kind="manifest"} %d`, r.dashRequestsManifest.Load()),
+		fmt.Sprintf(`flow_dash_requests_total{kind="init"} %d`, r.dashRequestsInit.Load()),
+		fmt.Sprintf(`flow_dash_requests_total{kind="segment"} %d`, r.dashRequestsSegment.Load()),
+		fmt.Sprintf(`flow_dash_requests_total{kind="utc"} %d`, r.dashRequestsUTC.Load()),
+	)
+	writeMetric(w, "flow_dash_bytes_served_total", "counter", "MPEG-DASH 已发送资源字节数",
+		fmt.Sprintf(`flow_dash_bytes_served_total{kind="init"} %d`, r.dashBytesInit.Load()),
+		fmt.Sprintf(`flow_dash_bytes_served_total{kind="segment"} %d`, r.dashBytesSegment.Load()),
 	)
 	// E-9：抓取时采样当前 goroutine 数，用于观察资源回收后是否回落。
 	writeMetric(w, "flow_goroutines", "gauge", "当前 goroutine 数",

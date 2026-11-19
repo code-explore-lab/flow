@@ -389,6 +389,12 @@ func validStreamName(name string) bool {
 
 // ---- 解析 packager ----
 
+// PackagerFor 是 packagerFor 的导出形式。P-3 DASH 与 HLS 共享同一条切片管线：
+// DASH 服务器通过它拿到 HLS manager 里已经切好的段，不重复打包。
+func (s *Server) PackagerFor(ctx context.Context, name string) *Packager {
+	return s.packagerFor(ctx, name)
+}
+
 // packagerFor 找到请求对应的流并返回 manager 里的 packager。
 func (s *Server) packagerFor(ctx context.Context, name string) *Packager {
 	if st := s.resolveStream(ctx, name); st != nil {

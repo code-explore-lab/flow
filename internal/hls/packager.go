@@ -156,8 +156,12 @@ func NewPackager(spec PackagerSpec, opts Options) (*Packager, error) {
 
 func (p *Packager) Name() string           { return p.name }
 func (p *Packager) Stream() *stream.Stream { return p.stream }
-func (p *Packager) Video() *Track          { return p.video }
-func (p *Packager) Audio() *Track          { return p.audio }
+
+// Epoch 返回打包时钟原点。每条轨的 SegmentInfo.StartPTS 都是相对它的 ticks，
+// P-3 DASH 用它作为 MPD 的 availabilityStartTime。
+func (p *Packager) Epoch() time.Time { return p.epoch }
+func (p *Packager) Video() *Track    { return p.video }
+func (p *Packager) Audio() *Track    { return p.audio }
 
 // Closed 报告所有轨是否都已经结束。
 func (p *Packager) Closed() bool {
@@ -817,6 +821,7 @@ func (t *Track) handleEvents(events []Event) {
 				Discontinuity: s.Discontinuity,
 				MapURI:        t.mapURI(s.MapVersion),
 				Duration:      s.Duration.Seconds(),
+				DurationTicks: s.DurationTicks,
 				PDT:           t.pdt(s.StartPTS),
 				URI:           t.segmentURI(s.MSN),
 				StartPTS:      s.StartPTS,

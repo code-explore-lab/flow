@@ -132,6 +132,11 @@ func (m *Manager) Sweep(now time.Time) {
 	var expired []*Packager
 	m.mu.Lock()
 	for name, e := range m.m {
+		// O-6：DVR 需要在没有请求时也持续切片，否则观众暂停几分钟后
+		// 回看窗口就被清空了。源结束（Closed）后仍按 idle 回收。
+		if m.opts.DVRWindow > 0 && !e.p.Closed() {
+			continue
+		}
 		if now.Sub(e.last) >= m.idle {
 			delete(m.m, name)
 			m.opts.Metrics.DecHLSPackager()

@@ -534,9 +534,10 @@
 - [ ] **O-5 配置热加载（P2）**
   - YAML/环境变量/flag 合并；SIGHUP 或 watcher 热更新鉴权、限额、日志级别；
   - 验收：不重启服务修改限额生效。
-- [ ] **O-6 DVR / 时移（P3）**
+- [x] **O-6 DVR / 时移（P3）**
   - 环形录制 + 按时间回看；与 F-3 录制、T-5/G-2 seek 联动；
   - 验收：回看最近 5 分钟，拖动/暂停正常。
+  - ✅ 已实现 O-6-1（HLS/DASH 磁盘时移）：`internal/hls` 的存储从固定 `map[string][]byte` 抽成 `blobStore` 接口，内存后端保持原行为，新增 `diskStore`（`<dvr-dir>/<流名>-<pid>-<序号>/video|audio/seg-N.m4s`，URI 校验拒绝 `..`/绝对路径/跨轨写）。`Options` 新增 `DVRWindow`/`DVRDir`/`DVRMaxBytes`：窗口 >0 时按**时长**回收（不再受 `-hls-window` 的段数限制），playlist 的 `EXT-X-MEDIA-SEQUENCE` 与 DASH 的 `timeShiftBufferDepth` 自然覆盖整个窗口，播放器拖动/暂停即可回看；`-hls-window` 仍决定内存模式行为。每路 packager 用 `pid+原子序号` 的唯一目录，避免替换同名流时互删；`PrepareDVR` 在启动时清空环形目录；`Close` 只删自己那一路。为让暂停的观众几分钟后仍能回看，`Manager.Sweep` 在 DVR 模式下跳过仍活跃（未 Closed）的 packager，源结束后照常按 idle 回收。`cmd/server` 新增 `-dvr-window`（例如 5m，0 关闭）、`-dvr-dir`（默认 `dvr`，启动清空）、`-dvr-max-bytes`（每路磁盘上限，0 表示只按时间），参数校验拒绝负值，`/api/v1/config` 暴露三项。测试新增 `store_test.go`（内存/磁盘后端、非法 URI、只清理本轨目录、`PrepareDVR`、目录名消毒）与 `dvr_test.go`（10s 素材配 5s 窗口只留窗口内段且首段 MSN>0、磁盘文件数与 playlist 一致、Close 删目录；字节上限淘汰；活跃 DVR packager 不被 idle Sweep 清掉、源结束后可回收），`main_test.go` 增加参数校验。e2e（RTSP 28554/RTMP 29355/HLS 28082/DASH 28083，`-hls-window 3 -dvr-window 20s`）：HLS playlist 稳定给出 10 段×2s（`EXT-X-MEDIA-SEQUENCE` 随窗口前移），磁盘同时存在 10 个 video + 10 个 audio `seg-*.m4s`；下载「init + 当前窗口首段」后 `ffprobe` 识别 h264 640x480，`ffmpeg -f null` 解码通过；窗口滑出的旧段返回 404、当前窗口首段返回 200；DASH MPD 的 `timeShiftBufferDepth="PT20.453S"` 且含 20 个 `<S>`。局限：仅 HLS/DASH 时移；RTSP/RTMP 播放中的 seek 需要源侧缓存与时间轴映射，留作 O-6-2；DVR 窗口从首次请求（packager 创建）开始，不回溯推流开始前的数据；磁盘是普通文件 + 内存索引，重启后环形目录清空；未加密。
 - [ ] **O-7 日志聚合 / 追踪（P3，可选）**
   - 结构化日志 + trace id（连接/会话/流），对接 Loki/OTel；
   - 验收：一次推拉链路可按 trace 串起来。

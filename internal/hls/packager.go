@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -42,9 +43,14 @@ type Options struct {
 	PartTarget    time.Duration
 	Window        int
 	MaxBytes      int64 // 每路流 HLS 内存预算；0 表示只按 Window 回收
-	Metrics       *metrics.Registry
-	Now           func() time.Time
-	Logf          func(format string, args ...any)
+	// O-6 DVR：DVRWindow > 0 时改为按时间保留窗口，并把段落盘，
+	// 使播放器可以回看最近这段媒体。Window 在 DVR 模式下不参与回收。
+	DVRWindow   time.Duration
+	DVRDir      string // 磁盘环形缓冲根目录；空时用 "dvr"
+	DVRMaxBytes int64  // 每路流 DVR 磁盘预算；0 表示只按 DVRWindow 回收
+	Metrics     *metrics.Registry
+	Now         func() time.Time
+	Logf        func(format string, args ...any)
 }
 
 func (o Options) withDefaults() Options {
@@ -56,6 +62,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.DVRWindow > 0 && o.DVRDir == "" {
+		o.DVRDir = "dvr"
 	}
 	return o
 }
@@ -90,12 +99,13 @@ func SpecFromStream(st *stream.Stream) PackagerSpec {
 
 // Packager 把一路流的两条轨打成 HLS；每路流只创建一个，观众共享。
 type Packager struct {
-	name   string
-	stream *stream.Stream
-	opts   Options
-	epoch  time.Time
-	video  *Track
-	audio  *Track
+	name    string
+	stream  *stream.Stream
+	opts    Options
+	epoch   time.Time
+	video   *Track
+	audio   *Track
+	dvrRoot string // 非空表示本实例的 DVR 目录，Close 时整体删除
 
 	closeOnce sync.Once
 }
@@ -106,7 +116,10 @@ func NewPackager(spec PackagerSpec, opts Options) (*Packager, error) {
 	if strings.TrimSpace(spec.Name) == "" {
 		return nil, errors.New("hls: packager name is empty")
 	}
-	p := &Packager{name: spec.Name, stream: spec.Stream, opts: opts, epoch: opts.Now()}
+	p := &Packager{
+		name: spec.Name, stream: spec.Stream, opts: opts, epoch: opts.Now(),
+		dvrRoot: newDVDRoot(opts, spec.Name),
+	}
 
 	if spec.Video != nil {
 		t, err := newVideoTrack(p, spec.Video)
@@ -125,11 +138,19 @@ func NewPackager(spec PackagerSpec, opts Options) (*Packager, error) {
 		}
 	}
 	if p.video == nil && p.audio == nil {
+		if p.dvrRoot != "" {
+			_ = os.RemoveAll(p.dvrRoot)
+		}
 		return nil, fmt.Errorf("hls: %s has no supported track (need H.264 and/or AAC)", spec.Name)
 	}
-	// MaxBytes 是整路流的预算；两条轨平分，单轨拿全部。
-	if opts.MaxBytes > 0 {
-		perTrack := opts.MaxBytes
+	// 字节预算按存储后端选择：DVR 用磁盘预算，否则用内存预算。
+	// 预算覆盖整路流，两条轨平分，单轨拿全部。
+	budget := opts.MaxBytes
+	if opts.DVRWindow > 0 {
+		budget = opts.DVRMaxBytes
+	}
+	if budget > 0 {
+		perTrack := budget
 		if p.video != nil && p.audio != nil {
 			perTrack /= 2
 		}
@@ -183,6 +204,11 @@ func (p *Packager) Close() {
 		if p.audio != nil {
 			p.audio.Close()
 		}
+		if p.dvrRoot != "" {
+			if err := os.RemoveAll(p.dvrRoot); err != nil {
+				p.opts.logf("hls[%s]: remove dvr dir: %v", p.name, err)
+			}
+		}
 		p.opts.logf("hls[%s]: packager closed", p.name)
 	})
 }
@@ -197,9 +223,8 @@ type Snapshot struct {
 }
 
 type storedSegment struct {
-	info       SegmentInfo
-	mapVersion int
-	data       []byte
+	info SegmentInfo
+	size int64
 }
 
 // Track 一条轨：源订阅、AU 组装、切片、playlist 元数据与字节 store。
@@ -248,12 +273,11 @@ type Track struct {
 	segments       []*storedSegment
 	open           *OpenSegmentInfo
 	openParts      []PartInfo
-	data           map[string][]byte
+	store          blobStore
 	partURIs       map[uint64][]string
 	targetDuration int
 	partTarget     time.Duration
 	maxBytes       int64
-	storedBytes    int64
 	codec          string
 	width, height  int
 	closed         bool
@@ -307,8 +331,9 @@ func newVideoTrack(p *Packager, ts *TrackSource) (*Track, error) {
 	t := &Track{
 		name: p.name, kind: "video", prefix: "video/", opts: p.opts, epoch: p.epoch,
 		timescale: 90000, video: true, seg: seg, sub: ts.Subscriber,
-		done: make(chan struct{}), data: map[string][]byte{}, partURIs: map[uint64][]string{},
-		notified: make(chan struct{}), targetDuration: seg.TargetDuration(), partTarget: seg.PartTarget(),
+		done: make(chan struct{}), store: newTrackStore(p.opts, p.dvrRoot, "video", p.name),
+		partURIs: map[uint64][]string{}, notified: make(chan struct{}),
+		targetDuration: seg.TargetDuration(), partTarget: seg.PartTarget(),
 	}
 	if ts.Video != nil && len(ts.Video.SPS) > 0 && len(ts.Video.PPS) > 0 {
 		if err := t.applyVideoParams(ts.Video.SPS, ts.Video.PPS, 0); err != nil {
@@ -379,11 +404,12 @@ func newAudioTrack(p *Packager, ts *TrackSource) (*Track, error) {
 	t := &Track{
 		name: p.name, kind: "audio", prefix: "audio/", opts: p.opts, epoch: p.epoch,
 		timescale: clock, video: false, seg: seg, sub: ts.Subscriber, audioCfg: cfg,
-		done: make(chan struct{}), data: map[string][]byte{}, partURIs: map[uint64][]string{},
-		notified: make(chan struct{}), targetDuration: seg.TargetDuration(), partTarget: seg.PartTarget(),
+		done: make(chan struct{}), store: newTrackStore(p.opts, p.dvrRoot, "audio", p.name),
+		partURIs: map[uint64][]string{}, notified: make(chan struct{}),
+		targetDuration: seg.TargetDuration(), partTarget: seg.PartTarget(),
 		codec: fmt.Sprintf("mp4a.40.%d", aot),
 	}
-	t.data[t.mapURI(0)] = init
+	t.storePut(t.mapURI(0), init)
 	return t, nil
 }
 
@@ -433,6 +459,9 @@ func (t *Track) Close() {
 	t.closed = true
 	t.open = nil
 	t.openParts = nil
+	if t.store != nil {
+		t.store.Close()
+	}
 	t.notifyLocked()
 	t.mu.Unlock()
 }
@@ -599,7 +628,7 @@ func (t *Track) applyVideoParams(sps, pps []byte, version int) error {
 	t.videoCfg = cfg
 	t.initVersion = version
 	t.mu.Lock()
-	t.data[t.mapURI(version)] = init
+	t.storePut(t.mapURI(version), init)
 	t.codec = codec
 	t.width, t.height = width, height
 	t.notifyLocked()
@@ -807,9 +836,8 @@ func (t *Track) handleEvents(events []Event) {
 				Independent: p.Independent,
 				URI:         t.partURI(p.MSN, p.Index),
 			}
-			t.data[info.URI] = p.Data
+			t.storePut(info.URI, p.Data)
 			t.partURIs[p.MSN] = append(t.partURIs[p.MSN], info.URI)
-			t.storedBytes += int64(len(p.Data))
 			t.opts.Metrics.IncHLSPart(t.kind)
 			t.syncOpenLocked()
 			t.openParts = append(t.openParts, info)
@@ -827,12 +855,23 @@ func (t *Track) handleEvents(events []Event) {
 				StartDTS:      s.StartDTS,
 				StartPTS:      s.StartPTS,
 			}
-			t.segments = append(t.segments, &storedSegment{info: info, mapVersion: s.MapVersion, data: s.Data})
-			t.data[info.URI] = s.Data
-			t.storedBytes += int64(len(s.Data))
+			t.storePut(info.URI, s.Data)
+			t.segments = append(t.segments, &storedSegment{info: info, size: int64(len(s.Data))})
 			t.opts.Metrics.IncHLSSegment(t.kind)
 			t.open = nil
 			t.openParts = nil
+			// 已关闭父段的 part 不会再出现在 playlist 里；保留刚结束的这一段，
+			// 给 late part 请求留一个段的余量，更早的立即删除（DVR 下避免
+			// part 和父段各占一份磁盘）。
+			for msn, uris := range t.partURIs {
+				if msn >= s.MSN {
+					continue
+				}
+				for _, uri := range uris {
+					t.storeDelete(uri)
+				}
+				delete(t.partURIs, msn)
+			}
 			t.evictLocked()
 			if !t.firstSegment {
 				t.firstSegment = true
@@ -877,19 +916,48 @@ func (t *Track) syncOpenLocked() {
 }
 
 func (t *Track) evictLocked() {
-	for len(t.segments) > t.opts.Window ||
-		(t.maxBytes > 0 && t.storedBytes > t.maxBytes && len(t.segments) > 1) {
+	for len(t.segments) > 1 {
+		over := false
+		if t.opts.DVRWindow > 0 {
+			// DVR：按时间窗口保留，Window（段数）不再参与回收。
+			var total float64
+			for _, s := range t.segments {
+				total += s.info.Duration
+			}
+			over = total > t.opts.DVRWindow.Seconds()
+		} else {
+			over = len(t.segments) > t.opts.Window
+		}
+		if !over && t.maxBytes > 0 && t.store.Bytes() > t.maxBytes {
+			over = true
+		}
+		if !over {
+			return
+		}
 		old := t.segments[0]
 		t.segments = t.segments[1:]
-		t.storedBytes -= int64(len(old.data))
-		delete(t.data, old.info.URI)
+		t.storeDelete(old.info.URI)
 		for _, uri := range t.partURIs[old.info.MSN] {
-			if b, ok := t.data[uri]; ok {
-				t.storedBytes -= int64(len(b))
-			}
-			delete(t.data, uri)
+			t.storeDelete(uri)
 		}
 		delete(t.partURIs, old.info.MSN)
+	}
+}
+
+// storePut / storeDelete 是所有片段字节的统一入口；错误只记日志，
+// 不打断切片（内存后端不会失败，磁盘后端失败时播放列表会自然跳过该段）。
+func (t *Track) storePut(uri string, data []byte) {
+	if t.store == nil {
+		return
+	}
+	if err := t.store.Put(uri, data); err != nil {
+		t.logf("store %s: %v", uri, err)
+	}
+}
+
+func (t *Track) storeDelete(uri string) {
+	if t.store != nil {
+		t.store.Delete(uri)
 	}
 }
 
@@ -957,8 +1025,10 @@ func (t *Track) Watch() <-chan struct{} {
 func (t *Track) Data(uri string) ([]byte, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	b, ok := t.data[uri]
-	return b, ok
+	if t.store == nil {
+		return nil, false
+	}
+	return t.store.Get(uri)
 }
 
 func (t *Track) Snapshot() Snapshot {
@@ -996,11 +1066,14 @@ func (t *Track) Progress() (msn uint64, part int) {
 	return 0, -1
 }
 
-// StoredBytes 返回当前内存里该轨 segment + part 的字节数。
+// StoredBytes 返回该轨当前 store 里的字节数（内存或 DVR 磁盘）。
 func (t *Track) StoredBytes() int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.storedBytes
+	if t.store == nil {
+		return 0
+	}
+	return t.store.Bytes()
 }
 
 // Bandwidth 用窗口内完整段估算码率（bit/s）。
@@ -1009,7 +1082,7 @@ func (t *Track) Bandwidth() uint32 {
 	defer t.mu.Unlock()
 	var bytes, dur float64
 	for _, s := range t.segments {
-		bytes += float64(len(s.data))
+		bytes += float64(s.size)
 		dur += s.info.Duration
 	}
 	if dur <= 0 {

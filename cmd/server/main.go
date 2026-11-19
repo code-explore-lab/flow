@@ -146,6 +146,11 @@ func main() {
 	hlsWindow := flag.Int("hls-window", 6, "P-2: number of complete segments kept in memory (>= 3)")
 	hlsIdle := flag.Duration("hls-idle", 60*time.Second, "P-2: close a packager after this long without requests")
 	hlsMaxBytes := flag.Int64("hls-max-bytes", 64<<20, "P-2: per-stream HLS memory budget in bytes (0 = only window limit)")
+	// O-6：DVR / 时移。窗口内的段落到磁盘，播放列表覆盖整个窗口，
+	// 浏览器/播放器可以拖动回看；再配合 -dash-addr 从 DASH 侧同样可见。
+	dvrWindow := flag.Duration("dvr-window", 0, "O-6: DVR/timeshift window kept on disk (0 disables, e.g. 5m)")
+	dvrDir := flag.String("dvr-dir", "dvr", "O-6: DVR ring directory, cleared at startup")
+	dvrMaxBytes := flag.Int64("dvr-max-bytes", 0, "O-6: per-stream DVR disk budget in bytes (0 = only -dvr-window)")
 	hlsCORS := flag.String("hls-cors", "", "P-2: allowed CORS origins, comma-separated (\"*\" allows any; empty disables CORS headers)")
 	hlsReferer := flag.String("hls-referer", "", "P-2: allowed Referer hosts, comma-separated (supports *.example.com; empty disables)")
 	hlsRequireReferer := flag.Bool("hls-require-referer", false, "P-2: reject requests without a Referer when -hls-referer is set")
@@ -310,6 +315,17 @@ func main() {
 	if err := validateHLSOptions(*hlsSegment, *hlsPart, *hlsWindow, *hlsIdle, *hlsMaxBytes); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+	if err := validateDVROptions(*dvrWindow, *dvrMaxBytes); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if *dvrWindow > 0 {
+		// DVR 是环形时移缓冲：启动时清掉上次运行留下的文件。
+		if err := hls.PrepareDVR(*dvrDir); err != nil {
+			fmt.Fprintf(os.Stderr, "dvr: %v\n", err)
+			os.Exit(2)
+		}
 	}
 	if err := validateDashOptions(*dashUpdate, *dashDelay); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -700,6 +716,9 @@ func main() {
 			"httpflvAddr":   *httpflvAddr,
 			"hlsAddr":       *hlsAddr,
 			"dashAddr":      *dashAddr,
+			"dvrWindow":     dvrWindow.String(),
+			"dvrDir":        *dvrDir,
+			"dvrMaxBytes":   strconv.FormatInt(*dvrMaxBytes, 10),
 			"srtAddr":       *srtAddr,
 			"webrtcAddr":    *webrtcAddr,
 			"snapshotAddr":  *snapshotAddr,
@@ -747,6 +766,9 @@ func main() {
 			PartTarget:    *hlsPart,
 			Window:        *hlsWindow,
 			MaxBytes:      *hlsMaxBytes,
+			DVRWindow:     *dvrWindow,
+			DVRDir:        *dvrDir,
+			DVRMaxBytes:   *dvrMaxBytes,
 		}, *hlsIdle)
 		if originMgr != nil {
 			hlsSrv.SetOrigin(originMgr)
@@ -1035,6 +1057,17 @@ func validateHLSOptions(segment, part time.Duration, window int, idle time.Durat
 	}
 	if maxBytes < 0 {
 		return errors.New("invalid -hls-max-bytes (must be >= 0)")
+	}
+	return nil
+}
+
+// validateDVROptions 校验 O-6 的时移参数。
+func validateDVROptions(window time.Duration, maxBytes int64) error {
+	if window < 0 {
+		return errors.New("invalid -dvr-window (must be >= 0)")
+	}
+	if maxBytes < 0 {
+		return errors.New("invalid -dvr-max-bytes (must be >= 0)")
 	}
 	return nil
 }

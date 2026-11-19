@@ -40,6 +40,29 @@ func TestValidateHLSOptions(t *testing.T) {
 	}
 }
 
+func TestValidateDVROptions(t *testing.T) {
+	tests := []struct {
+		name    string
+		window  time.Duration
+		max     int64
+		wantErr bool
+	}{
+		{"disabled", 0, 0, false},
+		{"five minutes", 5 * time.Minute, 0, false},
+		{"negative window", -time.Second, 0, true},
+		{"negative bytes", time.Minute, -1, true},
+	}
+	for _, tt := range tests {
+		err := validateDVROptions(tt.window, tt.max)
+		if tt.wantErr && err == nil {
+			t.Errorf("%s: expected error", tt.name)
+		}
+		if !tt.wantErr && err != nil {
+			t.Errorf("%s: unexpected error %v", tt.name, err)
+		}
+	}
+}
+
 func TestABRGroupsFromProfiles(t *testing.T) {
 	profiles, err := transcode.ParseProfiles(
 		"live/a=w=1280,h=720,bitrate=3m;live/a=w=640,h=360,bitrate=800k;" +

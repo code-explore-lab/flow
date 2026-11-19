@@ -425,6 +425,8 @@ func (c *Conn) handlePlay(streamID uint32, cmd *Command) error {
 		}
 	}
 
+	c.setAdminPlaying(name, true)
+
 	if video != nil {
 		ps.wg.Add(1)
 		go c.playVideo(ps, vrd, vcancel, vparams, codec)
@@ -448,10 +450,11 @@ func vcancelPlay(funcs ...func()) {
 // stopPlay 停止当前播放并等播放 goroutine 退出。可重复调用。
 func (c *Conn) stopPlay() {
 	ps := c.play
+	c.play = nil
+	c.setAdminPlaying("", false)
 	if ps == nil {
 		return
 	}
-	c.play = nil
 	if c.srv != nil {
 		c.srv.metrics.DecPlay()
 	}

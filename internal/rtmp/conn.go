@@ -19,6 +19,10 @@ import (
 	"time"
 )
 
+// connSeq 给每条连接生成稳定的管理 ID（rtmp-1、rtmp-2 ...）。
+// RTSP 的会话 ID 由 session.Manager 分配，两套 ID 在管理接口里并列展示。
+var connSeq atomic.Uint64
+
 // RTMP 默认 chunk size（协议规定 128）。
 const defaultChunkSize uint32 = 128
 
@@ -73,6 +77,19 @@ type Conn struct {
 	// fourCCs 是 connect 命令里客户端声明的 fourCcList（Enhanced RTMP）。
 	// nil 表示客户端没声明，按支持 HEVC 的新客户端处理。
 	fourCCs []string
+
+	// O-1 管理接口元数据。id/createdAt 创建后不变；app/stream/publishing/
+	// playing 由连接自身的 goroutine 写入、管理 HTTP goroutine 读取，统一
+	// 由 adminMu 保护，避免直接读上面的命令层字段造成数据竞争。
+	id              string
+	createdAt       time.Time
+	lastActive      atomic.Int64 // UnixNano；读循环每收到一条消息刷新
+	adminMu         sync.Mutex
+	adminApp        string
+	adminPubStream  string
+	adminPlayStream string
+	adminPub        bool
+	adminPlay       bool
 }
 
 // countingReader 统计底层连接读到的字节总数，用于周期性回 Ack。
@@ -115,7 +132,59 @@ func newConn(c net.Conn) *Conn {
 		readChunkSize:  defaultChunkSize,
 		writeChunkSize: defaultChunkSize,
 		chunks:         make(map[uint32]*chunkStream),
+		id:             fmt.Sprintf("rtmp-%d", connSeq.Add(1)),
+		createdAt:      time.Now(),
 	}
+}
+
+// lastActivity 返回最近一次收到消息的时间；从未收到时回退到建连时间。
+func (c *Conn) lastActivity() time.Time {
+	if n := c.lastActive.Load(); n > 0 {
+		return time.Unix(0, n)
+	}
+	return c.createdAt
+}
+
+// setAdminApp 记录 connect 声明的 app。
+func (c *Conn) setAdminApp(app string) {
+	c.adminMu.Lock()
+	c.adminApp = app
+	c.adminMu.Unlock()
+}
+
+// setAdminPublish 记录推流状态；publishing=false 时同时清掉流名。
+func (c *Conn) setAdminPublish(name string, publishing bool) {
+	c.adminMu.Lock()
+	c.adminPub = publishing
+	if publishing {
+		c.adminPubStream = name
+	} else {
+		c.adminPubStream = ""
+	}
+	c.adminMu.Unlock()
+}
+
+// setAdminPlaying 记录拉流状态；playing=false 时同时清掉流名。
+func (c *Conn) setAdminPlaying(name string, playing bool) {
+	c.adminMu.Lock()
+	c.adminPlay = playing
+	if playing {
+		c.adminPlayStream = name
+	} else {
+		c.adminPlayStream = ""
+	}
+	c.adminMu.Unlock()
+}
+
+// adminSnapshot 返回管理接口需要的连接状态快照。
+func (c *Conn) adminSnapshot() (app, stream string, publishing, playing bool) {
+	c.adminMu.Lock()
+	defer c.adminMu.Unlock()
+	stream = c.adminPubStream
+	if !c.adminPub {
+		stream = c.adminPlayStream
+	}
+	return c.adminApp, stream, c.adminPub, c.adminPlay
 }
 
 // chunkState 返回 csid 对应的重组状态，没有则创建。
@@ -232,6 +301,9 @@ func (c *Conn) pump() error {
 			_ = c.SetReadDeadline(time.Now().Add(c.connTimeout))
 		}
 		m, err := c.readMessage()
+		if err == nil {
+			c.lastActive.Store(time.Now().UnixNano())
+		}
 		if err != nil {
 			return err
 		}

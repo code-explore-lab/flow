@@ -517,9 +517,10 @@
 
 ## O — 运维与产品（P2/P3）
 
-- [ ] **O-1 HTTP 管理 API（P2）**
+- [x] **O-1 HTTP 管理 API（P2）**
   - 流列表、会话列表、踢流/踢会话、配置查询；REST + JSON；
   - 验收：curl 能查询并踢掉指定推流，拉流端收到 EOF。
+  - ✅ 已实现：新增 `internal/admin`，独立 HTTP 服务 + JSON 路由：`GET /api/v1/streams[/{name}]`、`DELETE /api/v1/streams/{name}`、`GET /api/v1/sessions[?protocol=rtsp|rtmp]`、`DELETE /api/v1/sessions/{id}`、`GET /api/v1/config`。流列表来自共享 `stream.Registry.Snapshot()`，并标注编码参数、创建/最近活跃时间、发布者（协议 + 会话 ID + IP）；`stream.Stream` 新增 `CreatedAt()`/`LastActivity()` 只读方法供展示。会话与踢除通过 `admin.Backend` 接口下放给协议实现：`internal/rtsp/admin.go`（`Sessions`/`KickSession`/`KickStream`）与 `internal/rtmp/admin.go`，本包不反向依赖协议，避免 import 环。踢 RTSP 推流会话走 `Session.Close → closeAll → unpublish → 关闭 ExternalSource`，踢拉流会话发 BYE 后关闭独占 TCP 连接；踢 RTMP 连接走 `Conn.Close → handleConn defer → stopPublish/stopPlay → registry.Unpublish`。RTMP 连接新增管理 ID（`rtmp-N`）、创建/最近收包时间与受锁保护的 app/stream/publishing/playing 快照，避免管理 HTTP goroutine 直接读命令层字段造成数据竞争。踢流只作用于网络推流（RTSP ANNOUNCE / RTMP publish）；`-ts-*` / 转码 / 回源等由配置驱动的流没有可踢会话，返回 `409` 并说明原因。安全：`-admin-addr` 默认关闭，未设置 `-admin-token` 时强制回环监听，非回环绑定必须配 token；支持 `Authorization: Bearer` 与 `X-Flow-Token`，常量时间比较。单元测试覆盖流/轨道/发布者视图、协议过滤、踢流 200/404/409、踢会话、token 401/200、配置查询，以及 RTSP 踢推流后源关闭、拉流端 reader 结束、踢拉流不影响已发布源和 RTMP 连接关闭。e2e：RTSP 推 `live/push` + ffmpeg TCP 拉流，curl 查询到 `sess-1` 发布者，`DELETE /api/v1/streams/live/push` 返回 `{"kicked":1}`，拉流 1s 内收到 EOF（`pull_rc=0`）且注册表清空；RTMP 推 `live/kicktest`（注册名 `kicktest`）+ RTSP 拉流，同样踢流后拉流立即退出、推流 Broken pipe，日志出现 `rtmp: unpublished "kicktest"` 与 `session sess-1 closed: pull source ended`。`gofmt -l .`/`go vet ./...`/`go test ./...` 全绿，`go test -race ./internal/admin/ ./internal/rtsp/ ./internal/rtmp/` 通过。说明：`/api/v1/config` 只返回非敏感运行时配置；`/healthz`/`/readyz` 与 Web 控制台仍属 O-2/O-4。
 - [ ] **O-2 Web 控制台（P3，可选）**
   - 简洁页面展示流/会话/指标，支持操作；
   - 验收：浏览器完成查看与踢流。

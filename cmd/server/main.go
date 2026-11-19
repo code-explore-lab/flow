@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"flow/internal/access"
+	"flow/internal/admin"
 	"flow/internal/dash"
 	"flow/internal/discovery"
 	"flow/internal/hls"
@@ -76,6 +77,9 @@ func main() {
 	pprofAddr := flag.String("pprof", "", "E-2: pprof listen address, e.g. :6060 (loopback only; empty disables)")
 	// E-4：Prometheus 指标端点，空表示关闭；只允许回环地址。
 	metricsAddr := flag.String("metrics", "", "E-4: Prometheus /metrics listen address, e.g. :9090 (loopback only; empty disables)")
+	// O-1：HTTP 管理 API。空表示关闭；没有 token 时只允许回环监听。
+	adminAddr := flag.String("admin-addr", "", "O-1: management HTTP API listen address, e.g. 127.0.0.1:9091 (empty disables)")
+	adminToken := flag.String("admin-token", "", "O-1: bearer token for the management API (required for non-loopback listeners)")
 	// E-5：连接/会话上限与超时。
 	maxConns := flag.Int("max-conns", 0, "E-5: max concurrent TCP connections per protocol (0 = unlimited)")
 	maxSessions := flag.Int("max-sessions", 0, "E-5: max concurrent RTSP sessions (0 = unlimited)")
@@ -283,6 +287,20 @@ func main() {
 	if *snapshotFFmpegTimeout <= 0 {
 		fmt.Fprintln(os.Stderr, "invalid -snapshot-ffmpeg-timeout (must be > 0)")
 		os.Exit(2)
+	}
+	// O-1：管理接口能中断推流，没有 token 时强制回环监听；配置了 token
+	// 才允许绑定非回环地址。
+	adminListen := ""
+	if *adminAddr != "" {
+		adminListen = *adminAddr
+		if *adminToken == "" {
+			resolved, err := loopbackListenAddr(*adminAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "admin: %v (set -admin-token to allow non-loopback)\n", err)
+				os.Exit(2)
+			}
+			adminListen = resolved
+		}
 	}
 	if err := validateHLSOptions(*hlsSegment, *hlsPart, *hlsWindow, *hlsIdle, *hlsMaxBytes); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -646,6 +664,42 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// O-1：管理 API。流列表直接来自共享注册表；会话查询和踢除由各协议
+	// 服务器实现 admin.Backend。配置项只放非敏感值。
+	var adminSrv *admin.Server
+	if adminListen != "" {
+		backends := []admin.Backend{rtspSrv, rtmpSrv}
+		if rtmpsSrv != nil {
+			backends = append(backends, rtmpsSrv)
+		}
+		adminSrv = admin.New(reg, backends...)
+		adminSrv.SetToken(*adminToken)
+		adminSrv.SetConfig(map[string]string{
+			"node":          node,
+			"live":          strconv.FormatBool(*live),
+			"publishPolicy": publishPolicy.String(),
+			"rtspAddr":      *rtspAddr,
+			"rtmpAddr":      *rtmpAddr,
+			"rtmpsAddr":     *rtmpsAddr,
+			"httpflvAddr":   *httpflvAddr,
+			"hlsAddr":       *hlsAddr,
+			"dashAddr":      *dashAddr,
+			"srtAddr":       *srtAddr,
+			"webrtcAddr":    *webrtcAddr,
+			"snapshotAddr":  *snapshotAddr,
+			"multicastAddr": *multicastAddr,
+			"rtspAuthUsers": strconv.Itoa(len(users)),
+			"rtmpAuth":      strconv.FormatBool(rtmpAuth.Enabled()),
+			"discoveryMode": *discoveryMode,
+			"discovery":     strconv.FormatBool(discoveryClient != nil),
+			"streamIdle":    streamIdle.String(),
+		})
+		if *adminToken != "" {
+			fmt.Printf("admin api listen on http://%s/api/v1/ (bearer token required)\n", adminListen)
+		} else {
+			fmt.Printf("admin api listen on http://%s/api/v1/ (loopback, no token)\n", adminListen)
+		}
+	}
 	// P-1：HTTP-FLV 复用同一份注册表，RTSP/RTMP 推上来的流都能用
 	// http://host:8080/live/<name>.flv 拉取。
 	var httpflvSrv *httpflv.Server
@@ -820,6 +874,9 @@ func main() {
 	if snapshotSrv != nil {
 		wg.Add(1)
 	}
+	if adminSrv != nil {
+		wg.Add(1)
+	}
 	if hlsEnabled {
 		wg.Add(1)
 	}
@@ -858,6 +915,9 @@ func main() {
 	}
 	if snapshotSrv != nil {
 		go serve("snapshot", *snapshotAddr, snapshotSrv.Serve)
+	}
+	if adminSrv != nil {
+		go serve("admin", adminListen, adminSrv.Serve)
 	}
 	if hlsEnabled {
 		go serve("hls", *hlsAddr, hlsSrv.Serve)

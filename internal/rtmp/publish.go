@@ -26,6 +26,7 @@ func (c *Conn) stopPublish() {
 		return
 	}
 	c.publish = nil
+	c.setAdminPublish("", false)
 	if c.srv != nil {
 		c.srv.metrics.DecPublish()
 		c.srv.registry.Unpublish(p.Stream.Name, p.Stream)

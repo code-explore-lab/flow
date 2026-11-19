@@ -483,6 +483,32 @@ func (s *Stream) Active(window time.Duration) bool {
 	return false
 }
 
+// CreatedAt 返回流登记到注册表的时间；还没登记时为零值。
+func (s *Stream) CreatedAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createdAt
+}
+
+// LastActivity 返回最近一次媒体写入时间。还没建轨或从未写入时回退到
+// 登记时间，供管理接口展示流的活跃度。
+func (s *Stream) LastActivity() time.Time {
+	s.mu.Lock()
+	video, audio, created := s.Video, s.Audio, s.createdAt
+	s.mu.Unlock()
+
+	last := created
+	for _, t := range []*Track{video, audio} {
+		if t == nil || t.Src == nil {
+			continue
+		}
+		if w := t.Src.LastWrite(); w.After(last) {
+			last = w
+		}
+	}
+	return last
+}
+
 // SetIdleExempt 控制这条流是否豁免空闲回收。回源/-pull 在创建流时置 true。
 func (s *Stream) SetIdleExempt(v bool) { s.idleExempt.Store(v) }
 

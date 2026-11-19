@@ -244,6 +244,7 @@ func (c *Conn) handleCommand(m *Message) error {
 func (c *Conn) handleConnect(cmd *Command) error {
 	if app, ok := cmd.objectString("app"); ok {
 		c.app = app
+		c.setAdminApp(app)
 	}
 	if list, ok := cmd.objectStringArray("fourCcList"); ok {
 		c.fourCCs = list
@@ -342,6 +343,7 @@ func (c *Conn) handlePublish(streamID uint32, cmd *Command) error {
 	}
 	c.publish = flvingest.NewIngest(st)
 	c.streamName = name
+	c.setAdminPublish(name, true)
 	c.srv.metrics.IncPublish()
 	c.srv.metrics.IncPublishTotal()
 
